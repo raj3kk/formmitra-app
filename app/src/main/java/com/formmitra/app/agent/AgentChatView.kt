@@ -21,6 +21,8 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import com.formmitra.app.engine.Standalone
+import com.formmitra.app.engine.UserPrompt
+import com.formmitra.app.engine.PrecheckLogic
 import android.widget.Button
 import android.widget.EditText
 import android.widget.HorizontalScrollView
@@ -134,6 +136,27 @@ class AgentChatView(
         addView(standaloneChip)
         refreshStandaloneChip()
 
+        // v14: CAPTCHA auto-solve consent toggle (default ON, persisted)
+        addView(LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(pad, dp(2), pad, dp(2))
+            addView(TextView(context).apply {
+                text = "🧩 CAPTCHA auto-solve"
+                textSize = 13f
+                setTextColor(Color.parseColor("#202124"))
+                layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+            })
+            addView(android.widget.Switch(context).apply {
+                isChecked = com.formmitra.app.engine.CaptchaConsent.isEnabled(context)
+                textSize = 12f
+                setOnCheckedChangeListener { _, on ->
+                    com.formmitra.app.engine.CaptchaConsent.setEnabled(context, on)
+                    toast(if (on) "CAPTCHA auto-solve ON ✅" else "CAPTCHA auto-solve OFF — ab aap khud solve karenge")
+                }
+            })
+        })
+
         // needs_user banner (polling se dikhega)
         bannerBox = LinearLayout(context).apply {
             orientation = VERTICAL
@@ -239,6 +262,21 @@ class AgentChatView(
             setOnClickListener { onMicClick() }
         }
         inputRow.addView(micBtn)
+        // 🔊 speaker toggle — agent ke jawab bol ke sunao (Phase 5 voice)
+        val speakBtn = Button(context).apply {
+            text = if (VoiceOutput.isEnabled(context)) "🔊" else "🔇"
+            textSize = 18f
+            layoutParams = LayoutParams(
+                LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(dp(4), 0, dp(4), 0) }
+            setOnClickListener {
+                val on = !VoiceOutput.isEnabled(context)
+                VoiceOutput.setEnabled(context, on)
+                text = if (on) "🔊" else "🔇"
+                if (on) VoiceOutput.speak(context, "Awaaz chalu hai")
+            }
+        }
+        inputRow.addView(speakBtn)
         sendBtn = Button(context).apply {
             text = "➤"
             textSize = 18f
@@ -495,6 +533,8 @@ class AgentChatView(
                         if (reply.isNotEmpty()) {
                             addAssistantBubble(reply)
                             history.add("assistant" to reply)
+                            // Agent ka jawab bol ke bhi sunao (voice output)
+                            VoiceOutput.speak(context, reply)
                         }
                         val plan = json?.optJSONObject("plan")
                         if (plan != null) addPlanCard(plan)
@@ -526,11 +566,34 @@ class AgentChatView(
             if (url.isEmpty()) {
                 msg = "Is form ka official link nahi mila — dobara pucho."
             } else {
+                // PRECHECK: pehle dekho ho sakta hai ya nahi (+ pichhla experience).
+                val verdict = runPrecheck(url, title)
+                if (verdict != null && !verdict.feasible) {
+                    msg = PrecheckLogic.verdictText(verdict) +
+                        "\n\nIsliye shuru nahi kiya — koi aur tareeka batao ya link badlo."
+                    post {
+                        addAssistantBubble(msg)
+                        VoiceOutput.speak(context, "Ye kaam nahi ho sakta. ${verdict.reason}".take(300))
+                        onDone()
+                    }
+                    return@Thread
+                }
+                if (verdict != null) {
+                    val vt = PrecheckLogic.verdictText(verdict)
+                    post {
+                        addAssistantBubble(vt)
+                        VoiceOutput.speak(context, vt.take(300))
+                    }
+                }
                 val (code, taskId) = AgentApi.createTask(context, title, url)
                 msg = if (taskId.isNullOrEmpty()) {
-                    when (code) {
-                        -1 -> "Internet nahi hai 📡"
-                        401 -> "Pehle Profile tab me login karo 🔑"
+                    val offline = code == -1 || code >= 500
+                    when {
+                        code == 401 -> "Pehle Profile tab me login karo 🔑"
+                        offline && com.formmitra.app.engine.Standalone.isConfigured(context) ->
+                            startStandaloneTask(title, url)
+                        code == -1 -> "Internet nahi hai 📡 — server bhi nahi mil raha. " +
+                            "Standalone ke liye Profile me apni Groq API key save karo."
                         else -> "Task ban nahi paya (code $code). Dobara try karo."
                     }
                 } else {
@@ -551,6 +614,75 @@ class AgentChatView(
                 onDone()
             }
         }.start()
+    }
+
+    /**
+     * Offline task: StandaloneStore me save + FormRunService seedha chalao.
+     * Server bilkul involve nahi — brain = user ki Groq key (StandaloneBrain).
+     */
+    private fun startStandaloneTask(title: String, url: String): String {
+        return try {
+            val id = com.formmitra.app.engine.StandaloneStore.create(context, title, url)
+            val task = JSONObject()
+                .put("name", title)
+                .put("target_url", url)
+                .put("run_id", id)
+                .put("standalone", true)
+                .put(
+                    "steps",
+                    JSONArray().put(
+                        JSONObject()
+                            .put("type", "agent_run")
+                            .put("goal", title)
+                            .put("url", url)
+                    )
+                )
+            com.formmitra.app.engine.FormRunService.startWithTask(context, task)
+            "Server nahi mil raha — standalone mode me shuru kiya ✅\n" +
+                "(tumhari Groq key se, bina server ke). Progress notification me dikhega."
+        } catch (e: Exception) {
+            "Standalone task shuru nahi hua: ${(e.message ?: "error").take(120)}"
+        }
+    }
+
+    /**
+     * POST /api/agent/precheck → Verdict?.
+     * null = check nahi ho paya (network/401 — proceed anyway, purana flow).
+     */
+    private fun runPrecheck(url: String, goal: String): PrecheckLogic.Verdict? {
+        return try {
+            val res = AgentApi.precheck(context, url, goal)
+            if (res.code == 401) {
+                post { addAssistantBubble("Precheck ke liye login chahiye 🔑 — bina check ke shuru kar raha hu.") }
+                null
+            } else if (res.code !in 200..299 || res.json == null) {
+                null
+            } else {
+                PrecheckLogic.parse(jsonToMap(res.json!!))
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** JSONObject → Map (PrecheckLogic ke liye, org.json-free). */
+    private fun jsonToMap(o: JSONObject): Map<String, Any?> {
+        val m = HashMap<String, Any?>()
+        val keys = o.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            val v = o.opt(k)
+            m[k] = when (v) {
+                is JSONObject -> jsonToMap(v)
+                is JSONArray -> (0 until v.length()).map { idx ->
+                    val e = v.opt(idx)
+                    if (e is JSONObject) jsonToMap(e) else e
+                }
+                JSONObject.NULL -> null
+                else -> v
+            }
+        }
+        return m
     }
 
     // ---------- runs history ----------
@@ -750,6 +882,8 @@ class AgentChatView(
 
     /** MainActivity.selectTab se — Agent tab dikha to polling shuru. */
     fun onTabShown() {
+        // TTS engine warm karo taaki pehla jawab turant bole (lost na ho)
+        try { VoiceOutput.init(context) } catch (_: Exception) { }
         refreshStandaloneChip()
         if (polling) return
         polling = true
@@ -765,7 +899,17 @@ class AgentChatView(
     private fun pollTaskStatus() {
         Thread {
             val runs = try { AgentApi.listRuns(context) } catch (_: Exception) { null }
-            post { handlePollResult(runs) }
+            val prompt = UserPrompt.pendingRequest()
+            post {
+                handlePollResult(runs)
+                // Interactive prompt khula ho to popup dikhao (OTP/payment/choice)
+                if (prompt != null) {
+                    val act = context as? Activity
+                    if (act != null && !PromptDialog.isShowing(prompt.runId)) {
+                        PromptDialog.show(act, prompt)
+                    }
+                }
+            }
         }.start()
     }
 
@@ -812,6 +956,17 @@ class AgentChatView(
         retryBtn.isEnabled = false
         Thread {
             var msg: String
+            // Retry se pehle bhi precheck (pichhle experience se faisla)
+            val verdict = runPrecheck(bannerUrl, bannerGoal)
+            if (verdict != null && !verdict.feasible) {
+                msg = PrecheckLogic.verdictText(verdict) + "\n\nRetry nahi kiya."
+                post {
+                    addAssistantBubble(msg)
+                    VoiceOutput.speak(context, "Ye kaam nahi ho sakta. ${verdict.reason}".take(300))
+                    retryBtn.isEnabled = true
+                }
+                return@Thread
+            }
             val (code, taskId) = AgentApi.createTask(context, bannerGoal, bannerUrl)
             msg = if (taskId.isNullOrEmpty()) {
                 when (code) {

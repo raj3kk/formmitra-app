@@ -70,4 +70,34 @@ object DocsStore {
     }
 
     /** Save ki hui files ke naam (sorted). */
+    fun listDocs(ctx: Context): List<String> {
+        return try {
+            docsDir(ctx).listFiles()
+                ?.filter { it.isFile && it.canRead() }
+                ?.map { it.name }
+                ?.sorted()
+                ?: emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * v14: purani plaintext file → successful read ke baad encrypted me
+     * migrate karo (best-effort). docs dir ke bahar ki files ko chhedo mat.
+     */
+    fun migratePlaintextToEncrypted(ctx: Context, file: File) {
+        try {
+            val dir = docsDir(ctx)
+            val canonBase = try { dir.canonicalPath } catch (_: Exception) { dir.absolutePath }
+            val canonFile = try { file.canonicalPath } catch (_: Exception) { return }
+            if (!canonFile.startsWith(canonBase + File.separator)) return
+            try {
+                CryptoVault.decryptFile(ctx, file)
+                return // pehle se encrypted — kuch nahi karna
+            } catch (_: Exception) { /* plaintext → migrate karo */ }
+            val plain = file.readBytes()
+            CryptoVault.encryptFile(ctx, plain, file)
+        } catch (_: Exception) { }
+    }
 }

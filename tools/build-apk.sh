@@ -18,11 +18,11 @@ rm -rf $OUT && mkdir -p $OUT/{aar,classes,dex,res}
 export JAVA_HOME=$PTOOLS/jdk-17
 export PATH=$JAVA_HOME/bin:$PATH
 APPID="com.formmitra.app"
-VERSION_CODE=12
-VERSION_NAME="1.0.12-v12"
+VERSION_CODE=14
+VERSION_NAME="1.0.14-v14"
 SITE_URL="https://formmitra-git-main-webbuilder1.vercel.app/"
 # Output APK name parameterized — v1 APK (formmitra-v1.apk) untouched rehta hai.
-APK_NAME="formmitra-v12.apk"
+APK_NAME="formmitra-v${VERSION_CODE}.apk"
 
 # BuildConfig.java sync (manual build me Gradle nahi hai)
 sed -i -e "s/VERSION_NAME = \"[^\"]*\"/VERSION_NAME = \"$VERSION_NAME\"/" \

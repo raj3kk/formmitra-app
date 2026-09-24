@@ -4,6 +4,32 @@ import android.content.Context
 import com.formmitra.app.agent.AgentApi
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+
+/**
+ * v14: CAPTCHA auto-solve consent — default ON (persisted). OFF ho to
+ * AgentLoop CAPTCHA ko chhoota tak nahi, seedha needs_user handoff.
+ */
+object CaptchaConsent {
+    private const val PREFS = "formmitra_agent_prefs"
+    private const val KEY = "captcha_auto_solve"
+
+    fun isEnabled(ctx: Context): Boolean = try {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY, true)
+    } catch (_: Exception) {
+        true
+    }
+
+    fun setEnabled(ctx: Context, enabled: Boolean) {
+        try {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY, enabled).apply()
+        } catch (_: Exception) { }
+    }
+}
 
 /**
  * AgentLoop — AI brain loop (Phase 2).
@@ -140,6 +166,10 @@ object AgentLoop {
         } catch (e: Exception) {
             return finish("failed", "browser start nahi hua: ${e.message}")
         }
+        // Screenshot parallel capture ke liye background worker (DOM ke saath
+        // ek saath — dono WebView UI-thread queue pe safe hain). try se PEHLE
+        // declare (finally me visible rahe).
+        val shotExec = Executors.newSingleThreadExecutor()
         try {
             // Pehla navigation: start URL (veto + timeout runAgentStep ke andar)
             if (startUrl.isNotEmpty()) {
@@ -191,41 +221,54 @@ object AgentLoop {
             for (i in 1..maxSteps) {
                 onProgress(i)
 
-                // (a) DOM snapshot
+                // (a)+(c) PARALLEL: DOM snapshot + screenshot ek saath
+                // (screenshot har 3rd step pe + mirror file UI agent ke liye)
+                val shotFuture = if (i % 3 == 1) {
+                    shotExec.submit(Callable<String> {
+                        try {
+                            engine.capturePngBase64()
+                        } catch (_: Exception) {
+                            ""
+                        }
+                    })
+                } else null
                 val snap = try {
                     engine.domSnapshot()
                 } catch (_: Exception) {
                     JSONObject()
                 }
+                val shot = try {
+                    shotFuture?.get(20, TimeUnit.SECONDS) ?: ""
+                } catch (_: Exception) {
+                    ""
+                }
+                if (shot.isNotEmpty()) mirrorShot()
                 val url = snap.optString("url", "").ifEmpty { currentUrl }
                 val title = snap.optString("title", "")
                 currentUrl = url
 
-                // (b) CAPTCHA safety net (+ auto-solve, max 3 attempts)
+                // (b) CAPTCHA safety net (v14 full protocol: max 3 attempts)
                 val capNote = handleCaptcha(ctx, engine, url, snap, captchaAttempts)
                 if (capNote != null) {
                     logStep(i, "captcha", false, capNote.take(200))
                     return finish("needs_user", capNote)
                 }
 
-                // (c) screenshot har 3rd step pe (+ mirror file UI agent ke liye)
-                val shot = if (i % 3 == 1) {
-                    try {
-                        val b64 = engine.capturePngBase64()
-                        if (b64.isNotEmpty()) mirrorShot()
-                        b64
-                    } catch (_: Exception) {
-                        ""
-                    }
-                } else ""
-
-                // (d) act call
+                // (d) act call — page_analysis ke saath (Operator pehle
+                // page samjhata hai; AI is block + screenshot se samajh ke
+                // action chunta hai)
                 val hArr = JSONArray()
                 history.takeLast(15).forEach { hArr.put(it) }
                 val reqBody = JSONObject()
                     .put("goal", goal)
                     .put("url", url)
                     .put("page_title", title)
+                    .put(
+                        "page_analysis", buildPageAnalysis(
+                            snap, url,
+                            buildStuckReport(stuckCount, recentSigs, history)
+                        )
+                    )
                     .put(
                         "dom_snapshot", JSONObject()
                             .put("fields", snap.optJSONArray("fields") ?: JSONArray())
@@ -496,6 +539,10 @@ object AgentLoop {
                 "$maxSteps steps ho gaye, kaam poora nahi hua — aap dekh lein"
             )
         } finally {
+            try { shotExec.shutdownNow() } catch (_: Exception) { }
+            // v14: run khatam/stop — mirror screenshot saaf karo (stale live
+            // view na dikhe; naya run nayi image banayega)
+            try { java.io.File(ctx.cacheDir, "agent_mirror.png").delete() } catch (_: Exception) { }
             // session cookies persist karo (login bana rahe)
             try { android.webkit.CookieManager.getInstance().flush() } catch (_: Exception) { }
             try {
@@ -1182,6 +1229,19 @@ object AgentLoop {
      * String = user ko dikhane wala note (loop needs_user pe finish).
      * Ek run me max 3 solve-attempts — uske baad user handoff.
      */
+    /**
+     * v14 CAPTCHA full protocol — AI sirf analyze karta hai, Operator execute:
+     *   1. Operator DOM detect (captchaDetect) → AI vision confirm (analyze me).
+     *   2. /api/agent/captcha (analyze): screenshot + dom_snippet + url + attempt.
+     *   3. Operator executeCaptchaSequence: har step execute, naya screenshot.
+     *   4. /api/agent/captcha (verify): solved? nahi → corrected next_action.
+     *   5. Low-confidence (<0.5) targets skip + dobara analyze.
+     *   6. Max 3 attempts → structured needs_user.
+     * Consent toggle default ON; OFF → bina koshish needs_user.
+     *
+     * null = koi captcha nahi, ya solve ho gaya (loop continue);
+     * String = user ko dikhane wala note (loop needs_user pe finish).
+     */
     private fun handleCaptcha(
         ctx: Context,
         engine: FormEngine,
@@ -1198,14 +1258,80 @@ object AgentLoop {
             attempts[0] = 0 // captcha gaya — counter reset
             return null
         }
-        if (attempts[0] >= 3) {
-            return "CAPTCHA 3 baar try kiya, solve nahi hua — aap khud solve karke task dobara chalayein"
+        // Consent OFF → turant user handoff (koi auto-solve nahi)
+        if (!CaptchaConsent.isEnabled(ctx)) {
+            return "CAPTCHA aaya hai — auto-solve aapne settings me band kiya hai. " +
+                "Page khol ke CAPTCHA khud solve kar lein, phir task dobara chalayein"
         }
         val widgets = det.optJSONArray("widgets") ?: JSONArray()
         val widget = widgets.optJSONObject(0)
         val kind = widget?.optString("kind", "unknown") ?: "unknown"
-        val shot = try {
-            val b64 = engine.capturePngBase64()
+        val domSnippet = domSnippetForCaptcha(det)
+
+        while (attempts[0] < 3) {
+            attempts[0]++
+            val attempt = attempts[0]
+            // (1) ANALYZE: AI sirf batata hai (type + targets + sequence)
+            val shot = captchaShot(ctx, engine)
+            val ares = try {
+                AgentApi.captcha(
+                    ctx, JSONObject()
+                        .put("mode", "analyze")
+                        .put("screenshot_b64", shot)
+                        .put("dom_snippet", domSnippet)
+                        .put("url", url)
+                        .put("attempt", attempt)
+                )
+            } catch (_: Exception) {
+                AgentApi.ApiResult(-1, null)
+            }
+            if (ares.code != 200 || ares.json == null) {
+                // AI unreachable — ye attempt fail; dobara analyze ya handoff
+                if (attempt >= 3) break
+                continue
+            }
+            val cap = ares.json!!.optJSONObject("captcha") ?: JSONObject()
+            if (cap.optBoolean("is_access_wall", false)) {
+                return "Ye page access-wall hai (login wall) — CAPTCHA auto-solve yahan allowed nahi. " +
+                    "Aap khud login karke task dobara chalayein"
+            }
+            // (2) EXECUTE: Operator har step khud karta hai
+            executeCaptchaSequence(ctx, engine, cap, snap, widget)
+            // (3) VERIFY: naya screenshot → AI verify karta hai
+            val vshot = captchaShot(ctx, engine)
+            val vres = try {
+                AgentApi.captcha(
+                    ctx, JSONObject()
+                        .put("mode", "verify")
+                        .put("screenshot_b64", vshot)
+                        .put("dom_snippet", domSnippet)
+                        .put("url", url)
+                        .put("attempt", attempt)
+                        .put("verify_hint", cap.optString("verify_hint", ""))
+                )
+            } catch (_: Exception) {
+                AgentApi.ApiResult(-1, null)
+            }
+            val vcap = vres.json?.optJSONObject("captcha")
+            val solved = vres.code == 200 && vcap?.optBoolean("solved", false) == true
+            if (solved) {
+                attempts[0] = 0
+                return null
+            }
+            val nextAction = vcap?.optString("next_action", "") ?: ""
+            // corrected next_action mila to turant apply (bina naye analyze ke)
+            if (nextAction.isNotEmpty() && attempt < 3) {
+                applyCorrectedCaptchaAction(ctx, engine, nextAction, cap, snap, widget)
+            }
+        }
+        return "CAPTCHA 3 baar try kiya ($kind), solve nahi hua — aap khud solve " +
+            "karke task dobara chalayein"
+    }
+
+    /** CAPTCHA screenshots: uncapped (coords linear rahein) + mirror UI ke liye. */
+    private fun captchaShot(ctx: Context, engine: FormEngine): String {
+        return try {
+            val b64 = engine.captureCaptchaPngBase64()
             if (b64.isNotEmpty()) {
                 try { engine.writeMirrorPng(ctx) } catch (_: Exception) { }
             }
@@ -1213,62 +1339,374 @@ object AgentLoop {
         } catch (_: Exception) {
             ""
         }
-        val cres = try {
-            AgentApi.captcha(
-                ctx, JSONObject()
-                    .put("screenshot_b64", shot)
-                    .put("widget_kind", kind)
-                    .put("page_url", url)
-            )
-        } catch (_: Exception) {
-            return "CAPTCHA aaya hai ($kind) — analysis nahi ho paya, aap khud solve karein"
-        }
-        val cinfo = cres.json?.optJSONObject("captcha")
-        val action = cinfo?.optString("action", "needs_user") ?: "needs_user"
-        val instruction = cinfo?.optString("instruction", "")
-            ?.ifEmpty { "CAPTCHA aaya hai ($kind)" } ?: "CAPTCHA aaya hai ($kind)"
+    }
 
-        when (action) {
-            "type_text" -> {
-                val chars = cinfo?.optString("characters", "") ?: ""
-                if (chars.isEmpty()) return "$instruction — aap khud likhein"
-                val sel = findCaptchaInput(snap, widget)
-                    ?: return "$instruction — input box nahi mila, aap khud likhein: $chars"
-                return try {
-                    engine.runAgentStep(
-                        JSONObject()
-                            .put("type", "fill")
-                            .put("selector", JSONObject()
-                                .put("mode", sel.first).put("value", sel.second))
-                            .put("text", chars)
-                    )
-                    attempts[0]++
-                    null // solve-attempt ho gaya — loop continue, agle round me re-check
-                } catch (e: FormEngine.VetoException) {
-                    "Payment page — safety ke liye rok diya"
-                } catch (_: Exception) {
-                    "$instruction — type nahi ho paya, aap khud likhein: $chars"
-                }
-            }
-            "click_checkbox" -> {
-                val rect = widget?.optJSONObject("rect")
-                val cx = rect?.optDouble("x", Double.NaN) ?: Double.NaN
-                val cy = rect?.optDouble("y", Double.NaN) ?: Double.NaN
-                val w = rect?.optDouble("w", 0.0) ?: 0.0
-                val h = rect?.optDouble("h", 0.0) ?: 0.0
-                if (cx.isNaN() || cy.isNaN()) return "$instruction — aap khud tick karein"
-                val tapped = try {
-                    engine.tapAt((cx + w / 2).toFloat(), (cy + h / 2).toFloat())
-                } catch (_: Exception) {
-                    false
-                }
-                if (!tapped) return "$instruction — tap nahi hua, aap khud tick karein"
-                attempts[0]++
-                try { Thread.sleep(2500) } catch (_: Exception) { }
-                return null // loop continue — agle round me dekho tick hua ya nahi
-            }
-            else -> return "$instruction — aap khud solve karein, phir task dobara chalayein"
+    /** detectCaptcha widgets ke HTML se capped snippet (AI analyze ke liye). */
+    private fun domSnippetForCaptcha(det: JSONObject): String {
+        val sb = StringBuilder()
+        val widgets = det.optJSONArray("widgets") ?: JSONArray()
+        for (i in 0 until widgets.length()) {
+            if (sb.length > 3000) break
+            val w = widgets.optJSONObject(i) ?: continue
+            sb.append("[")
+                .append(w.optString("kind", "?"))
+                .append("] ")
+                .append(w.optString("html", "").take(600))
+                .append("\n")
         }
+        return sb.toString().take(3200)
+    }
+
+    /**
+     * v14: AI ki action_sequence execute karo. Har step Operator khud karta
+     * hai; confidence < 0.5 wale targets skip (dobara analyze hoga).
+     * @return true = kam se kam ek step execute hua.
+     */
+    private fun executeCaptchaSequence(
+        ctx: Context,
+        engine: FormEngine,
+        cap: JSONObject,
+        snap: JSONObject,
+        widget: JSONObject?
+    ): Boolean {
+        val seq = cap.optJSONArray("action_sequence") ?: JSONArray()
+        var didAny = false
+        if (seq.length() == 0) {
+            // sequence nahi aayi → type-based legacy fallback
+            return executeCaptchaLegacy(ctx, engine, cap, snap, widget)
+        }
+        for (i in 0 until seq.length()) {
+            val st = seq.optJSONObject(i) ?: continue
+            val op = st.optString("op", "")
+            try {
+                when (op) {
+                    "tap" -> {
+                        val t = st.optJSONObject("target") ?: continue
+                        if (t.optDouble("confidence", 1.0) < 0.5) continue // skip, re-analyze
+                        val x = t.optDouble("x", -1.0)
+                        val y = t.optDouble("y", -1.0)
+                        if (x < 0 || y < 0) continue
+                        if (engine.tapNormalized(x, y)) {
+                            didAny = true
+                            Thread.sleep(700)
+                        }
+                    }
+                    "type" -> {
+                        val text = st.optString("text", "")
+                        if (text.isEmpty()) continue
+                        if (typeIntoCaptchaInput(engine, snap, widget, text)) {
+                            didAny = true
+                            Thread.sleep(700)
+                        }
+                    }
+                    "slide" -> {
+                        val from = st.optJSONObject("from")
+                        val to = st.optJSONObject("to")
+                        if (from == null || to == null) continue
+                        if (engine.swipeNormalized(
+                                from.optDouble("x", 0.0), from.optDouble("y", 0.0),
+                                to.optDouble("x", 0.0), to.optDouble("y", 0.0)
+                            )
+                        ) {
+                            didAny = true
+                            Thread.sleep(1000)
+                        }
+                    }
+                    "wait" -> {
+                        val secs = st.optDouble("seconds", 2.0).coerceIn(0.5, 10.0)
+                        Thread.sleep((secs * 1000).toLong())
+                        didAny = true
+                    }
+                }
+            } catch (_: Exception) { }
+        }
+        return didAny
+    }
+
+    /**
+     * action_sequence khaali ho to type-based fallback (legacy action field).
+     */
+    private fun executeCaptchaLegacy(
+        ctx: Context,
+        engine: FormEngine,
+        cap: JSONObject,
+        snap: JSONObject,
+        widget: JSONObject?
+    ): Boolean {
+        val type = cap.optString("type", "")
+        val targets = cap.optJSONArray("targets") ?: JSONArray()
+        fun targetXY(idx: Int): Pair<Double, Double>? {
+            val t = targets.optJSONObject(idx) ?: return null
+            if (t.optDouble("confidence", 1.0) < 0.5) return null
+            val x = t.optDouble("x", -1.0); val y = t.optDouble("y", -1.0)
+            return if (x >= 0 && y >= 0) x to y else null
+        }
+        return try {
+            when (type) {
+                "checkbox" -> {
+                    val xy = targetXY(0) ?: widgetCenter(widget) ?: return false
+                    val ok = engine.tapNormalized(xy.first, xy.second)
+                    if (ok) Thread.sleep(2500)
+                    ok
+                }
+                "text_entry" -> {
+                    val chars = cap.optString("characters", "")
+                    if (chars.isEmpty()) return false
+                    typeIntoCaptchaInput(engine, snap, widget, chars)
+                }
+                "image_select" -> {
+                    var any = false
+                    for (i in 0 until targets.length()) {
+                        val xy = targetXY(i) ?: continue
+                        if (engine.tapNormalized(xy.first, xy.second)) {
+                            any = true
+                            Thread.sleep(500)
+                        }
+                    }
+                    any
+                }
+                "puzzle_slide" -> {
+                    val a = targetXY(0); val b = targetXY(1)
+                    if (a == null || b == null) return false
+                    val ok = engine.swipeNormalized(a.first, a.second, b.first, b.second)
+                    if (ok) Thread.sleep(1000)
+                    ok
+                }
+                else -> false
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** Widget rect ka center (CSS px) — checkbox fallback ke liye. */
+    private fun widgetCenter(widget: JSONObject?): Pair<Double, Double>? {
+        val rect = widget?.optJSONObject("rect") ?: return null
+        val x = rect.optDouble("x", Double.NaN)
+        val y = rect.optDouble("y", Double.NaN)
+        if (x.isNaN() || y.isNaN()) return null
+        return (x + rect.optDouble("w", 0.0) / 2) to (y + rect.optDouble("h", 0.0) / 2)
+    }
+
+    /**
+     * Verify ka corrected next_action turant apply karo (naye analyze ka
+     * wait kiye bina). Formats: "tap:x,y" ya "type:<text>".
+     */
+    private fun applyCorrectedCaptchaAction(
+        ctx: Context,
+        engine: FormEngine,
+        nextAction: String,
+        cap: JSONObject,
+        snap: JSONObject,
+        widget: JSONObject?
+    ) {
+        try {
+            val na = nextAction.trim()
+            when {
+                na.startsWith("tap:") -> {
+                    val parts = na.removePrefix("tap:").split(",")
+                    if (parts.size == 2) {
+                        val x = parts[0].toDoubleOrNull()
+                        val y = parts[1].toDoubleOrNull()
+                        if (x != null && y != null) {
+                            engine.tapNormalized(x, y)
+                            Thread.sleep(700)
+                        }
+                    }
+                }
+                na.startsWith("type:") -> {
+                    val text = na.removePrefix("type:")
+                    if (text.isNotEmpty()) typeIntoCaptchaInput(engine, snap, widget, text)
+                }
+            }
+        } catch (_: Exception) { }
+    }
+
+    /** CAPTCHA characters ko page ke input me locally type karo (AI ko nahi bhejte). */
+    private fun typeIntoCaptchaInput(
+        engine: FormEngine,
+        snap: JSONObject,
+        widget: JSONObject?,
+        text: String
+    ): Boolean {
+        val sel = findCaptchaInput(snap, widget) ?: return false
+        return try {
+            engine.runAgentStep(
+                JSONObject()
+                    .put("type", "fill")
+                    .put("selector", JSONObject()
+                        .put("mode", sel.first).put("value", sel.second))
+                    .put("text", text)
+            )
+            Thread.sleep(700)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * v14 Operator page-understanding: har /api/agent/act call se pehle
+     * Operator page ka analysis banata hai — AI screenshot ke SAATH is block
+     * ko padh ke pehle page SAMAJHTA hai, phir action chunta hai.
+     * - page_kind (+ confidence): login | otp | captcha | payment | form |
+     *   success | error | listing | unknown
+     * - visible_summary: page par kya dikh raha hai (2-4 lines)
+     * - stuck_report: atka hua? kahan? kyun?
+     * - candidate_elements: label/type/state ke saath (max 20)
+     */
+    private fun buildPageAnalysis(
+        snap: JSONObject,
+        url: String,
+        stuckReport: String
+    ): JSONObject {
+        val pageText = snap.optString("page_text", "")
+        val title = snap.optString("title", "")
+        val (kind, kindConf) = inferPageKind(snap, url, title, pageText)
+        return JSONObject()
+            .put("page_kind", kind)
+            .put("page_kind_confidence", kindConf)
+            .put("visible_summary", visibleSummary(snap, title, pageText))
+            .put("stuck_report", stuckReport)
+            .put("candidate_elements", candidateElements(snap))
+    }
+
+    /** DOM text + fields + URL se page kind infer karo. */
+    private fun inferPageKind(
+        snap: JSONObject,
+        url: String,
+        title: String,
+        pageText: String
+    ): Pair<String, Double> {
+        val t = "$title $pageText $url".lowercase()
+        val fields = snap.optJSONArray("fields") ?: JSONArray()
+        var hasPassword = false
+        var hasOtpish = false
+        for (i in 0 until fields.length()) {
+            val f = fields.optJSONObject(i) ?: continue
+            val ty = f.optString("type", "").lowercase()
+            val blob = "${f.optString("label", "")} ${f.optString("placeholder", "")} " +
+                "${f.optString("aria", "")} ${f.optString("name", "")} " +
+                "${f.optString("id", "")}".lowercase()
+            if (ty == "password") hasPassword = true
+            if (blob.contains("otp") || blob.contains("one-time") ||
+                blob.contains("verification code") || blob.contains("verify code")
+            ) hasOtpish = true
+        }
+        fun has(vararg kws: String) = kws.any { t.contains(it) }
+        return when {
+            hasPassword -> "login" to 0.9
+            hasOtpish || has("enter otp", "otp bheja", "otp sent") -> "otp" to 0.85
+            has("captcha", "i'm not a robot", "i am not a robot") -> "captcha" to 0.85
+            has("payment", "upi", "pay now", "checkout", "card number", "cvv",
+                "netbanking", "bhugtan", "पेमेंट") -> "payment" to 0.85
+            has("success", "thank you", "submitted", "ho gaya", "mil gaya",
+                "confirmed") -> "success" to 0.75
+            has("error", "404", "not found", "something went wrong",
+                "try again later") -> "error" to 0.7
+            fields.length() > 0 -> "form" to 0.7
+            else -> "unknown" to 0.4
+        }
+    }
+
+    /** Page par kya dikh raha hai — compact summary (AI ke liye). */
+    private fun visibleSummary(
+        snap: JSONObject,
+        title: String,
+        pageText: String
+    ): String {
+        val sb = StringBuilder()
+        if (title.isNotEmpty()) sb.append("Title: ").append(title.take(120)).append("\n")
+        val text = pageText.trim().replace("\\s+".toRegex(), " ").take(600)
+        if (text.isNotEmpty()) sb.append("Text: ").append(text).append("\n")
+        val fields = snap.optJSONArray("fields") ?: JSONArray()
+        val buttons = snap.optJSONArray("buttons") ?: JSONArray()
+        sb.append("Fields: ").append(fields.length())
+            .append(", Buttons: ").append(buttons.length())
+        val labels = ArrayList<String>()
+        for (i in 0 until buttons.length().coerceAtMost(8)) {
+            val b = buttons.optJSONObject(i) ?: continue
+            val lbl = b.optString("label", "").trim().take(30)
+            if (lbl.isNotEmpty()) labels.add(lbl)
+        }
+        if (labels.isNotEmpty()) sb.append("\nButtons: ").append(labels.joinToString(" | "))
+        return sb.toString().take(1000)
+    }
+
+    /** Candidate elements: label/type/state (max 20) — AI inhi me se chunta hai. */
+    private fun candidateElements(snap: JSONObject): JSONArray {
+        val out = JSONArray()
+        fun push(tag: String, f: JSONObject) {
+            if (out.length() >= 20) return
+            val label = (f.optString("label", "").ifEmpty {
+                f.optString("placeholder", "")
+            }.ifEmpty { f.optString("aria", "") }
+                .ifEmpty { f.optString("text", "") }
+                .ifEmpty { f.optString("id", "") }).trim().take(60)
+            val rect = f.optJSONObject("rect")
+            out.put(
+                JSONObject()
+                    .put("tag", tag)
+                    .put("label", label)
+                    .put("type", f.optString("type", "").take(20))
+                    .put("state", elementState(f))
+                    .put("x", rect?.optDouble("x", 0.0) ?: 0.0)
+                    .put("y", rect?.optDouble("y", 0.0) ?: 0.0)
+            )
+        }
+        val fields = snap.optJSONArray("fields") ?: JSONArray()
+        for (i in 0 until fields.length()) {
+            fields.optJSONObject(i)?.let { push(it.optString("tag", "input"), it) }
+        }
+        val buttons = snap.optJSONArray("buttons") ?: JSONArray()
+        for (i in 0 until buttons.length()) {
+            buttons.optJSONObject(i)?.let { push("button", it) }
+        }
+        return out
+    }
+
+    /** Element state: visible/enabled/checked/selected/disabled. */
+    private fun elementState(f: JSONObject): String {
+        val parts = ArrayList<String>()
+        val rect = f.optJSONObject("rect")
+        val w = rect?.optDouble("w", 0.0) ?: 0.0
+        val h = rect?.optDouble("h", 0.0) ?: 0.0
+        parts.add(if (w > 0 && h > 0) "visible" else "hidden")
+        if (f.optBoolean("disabled", false)) parts.add("disabled") else parts.add("enabled")
+        if (f.optBoolean("checked", false)) parts.add("checked")
+        val sel = f.optString("selected", "")
+        if (sel.isNotEmpty()) parts.add("selected=$sel")
+        return parts.joinToString(",")
+    }
+
+    /**
+     * v14 stuck_report: atka hua? kahan? kyun? — history ke aakhri
+     * error/stuck entries se banta hai.
+     */
+    private fun buildStuckReport(
+        stuckCount: Int,
+        recentSigs: ArrayList<String>,
+        history: ArrayList<JSONObject>
+    ): String {
+        if (stuckCount == 0 && recentSigs.isEmpty()) return "not stuck"
+        val sb = StringBuilder()
+        sb.append("stuck_count=").append(stuckCount)
+        if (recentSigs.isNotEmpty()) {
+            sb.append("; repeating=").append(recentSigs.takeLast(3).joinToString(" ~ ").take(300))
+        }
+        val fails = ArrayList<String>()
+        for (i in history.size - 1 downTo 0) {
+            if (fails.size >= 3) break
+            val h = history[i]
+            val r = h.optString("result", "")
+            if (r == "error" || r == "stuck") {
+                fails.add(
+                    "${h.optString("action", "?")}: ${h.optString("detail", "").take(120)}"
+                )
+            }
+        }
+        if (fails.isNotEmpty()) sb.append("; last_failures=[").append(fails.joinToString(" | ")).append("]")
+        return sb.toString().take(800)
     }
 
     /**

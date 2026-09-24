@@ -149,13 +149,11 @@ class FormEngine(private val appContext: Context) {
             return runUploadStep(stepJson)
         }
         val s = StepParser.parse(jsonToMap(stepJson))
-        // Step-blob veto: AI ka payment action KABHI allow nahi — sirf goto
-        // tab skip jab assisted payment pehle verify ho chuki ho (success URL).
-        val skipStepVeto = paymentVerifiedOnce && s.type == "goto"
-        if (!skipStepVeto) {
-            VetoCheck.find(StepParser.vetoBlob(s))?.let {
-                throw VetoException("agent step ('${s.type}') me payment keyword '$it'")
-            }
+        // Step-blob veto: AI ka payment action KABHI allow nahi — koi bypass
+        // nahi (v14: paymentVerifiedOnce wala goto-skip hataya; action-level
+        // veto hamesha chalta hai).
+        VetoCheck.find(StepParser.vetoBlob(s))?.let {
+            throw VetoException("agent step ('${s.type}') me payment keyword '$it'")
         }
         // Live-page veto: payment verify ke baad suppress (receipt page par
         // "payment successful" text hota hai).
@@ -976,6 +974,112 @@ class FormEngine(private val appContext: Context) {
     }
 
     /**
+     * v14 CAPTCHA protocol: AI ke 0-1000 normalized coords → CSS px tap.
+     * Screenshot viewport ka linear scale hai, isliye mapping linear hai.
+     */
+    fun tapNormalized(x1000: Double, y1000: Double): Boolean {
+        val wv = webView ?: return false
+        val scale = try { wv.scale } catch (_: Exception) { 0f }
+        if (scale <= 0f) return false
+        val w = try { wv.width } catch (_: Exception) { 0 }
+        val h = try { wv.height } catch (_: Exception) { 0 }
+        if (w <= 0 || h <= 0) return false
+        val xCss = (x1000.coerceIn(0.0, 1000.0) / 1000.0 * w / scale).toFloat()
+        val yCss = (y1000.coerceIn(0.0, 1000.0) / 1000.0 * h / scale).toFloat()
+        return tapAt(xCss, yCss)
+    }
+
+    /**
+     * v14 CAPTCHA protocol: puzzle_slide ke liye normalized swipe
+     * (down → moves → up).
+     */
+    fun swipeNormalized(x1: Double, y1: Double, x2: Double, y2: Double): Boolean {
+        val h = handler ?: return false
+        val latch = CountDownLatch(1)
+        var sent = false
+        h.post {
+            try {
+                val wv = webView ?: return@post
+                val scale = wv.scale
+                if (scale <= 0f) return@post
+                fun cx(x: Double) = (x.coerceIn(0.0, 1000.0) / 1000.0 * wv.width / scale).toFloat()
+                fun cy(y: Double) = (y.coerceIn(0.0, 1000.0) / 1000.0 * wv.height / scale).toFloat()
+                val now = android.os.SystemClock.uptimeMillis()
+                val down = android.view.MotionEvent.obtain(
+                    now, now, android.view.MotionEvent.ACTION_DOWN, cx(x1), cy(y1), 0
+                )
+                wv.dispatchTouchEvent(down)
+                // 10 interpolated moves (~300ms) — slider pakad ke kheenchna
+                val steps = 10
+                for (i in 1..steps) {
+                    val t = i.toFloat() / steps
+                    val mx = cx(x1) + (cx(x2) - cx(x1)) * t
+                    val my = cy(y1) + (cy(y2) - cy(y1)) * t
+                    val mv = android.view.MotionEvent.obtain(
+                        now, now + i * 30L, android.view.MotionEvent.ACTION_MOVE, mx, my, 0
+                    )
+                    wv.dispatchTouchEvent(mv)
+                    mv.recycle()
+                }
+                val up = android.view.MotionEvent.obtain(
+                    now, now + 350, android.view.MotionEvent.ACTION_UP, cx(x2), cy(y2), 0
+                )
+                wv.dispatchTouchEvent(up)
+                down.recycle(); up.recycle()
+                sent = true
+            } catch (_: Exception) { }
+            latch.countDown()
+        }
+        latch.await(10, TimeUnit.SECONDS)
+        return sent
+    }
+
+    /**
+     * v14 CAPTCHA protocol: height-cap ke BINA screenshot — y-coords ka
+     * linear mapping sahi rahe (1200px cap aspect bigaad deta hai).
+     */
+    fun captureCaptchaPngBase64(): String {
+        for (w in intArrayOf(540, 400, 320)) {
+            val b64 = renderAtWidthUncapped(w)
+            if (b64.isNotEmpty() && b64.length * 3 / 4 <= 400 * 1024) return b64
+            if (b64.isNotEmpty()) return b64
+        }
+        return ""
+    }
+
+    private fun renderAtWidthUncapped(w: Int): String {
+        val b = renderBitmapUncapped(w) ?: return ""
+        return try {
+            val out = ByteArrayOutputStream()
+            b.compress(Bitmap.CompressFormat.PNG, 100, out)
+            b.recycle()
+            Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+        } catch (_: Exception) { "" }
+    }
+
+    private fun renderBitmapUncapped(w: Int): Bitmap? {
+        val latch = CountDownLatch(1)
+        var bmp: Bitmap? = null
+        handler!!.post {
+            try {
+                val wv = webView!!
+                val h = 960 * wv.height / wv.width.coerceAtLeast(1)
+                val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                val canvas = android.graphics.Canvas(b)
+                canvas.scale(
+                    w.toFloat() / wv.width.coerceAtLeast(1),
+                    h.toFloat() / wv.height.coerceAtLeast(1)
+                )
+                wv.draw(canvas)
+                bmp = b
+            } catch (_: Exception) { }
+            latch.countDown()
+        }
+        latch.await(15, TimeUnit.SECONDS)
+        return bmp
+    }
+
+    /**
      * captcha_detect — recaptcha / hcaptcha / turnstile iframes, class/id me
      * "captcha" wale elements, src me "captcha" wali images scan karo.
      */
@@ -1027,6 +1131,26 @@ class FormEngine(private val appContext: Context) {
             try{ imgs=doc.querySelectorAll('img'); }catch(e){ return; }
             Array.from(imgs).forEach(function(im){
               if((im.src||'').toLowerCase().indexOf('captcha')>=0) push('image_captcha', im, im.outerHTML);
+              else if((im.alt||'').toLowerCase().indexOf('captcha')>=0) push('image_captcha', im, im.outerHTML);
+            });
+            // v14: data-sitekey wale elements (invisible recaptcha/turnstile)
+            var sk;
+            try{ sk=doc.querySelectorAll('[data-sitekey]'); }catch(e){ return; }
+            Array.from(sk).forEach(function(e){
+              var c=(cls(e)+' '+(e.id||'')).toLowerCase();
+              var kind='recaptcha';
+              if(c.indexOf('hcaptcha')>=0) kind='hcaptcha';
+              else if(c.indexOf('turnstile')>=0||c.indexOf('cloudflare')>=0) kind='turnstile';
+              push(kind, e, e.outerHTML);
+            });
+            // v14: aria-label me captcha (accessible widgets)
+            var al;
+            try{ al=doc.querySelectorAll('[aria-label]'); }catch(e){ return; }
+            Array.from(al).forEach(function(e){
+              try{
+                var a=(e.getAttribute('aria-label')||'').toLowerCase();
+                if(a.indexOf('captcha')>=0) push('captcha_element', e, e.outerHTML);
+              }catch(x){}
             });
           });
           return JSON.stringify({found: out.length>0, widgets: out});
@@ -1152,7 +1276,7 @@ class FormEngine(private val appContext: Context) {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(src.absolutePath, bounds)
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
-            throw Exception("upload: image decode nahi hui: ${src.name}")
+            throw Exception("upload: image decode nahi hui (name hidden)")
         }
         var sample = 1
         val dim = maxOf(bounds.outWidth, bounds.outHeight)
@@ -1162,7 +1286,7 @@ class FormEngine(private val appContext: Context) {
         while (true) {
             val o2 = BitmapFactory.Options().apply { inSampleSize = sample }
             val bmp = BitmapFactory.decodeFile(src.absolutePath, o2)
-                ?: throw Exception("upload: image decode nahi hui: ${src.name}")
+                ?: throw Exception("upload: image decode nahi hui (name hidden)")
             try {
                 java.io.FileOutputStream(out).use { fos ->
                     bmp.compress(Bitmap.CompressFormat.JPEG, quality, fos)
@@ -1251,14 +1375,26 @@ class FormEngine(private val appContext: Context) {
                 pendingUploadLatch = null
             }
             Thread.sleep(1000)
+            // v14: upload ke baad page par confirmation text dikha? (verify)
+            val confirms = pageConfirmsUpload()
+            // v14: filename kabhi result/history/server payload me nahi
             return JSONObject()
                 .put("uploaded", true)
-                .put("file", file.name)
+                .put("file", "(name hidden)")
                 .put("bytes", final.length())
+                .put("page_confirms", confirms)
         } finally {
             // decrypt ka temp saaf karo (original chhedo mat)
             if (uploadSrc != file) {
                 try { uploadSrc.delete() } catch (_: Exception) { }
+            }
+            // v14: purani plaintext docs file → successful read ke baad
+            // encrypted me migrate (best-effort; docs-dir-bahar chhoote).
+            if (uploadSrc == file) {
+                try {
+                    com.formmitra.app.agent.DocsStore
+                        .migratePlaintextToEncrypted(appContext, file)
+                } catch (_: Exception) { }
             }
             // HIGH-2: compress ki plaintext copy bhi saaf karo. Upload ho
             // chuka hai — chooser ko file upar Thread.sleep(1000) se pehle
@@ -1267,6 +1403,27 @@ class FormEngine(private val appContext: Context) {
             if (ct != null && ct != uploadSrc && ct != file) {
                 try { ct.delete() } catch (_: Exception) { }
             }
+        }
+    }
+
+    /**
+     * v14: upload ke baad page par confirmation text dikha? (best-effort
+     * verify — site apna file input accept kar chuka hai ya nahi).
+     */
+    private fun pageConfirmsUpload(): Boolean {
+        return try {
+            val txt = unwrapJsString(
+                evalJsSync(
+                    "(function(){try{return document.body.innerText||''}catch(e){return ''}})()",
+                    10_000
+                )
+            ).lowercase()
+            listOf(
+                "upload", "success", "attached", "added", "uploaded",
+                "file", "document", "submit"
+            ).any { txt.contains(it) }
+        } catch (_: Exception) {
+            false
         }
     }
 

@@ -112,6 +112,20 @@ fun main() {
     check("stuck repeats = 3", AgentActions.STUCK_REPEATS == 3)
     check("stuck max = 4", AgentActions.STUCK_MAX == 4)
 
+    // ---- 5. v14: back/forward actions (AI allowlist + spec mapping) ----
+    check(
+        "back allowed",
+        validateAgentStep(mapOf("action" to "back")) == null
+    )
+    check(
+        "forward allowed",
+        validateAgentStep(mapOf("action" to "forward")) == null
+    )
+    val bspec = agentStepToSpec(mapOf("action" to "back"))
+    check("back spec mapping", StepParser.parse(bspec).type == "back")
+    val fspec = agentStepToSpec(mapOf("action" to "forward"))
+    check("forward spec mapping", StepParser.parse(fspec).type == "forward")
+
     if (failures > 0) {
         println("$failures FAILURES")
         kotlin.system.exitProcess(1)

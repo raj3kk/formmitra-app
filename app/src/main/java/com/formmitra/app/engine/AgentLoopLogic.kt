@@ -18,6 +18,7 @@ object AgentActions {
     val ALL = setOf(
         "fill", "select", "toggle", "press", "click", "goto",
         "wait_for_text", "wait_for_element", "wait_for_navigation",
+        "back", "forward",
         "upload", "done", "needs_user", "vetoed"
     )
     /** Terminal actions — execute nahi hote, loop finish karte hain. */
@@ -41,6 +42,8 @@ object AgentActions {
         "wait_for_text" to "wait_for_text",
         "wait_for_element" to "wait_for_element",
         "wait_for_navigation" to "wait_for_navigation",
+        "back" to "back",
+        "forward" to "forward",
         "upload" to "upload"
     )
     /** Confidence isse kam ho to step reject (andha action nahi chalega). */

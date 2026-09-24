@@ -80,7 +80,7 @@ Rules:
         }
 
         val key = Standalone.getKey(ctx)?.ifEmpty { null } ?: return null
-        val profile = fetchVaultProfile(ctx)
+        val profile = minimizeProfile(fetchVaultProfile(ctx), req)
         val userText = buildUserText(req, profile)
 
         val body = JSONObject()
@@ -96,6 +96,16 @@ Rules:
 
         val respText = try {
             postGroq(key, body)
+        } catch (e: GroqAuthException) {
+            // v14: 401 = key galat/expire — explicit needs_user, koi
+            // deterministic fallback nahi (galat key se andha kaam nahi).
+            return JSONObject()
+                .put("action", "needs_user")
+                .put(
+                    "user_prompt",
+                    "Groq API key galat ya expire ho gayi hai — ⚙️ settings me nayi key dalen, phir task dobara chalayein"
+                )
+                .put("confidence", 1.0)
         } catch (_: Exception) {
             return null
         } ?: return null
@@ -113,6 +123,25 @@ Rules:
                 .put("user_prompt", "AI se sahi jawab nahi mila — aap dekh lein")
                 .put("confidence", 1.0)
 
+        // v14: AI ke jawab par payment keyword scan (action/value/url/text/
+        // reason/selector/user_prompt) — server-side veto ka standalone mirror.
+        val aiBlob = listOf(
+            step.optString("action", ""),
+            step.optString("value", ""),
+            step.optString("url", ""),
+            step.optString("text", ""),
+            step.optString("reason", ""),
+            step.optString("result_summary", ""),
+            step.optString("user_prompt", ""),
+            step.optJSONObject("selector")?.optString("value", "") ?: ""
+        ).joinToString(" ")
+        VetoCheck.find(aiBlob)?.let { kw ->
+            return JSONObject()
+                .put("action", "vetoed")
+                .put("blocked_reason", "PAYMENT VETO (standalone AI output): '$kw' mila")
+                .put("confidence", 1.0)
+        }
+
         // confidence < 0.55 → needs_user (server jaisa)
         val conf = step.optDouble("confidence", 1.0)
         if (conf < 0.55) {
@@ -127,7 +156,10 @@ Rules:
         return step
     }
 
-    /** Groq POST. 2xx → response text; kuch aur → null (caller fallback). */
+    /** 401 (invalid/expired key) — deterministic fallback nahi, explicit handoff. */
+    private class GroqAuthException : Exception()
+
+    /** Groq POST. 2xx → response text; 401 → GroqAuthException; baaki → null. */
     private fun postGroq(apiKey: String, body: JSONObject): String? {
         val conn = (URL(GROQ_URL).openConnection() as HttpURLConnection).apply {
             connectTimeout = TIMEOUT_MS
@@ -141,12 +173,62 @@ Rules:
         return try {
             conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
+            if (code == 401) throw GroqAuthException()
             if (code !in 200..299) return null
             conn.inputStream.bufferedReader().use { it.readText() }.ifEmpty { null }
+        } catch (e: GroqAuthException) {
+            throw e
         } catch (_: Exception) {
             null
         } finally {
             conn.disconnect()
+        }
+    }
+
+    /**
+     * v14: profile minimization — Groq ko sirf wahi fields bhejo jo is page /
+     * goal ke liye relevant hain (visible DOM + goal text se match).
+     */
+    private fun minimizeProfile(
+        profile: Map<String, String>,
+        req: JSONObject
+    ): Map<String, String> {
+        if (profile.isEmpty()) return profile
+        val snap = req.optJSONObject("dom_snapshot") ?: JSONObject()
+        val labelBlob = StringBuilder()
+        val fields = snap.optJSONArray("fields") ?: JSONArray()
+        for (i in 0 until fields.length()) {
+            val f = fields.optJSONObject(i) ?: continue
+            labelBlob.append(f.optString("label", "")).append(" ")
+                .append(f.optString("placeholder", "")).append(" ")
+                .append(f.optString("aria", "")).append(" ")
+                .append(f.optString("name", "")).append(" ")
+        }
+        val blob = (req.optString("goal", "") + " " +
+            snap.optString("page_text", "") + " " + labelBlob.toString()).lowercase()
+        // key → us field ko dhoondhne wale hints
+        val hints = mapOf(
+            "name" to listOf("name", "naam", "full name"),
+            "email" to listOf("email", "e-mail", "mail"),
+            "phone" to listOf("phone", "mobile", "tel", "number"),
+            "dob" to listOf("dob", "birth", "janm", "date of birth"),
+            "gender" to listOf("gender", "ling"),
+            "address" to listOf("address", "pata", "street"),
+            "city" to listOf("city", "shahar"),
+            "state" to listOf("state", "rajya"),
+            "pincode" to listOf("pin", "pincode", "postal", "zip"),
+            "country" to listOf("country", "desh"),
+            "aadhaar" to listOf("aadhaar", "aadhar"),
+            "pan" to listOf("pan"),
+            "occupation" to listOf("occupation", "job", "profession", "kaam"),
+            "education" to listOf("education", "qualification", "degree", "padhai")
+        )
+        return profile.filter { (k, _) ->
+            val key = k.lowercase()
+            if (blob.contains(key)) return@filter true
+            val hs = hints.entries.firstOrNull { key.contains(it.key) }?.value
+                ?: return@filter blob.contains(key.take(4))
+            hs.any { blob.contains(it) }
         }
     }
 

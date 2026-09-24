@@ -35,6 +35,8 @@ class MainActivity : Activity() {
     private lateinit var webView: WebView
     private lateinit var agentChatView: AgentChatView
     private var agentVisible = false
+    private lateinit var historyView: com.formmitra.app.agent.HistoryView
+    private var historyVisible = false
 
     // Browser mirror tab (live agent screenshot)
     private lateinit var browserMirrorView: LinearLayout
@@ -57,6 +59,8 @@ class MainActivity : Activity() {
         "Jobs" to "/jobs",
         "Agent" to "/agent",
         "Browser" to "/browser",
+        "History" to "/history",
+        "Admin" to "/admin/agents",
         "Profile" to "/profile"
     )
 
@@ -83,6 +87,10 @@ class MainActivity : Activity() {
             databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
         }
+        // v14 audit: third-party cookies ON rakhe hain (jaanch ke baad faisla).
+        // Wajah: form automation me embedded widgets (payment/SSO iframes)
+        // third-party cookies ke bina toot jate hain; ye single-user ka apna
+        // automation WebView hai, general browser nahi — compatibility jeetti.
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
@@ -99,6 +107,15 @@ class MainActivity : Activity() {
             visibility = android.view.View.GONE
         }
         root.addView(agentChatView)
+
+        // History tab — native runs history (cafe wala hisaab)
+        historyView = com.formmitra.app.agent.HistoryView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            )
+            visibility = android.view.View.GONE
+        }
+        root.addView(historyView)
 
         // Browser mirror tab — engine ka agent_mirror.png har 3s refresh
         browserMirrorView = LinearLayout(this).apply {
@@ -128,10 +145,11 @@ class MainActivity : Activity() {
         browserMirrorView.addView(mirrorImg)
         root.addView(browserMirrorView)
 
-        val nav = LinearLayout(this).apply {
+        // Bottom nav — HorizontalScrollView (8 tabs phone par cramped na hon)
+        val navInner = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             )
         }
@@ -139,20 +157,37 @@ class MainActivity : Activity() {
             Button(this).apply {
                 text = label
                 textSize = 13f
+                minWidth = (88 * resources.displayMetrics.density).toInt()
                 layoutParams = LinearLayout.LayoutParams(
-                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
-                )
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    val m = (4 * resources.displayMetrics.density).toInt()
+                    setMargins(m, 0, m, 0)
+                }
                 setOnClickListener { selectTab(path) }
             }
         }
-        navButtons.forEach { nav.addView(it) }
-        root.addView(nav)
+        navButtons.forEach { navInner.addView(it) }
+        val navScroll = android.widget.HorizontalScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+            isHorizontalScrollBarEnabled = false
+            addView(navInner)
+        }
+        root.addView(navScroll)
         setContentView(root)
 
         // Deep link (notification tap) ya fresh launch
         val deepUrl = intent.getStringExtra("deep_url")
+        val openTab = intent.getStringExtra("open_tab")
         if (!deepUrl.isNullOrEmpty()) {
             loadDeepUrl(deepUrl)
+        } else if (!openTab.isNullOrEmpty()) {
+            // Prompt notification tap → seedha Agent tab (popup poller dikhayega)
+            selectTab(openTab)
         } else {
             selectTab("/")
         }
@@ -175,6 +210,39 @@ class MainActivity : Activity() {
         super.onNewIntent(intent)
         val deepUrl = intent.getStringExtra("deep_url")
         if (!deepUrl.isNullOrEmpty()) loadDeepUrl(deepUrl)
+        val openTab = intent.getStringExtra("open_tab")
+        if (!openTab.isNullOrEmpty()) selectTab(openTab)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // App-wide prompt poller: user kisi bhi tab me ho, agent ka sawal
+        // (OTP/input/choice/payment) popup me aayega. Agent tab ka apna
+        // poller bhi hai — isShowing guard se double-dialog nahi hoga.
+        promptHandler.post(promptPollRunnable)
+    }
+
+    override fun onPause() {
+        promptHandler.removeCallbacks(promptPollRunnable)
+        super.onPause()
+    }
+
+    /** Kisi bhi tab se pending agent prompt ko popup me dikhao. */
+    private val promptHandler = Handler(Looper.getMainLooper())
+    private val promptPollRunnable = object : Runnable {
+        override fun run() {
+            try {
+                val req = com.formmitra.app.engine.UserPrompt.pendingRequest()
+                if (req != null &&
+                    !com.formmitra.app.agent.PromptDialog.isShowing(req.runId)
+                ) {
+                    com.formmitra.app.agent.PromptDialog.show(
+                        this@MainActivity, req
+                    )
+                }
+            } catch (_: Exception) { }
+            promptHandler.postDelayed(this, 3000)
+        }
     }
 
     private fun baseUrl(): String = BuildConfig.SITE_URL.trimEnd('/')
@@ -182,9 +250,11 @@ class MainActivity : Activity() {
     private fun selectTab(path: String) {
         val wasAgent = agentVisible
         agentVisible = false
+        historyVisible = false
         browserVisible = false
         mirrorHandler.removeCallbacks(mirrorRunnable)
         agentChatView.visibility = View.GONE
+        historyView.visibility = View.GONE
         browserMirrorView.visibility = View.GONE
         webView.visibility = View.GONE
         if (wasAgent && path != "/agent") agentChatView.onTabHidden()
@@ -194,6 +264,12 @@ class MainActivity : Activity() {
                 agentChatView.visibility = View.VISIBLE
                 agentVisible = true
                 agentChatView.onTabShown()
+            }
+            "/history" -> {
+                // Native history tab
+                historyView.visibility = View.VISIBLE
+                historyVisible = true
+                historyView.onTabShown()
             }
             "/browser" -> {
                 // Live browser mirror — engine ka screenshot
@@ -216,6 +292,7 @@ class MainActivity : Activity() {
         browserVisible = false
         mirrorHandler.removeCallbacks(mirrorRunnable)
         agentChatView.visibility = View.GONE
+        historyView.visibility = View.GONE
         browserMirrorView.visibility = View.GONE
         webView.visibility = View.VISIBLE
         webView.loadUrl(url)
@@ -232,6 +309,7 @@ class MainActivity : Activity() {
             browserVisible = false
             mirrorHandler.removeCallbacks(mirrorRunnable)
             agentChatView.visibility = View.GONE
+            historyView.visibility = View.GONE
             browserMirrorView.visibility = View.GONE
             webView.visibility = View.VISIBLE
             webView.loadUrl(fullUrl)
@@ -253,7 +331,7 @@ class MainActivity : Activity() {
 
     @Deprecated("Use OnBackPressedDispatcher on newer APIs")
     override fun onBackPressed() {
-        if (agentVisible || browserVisible) {
+        if (agentVisible || browserVisible || historyVisible) {
             super.onBackPressed()
         } else if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
     }
@@ -333,6 +411,10 @@ class MainActivity : Activity() {
     @Deprecated("Document picker AgentChatView ke liye")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        // Agent prompt ka document picker (vault doc chuno / naya upload)
+        try {
+            com.formmitra.app.agent.PromptDialog.onDocPickResult(requestCode, data)
+        } catch (_: Exception) { }
         if (::agentChatView.isInitialized) {
             agentChatView.handleActivityResult(requestCode, resultCode, data)
         }

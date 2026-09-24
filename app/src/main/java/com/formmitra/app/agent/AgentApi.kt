@@ -86,24 +86,45 @@ object AgentApi {
 
     /**
      * POST /api/agent/act — brain step.
-     * Request: {goal, url, page_title, dom_snapshot, screenshot_b64,
-     *           history[], stuck_count, run_id}
+     * Request: {goal, url, page_title, page_analysis, dom_snapshot,
+     *           screenshot_b64, history[], stuck_count, run_id}
      * Response: {step{action, selector{mode,value}, value, option, url, key,
      *                  text, confidence, reason, requires_user, blocked_reason,
      *                  user_prompt, result_summary}, provider, model}
      * 401 = not logged in, 429 = rate limited. Timeout 60s (server AI call).
+     * v14: transient failures (network/-1 ya 5xx) par ek bounded retry (2s
+     * backoff) — 401/429/4xx par kabhi retry nahi.
      */
     fun act(ctx: Context, body: JSONObject): ApiResult =
-        postWithTimeout("/api/agent/act", ctx, body, 60_000)
+        postTransientRetry("/api/agent/act", ctx, body, 60_000)
 
     /**
-     * POST /api/agent/captcha — CAPTCHA analysis (AI sirf analyze karta hai).
-     * Request: {screenshot_b64, widget_kind, page_url}
-     * Response: {captcha{type, instruction, action, position_hint}}
-     * Timeout 60s.
+     * POST /api/agent/captcha — CAPTCHA protocol (AI sirf analyze karta hai).
+     * Request analyze: {mode, screenshot_b64, dom_snippet, url, attempt}
+     * Request verify:  {mode, screenshot_b64, dom_snippet, url, attempt, verify_hint}
+     * Timeout 60s. Transient-only retry act() jaisa.
      */
     fun captcha(ctx: Context, body: JSONObject): ApiResult =
-        postWithTimeout("/api/agent/captcha", ctx, body, 60_000)
+        postTransientRetry("/api/agent/captcha", ctx, body, 60_000)
+
+    /**
+     * Transient-only bounded retry: network fail (-1) ya HTTP 5xx par ek
+     * baar 2s backoff ke saath retry. 401/429/4xx par seedha wapas.
+     */
+    private fun postTransientRetry(
+        path: String,
+        ctx: Context,
+        body: JSONObject,
+        timeoutMs: Int
+    ): ApiResult {
+        val first = postWithTimeout(path, ctx, body, timeoutMs)
+        val transient = first.code == -1 || first.code in 500..599
+        if (!transient) return first
+        try {
+            Thread.sleep(2000)
+        } catch (_: Exception) { }
+        return postWithTimeout(path, ctx, body, timeoutMs)
+    }
 
     /** POST /api/agent/chat — poora history bhejo, reply + plan|null + missing_docs wapas. */
     fun chat(ctx: Context, messages: List<Pair<String, String>>): ApiResult {
@@ -267,5 +288,39 @@ object AgentApi {
         if (res.code !in 200..299) return null
         val p = res.json?.optJSONObject("profile")
         return p ?: res.json
+    }
+
+    /**
+     * POST /api/agent/precheck — "ye kaam ho sakta hai ya nahi?" pehle check.
+     * @return poora response JSONObject ya null (network fail).
+     */
+    fun precheck(ctx: Context, url: String, goal: String): ApiResult {
+        val body = JSONObject()
+            .put("url", url)
+            .put("goal", goal.take(500))
+        return post("/api/agent/precheck", ctx, body)
+    }
+
+    /**
+     * GET /api/agent/site-memory — is user ki seekhi hui site memories.
+     * @return JSONArray ya null.
+     */
+    fun siteMemory(ctx: Context): JSONArray? {
+        val res = get("/api/agent/site-memory", ctx)
+        if (res.code !in 200..299) return null
+        return res.json?.optJSONArray("memories")
+    }
+
+    /**
+     * PATCH /api/agent/runs — payment status update (device verify ke baad).
+     * payment: {status, amount, merchant, upi_id, txn_ref, verified_at}
+     */
+    fun patchPayment(ctx: Context, runId: String, payment: JSONObject): Boolean {
+        if (runId.isEmpty()) return false
+        val body = JSONObject()
+            .put("run_id", runId)
+            .put("payment", payment)
+        val res = patch("/api/agent/runs", ctx, body)
+        return res.code in 200..299
     }
 }
