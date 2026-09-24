@@ -79,6 +79,9 @@ class FormRunService : Service() {
         val stepsJson = task.optJSONArray("steps") ?: JSONArray()
         val total = stepsJson.length()
         var lastReported = 0
+        // Standalone (offline) task: server bilkul nahi — Groq direct + local store
+        val standalone = task.optBoolean("standalone", false) ||
+            runId.startsWith("local-")
 
         val engine = FormEngine(this)
         val firstStep = stepsJson.optJSONObject(0)
@@ -87,15 +90,33 @@ class FormRunService : Service() {
                 // AI agent mode — AgentLoop har step khud decide karta hai
                 val goal = firstStep.optString("goal", name).ifEmpty { name }
                 val url = firstStep.optString("url", task.optString("target_url", ""))
-                AgentLoop.runAgentTask(this, engine, goal, url, runId, 40) { aiStep ->
-                    val payload = JSONObject()
-                        .put("status", "progress")
-                        .put("current_step", aiStep)
-                        .put("total_steps", 40)
-                        .put("mode", "agent")
-                    FormApi.report(this, runId, payload)
-                    updateOngoing("Form bhar raha hai: $name", "AI step $aiStep / 40")
-                }
+                var offlineMode = false
+                var standaloneMode = false
+                AgentLoop.runAgentTask(
+                    this, engine, goal, url, runId, 40,
+                    onProgress = { aiStep ->
+                        val mode = when {
+                            standalone || standaloneMode -> "agent_standalone"
+                            offlineMode -> "agent_offline"
+                            else -> "agent"
+                        }
+                        val payload = JSONObject()
+                            .put("status", "progress")
+                            .put("current_step", aiStep)
+                            .put("total_steps", 40)
+                            .put("mode", mode)
+                        FormApi.report(this, runId, payload)
+                        val suffix = when {
+                            standalone || standaloneMode -> " (standalone)"
+                            offlineMode -> " (offline mode)"
+                            else -> ""
+                        }
+                        updateOngoing("Form bhar raha hai: $name", "AI step $aiStep / 40$suffix")
+                    },
+                    onOfflineMode = { offlineMode = true },
+                    onStandaloneMode = { standaloneMode = true },
+                    forceStandalone = standalone
+                )
             } else {
                 engine.runTask(task) { step1Based, _ ->
                     // progress cadence: RunPolicy (short: har step, long: har 3)
@@ -128,6 +149,12 @@ class FormRunService : Service() {
         try {
             FormApi.report(this, runId, terminal)
         } catch (_: Exception) { }
+        // Standalone task ka terminal status local store me (reboot-resume ke liye)
+        if (standalone) {
+            try {
+                StandaloneStore.setStatus(this, runId, result.status)
+            } catch (_: Exception) { }
+        }
 
         // User notification (Hinglish)
         when (result.status) {

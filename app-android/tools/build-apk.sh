@@ -18,11 +18,11 @@ rm -rf $OUT && mkdir -p $OUT/{aar,classes,dex,res}
 export JAVA_HOME=$PTOOLS/jdk-17
 export PATH=$JAVA_HOME/bin:$PATH
 APPID="com.formmitra.app"
-VERSION_CODE=4
-VERSION_NAME="1.0.4-v4"
+VERSION_CODE=10
+VERSION_NAME="1.0.10-v10"
 SITE_URL="https://formmitra-git-main-webbuilder1.vercel.app/"
 # Output APK name parameterized — v1 APK (formmitra-v1.apk) untouched rehta hai.
-APK_NAME="formmitra-v4.apk"
+APK_NAME="formmitra-v10.apk"
 
 # BuildConfig.java sync (manual build me Gradle nahi hai)
 sed -i -e "s/VERSION_NAME = \"[^\"]*\"/VERSION_NAME = \"$VERSION_NAME\"/" \
@@ -44,6 +44,8 @@ while IFS='=' read -r coord dest; do
     *.jar) JARS+=("$dest") ;;
   esac
 done < $PTOOLS/deps/artifacts.txt
+# zxing-core (UPI QR): compile classpath me bhi chahiye (d8 me alag se add hai)
+if [ -f "$FA/tools/zxing-core-3.5.3.jar" ]; then JARS+=("$FA/tools/zxing-core-3.5.3.jar"); fi
 for j in "${JARS[@]}"; do CP="$CP:$j"; done
 echo "jars: ${#JARS[@]}"
 

@@ -36,7 +36,9 @@ object AgentLoop {
         maxSteps: Int = 40,
         onProgress: (Int) -> Unit = {},
         onOfflineMode: () -> Unit = {},
-        onStandaloneMode: () -> Unit = {}
+        onStandaloneMode: () -> Unit = {},
+        /** true = server ko chhodo, har step StandaloneBrain (user ki Groq key) se */
+        forceStandalone: Boolean = false
     ): FormEngine.RunResult {
         val stepsLog = JSONArray()
         val history = ArrayList<JSONObject>()
@@ -52,6 +54,9 @@ object AgentLoop {
         val sensitiveKeys = mutableSetOf<String>()
         // Payment prompt ek run me ek hi baar — doosri baar seedha vetoed.
         var paymentPrompted = false
+        // Login/document prompt bhi ek run me ek hi baar (proactive triggers ke liye)
+        var loginPrompted = false
+        var docPrompted = false
 
         // Local task: runId khaali ho to local-<timestamp> (standalone mode —
         // UI agent local task banate waqt khud bhi yehi format bhej sakta hai)
@@ -233,7 +238,23 @@ object AgentLoop {
                     .put("run_id", runId)
                     // OTP/password yahan se filtered — AI/server ko kabhi nahi jate
                     .put("user_provided", filteredUserProvided(userProvided, sensitiveKeys))
-                var res: AgentApi.ApiResult = try {
+                // forceStandalone (offline task): server ko chhodo, seedha user ki
+                // Groq key se StandaloneBrain. Server unreachable fallback neeche
+                // (per-step) waise bhi hai; ye poore run ka standalone mode hai.
+                var res: AgentApi.ApiResult = if (forceStandalone && Standalone.isConfigured(ctx)) {
+                    try { onStandaloneMode() } catch (_: Exception) { }
+                    logStep(i, "act", false, "standalone mode → StandaloneBrain (Groq direct)")
+                    val sbStep: JSONObject? = try {
+                        StandaloneBrain.decide(ctx, reqBody)
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (sbStep != null) {
+                        AgentApi.ApiResult(200, JSONObject().put("step", sbStep))
+                    } else {
+                        AgentApi.ApiResult(-1, null)
+                    }
+                } else try {
                     AgentApi.act(ctx, reqBody)
                 } catch (_: Exception) {
                     AgentApi.ApiResult(-1, null)
@@ -372,6 +393,21 @@ object AgentLoop {
                     stuckCount++
                     pushHistory(action, stepMap, "stuck", "same action 3 baar")
                     logStep(i, action, false, "stuck: same action 3 baar (stuck_count=$stuckCount)")
+                    // Login page par atke ho? → credentials maango (ek baar),
+                    // local-only fill, same run continue.
+                    if (!loginPrompted && hasPasswordField(engine)) {
+                        loginPrompted = true
+                        val loginOk = askLoginProactively(
+                            ctx, engine, agentRunId ?: effectiveRunId,
+                            sensitiveKeys, history
+                        )
+                        if (loginOk) {
+                            stuckCount = 0
+                            consecErrors = 0
+                            recentSigs.clear()
+                            continue
+                        }
+                    }
                     if (stuckCount >= AgentActions.STUCK_MAX) {
                         return finish(
                             "needs_user",
@@ -432,6 +468,21 @@ object AgentLoop {
                 } catch (e: Exception) {
                     val msg = (e.message ?: "error").take(200)
                     pushHistory(action, stepMap, "error", msg)
+                    // Upload me file missing → user se document maango (ek baar),
+                    // same run continue. Dobara fail → neeche noteError path.
+                    if (action == "upload" && !docPrompted &&
+                        (msg.contains("file nahi mili") || msg.contains("upload:"))
+                    ) {
+                        docPrompted = true
+                        val docOk = askDocumentProactively(
+                            ctx, engine, agentRunId ?: effectiveRunId,
+                            userProvided, history
+                        )
+                        if (docOk) {
+                            consecErrors = 0
+                            continue
+                        }
+                    }
                     if (noteError(i, action, msg)) {
                         return finish(
                             "needs_user",
@@ -484,6 +535,8 @@ object AgentLoop {
         val ans = try { JSONObject(ansStr) } catch (_: Exception) { return false }
         if (!ans.optBoolean("approved", false)) return false
         when (kind) {
+            "login" -> return handleLoginPrompt(ctx, engine, req, ans, sensitiveKeys, history)
+            "document" -> return handleDocumentPrompt(ctx, engine, req, ans, userProvided, history)
             "choice" -> {
                 val choice = ans.optString("choice", "")
                 if (choice.isNotEmpty()) userProvided.put("choice", choice)
@@ -576,6 +629,245 @@ object AgentLoop {
             }
         }
         return true
+    }
+
+    // =====================================================================
+    // login / document prompts (v10) — same-run handoff, secrets local-only
+    // =====================================================================
+
+    /**
+     * Login prompt: username+password DIALOG se aaye (ans), dono SENSITIVE.
+     * OTP pattern: userProvided me NAHI, server/AI ko NAHI, history me value
+     * NAHI — sirf page me locally bharo, phir submit dabane ki koshish karo.
+     * true = kuch bhara (loop continue kare).
+     */
+    private fun handleLoginPrompt(
+        ctx: Context,
+        engine: FormEngine,
+        req: UserPrompt.Request,
+        ans: JSONObject,
+        sensitiveKeys: MutableSet<String>,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        val username = ans.optString("username", "").trim()
+        val password = ans.optString("password", "")
+        if (username.isEmpty() || password.isEmpty()) return false
+        sensitiveKeys.add("username")
+        sensitiveKeys.add("password")
+        var filledAny = false
+        val uField = findLoginField(engine, "username")
+        if (uField != null) {
+            try {
+                val d = engine.runAgentStep(
+                    JSONObject().put("type", "fill")
+                        .put(
+                            "selector",
+                            JSONObject().put("mode", uField.first).put("value", uField.second)
+                        )
+                        .put("text", username)
+                )
+                if (d.optBoolean("verified", true)) filledAny = true
+            } catch (_: Exception) { }
+        }
+        val pField = findLoginField(engine, "password")
+        if (pField != null) {
+            try {
+                val d = engine.runAgentStep(
+                    JSONObject().put("type", "fill")
+                        .put(
+                            "selector",
+                            JSONObject().put("mode", pField.first).put("value", pField.second)
+                        )
+                        .put("text", password)
+                )
+                if (d.optBoolean("verified", true)) filledAny = true
+            } catch (_: Exception) { }
+        }
+        // Submit/login button dabane ki koshish (user ne "Login bhardo" dabakar approve kiya)
+        var submitted = false
+        if (filledAny) {
+            submitted = tryTapSubmit(engine)
+        }
+        history.add(
+            JSONObject().put("action", "fill_login_local")
+                .put("result", if (filledAny) "ok" else "error")
+                .put("detail", "login page me bhara (value hidden), submit=$submitted")
+        )
+        return filledAny
+    }
+
+    /**
+     * Document prompt: ans = {doc: "<vault filename>"}. Sirf FILENAME milta hai.
+     * Page par file input ho to turant upload karo; warna userProvided me
+     * "document" key daal do (filename — sensitive NAHI) taaki brain apne
+     * upload action me use kare.
+     */
+    private fun handleDocumentPrompt(
+        ctx: Context,
+        engine: FormEngine,
+        req: UserPrompt.Request,
+        ans: JSONObject,
+        userProvided: JSONObject,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        val doc = ans.optString("doc", "").trim()
+        if (doc.isEmpty()) return false
+        val file = engine.docFile(doc)
+        if (file == null) {
+            history.add(
+                JSONObject().put("action", "document")
+                    .put("result", "error")
+                    .put("detail", "document file nahi mili: ${doc.take(60)}")
+            )
+            return false
+        }
+        userProvided.put("document", doc)
+        // Page par file input dikh raha ho to turant upload kar do
+        var uploaded = false
+        try {
+            if (hasFileInput(engine)) {
+                val d = engine.runAgentStep(
+                    JSONObject().put("type", "upload").put("doc", doc)
+                )
+                uploaded = d.optBoolean("uploaded", false)
+            }
+        } catch (_: Exception) { }
+        history.add(
+            JSONObject().put("action", "document")
+                .put("result", "ok")
+                .put(
+                    "detail",
+                    "document mila: ${doc.take(80)} (content hidden), uploaded=$uploaded"
+                )
+        )
+        return true
+    }
+
+    /** Page par login field dhoondho: which = "username" | "password". */
+    private fun findLoginField(engine: FormEngine, which: String): Pair<String, String>? {
+        val snap = try { engine.domSnapshot() } catch (_: Exception) { return null }
+        val fields = snap.optJSONArray("fields") ?: return null
+        for (i in 0 until fields.length()) {
+            val f = fields.optJSONObject(i) ?: continue
+            if (f.optString("tag", "") != "input") continue
+            val t = f.optString("type", "").lowercase()
+            if (t == "hidden" || t == "submit" || t == "button" || t == "checkbox" ||
+                t == "radio" || t == "file"
+            ) continue
+            val blob = (f.optString("label", "") + " " + f.optString("placeholder", "") +
+                " " + f.optString("aria", "") + " " + f.optString("name", "") +
+                " " + f.optString("id", "")).lowercase()
+            val match = if (which == "password") {
+                t == "password" || blob.contains("password") || blob.contains("passwd")
+            } else {
+                t != "password" && (blob.contains("user") || blob.contains("email") ||
+                    blob.contains("e-mail") || blob.contains("phone") ||
+                    blob.contains("mobile") || blob.contains("login"))
+            }
+            if (!match) continue
+            val id = f.optString("id", "")
+            val nm = f.optString("name", "")
+            val ph = f.optString("placeholder", "")
+            return when {
+                id.isNotEmpty() -> "id" to id
+                nm.isNotEmpty() -> "name" to nm
+                ph.isNotEmpty() -> "placeholder" to ph
+                else -> continue
+            }
+        }
+        return null
+    }
+
+    /** Page par password field hai? (proactive login-prompt trigger ke liye) */
+    private fun hasPasswordField(engine: FormEngine): Boolean =
+        findLoginField(engine, "password") != null
+
+    /** Page par <input type=file> hai? */
+    private fun hasFileInput(engine: FormEngine): Boolean {
+        val snap = try { engine.domSnapshot() } catch (_: Exception) { return false }
+        val fields = snap.optJSONArray("fields") ?: return false
+        for (i in 0 until fields.length()) {
+            val f = fields.optJSONObject(i) ?: continue
+            if (f.optString("tag", "") == "input" &&
+                f.optString("type", "").lowercase() == "file"
+            ) return true
+        }
+        return false
+    }
+
+    /**
+     * Login/Submit button dhoondh ke tap karo. true = tap bhej diya.
+     * (User ne dialog me "Login bhardo" dabakar submit approve kiya hai.)
+     */
+    private fun tryTapSubmit(engine: FormEngine): Boolean {
+        val snap = try { engine.domSnapshot() } catch (_: Exception) { return false }
+        val buttons = snap.optJSONArray("buttons") ?: return false
+        val keys = listOf(
+            "login", "log in", "sign in", "signin", "submit", "continue",
+            "आगे", "लॉगिन", "प्रवेश"
+        )
+        for (i in 0 until buttons.length()) {
+            val b = buttons.optJSONObject(i) ?: continue
+            val text = b.optString("text", "").lowercase()
+            if (keys.none { text.contains(it) }) continue
+            val rect = b.optJSONObject("rect") ?: continue
+            val x = (rect.optDouble("x", -1.0) + rect.optDouble("w", 0.0) / 2).toFloat()
+            val y = (rect.optDouble("y", -1.0) + rect.optDouble("h", 0.0) / 2).toFloat()
+            if (x < 0 || y < 0) continue
+            return try { engine.tapAt(x, y) } catch (_: Exception) { false }
+        }
+        return false
+    }
+
+    /** Upload fail (file missing) → user se document maango, same run continue. */
+    private fun askDocumentProactively(
+        ctx: Context,
+        engine: FormEngine,
+        runId: String,
+        userProvided: JSONObject,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        // Pehle se doc mil chuka ho aur file maujood ho → dobara mat puchho
+        val existing = userProvided.optString("document", "")
+        if (existing.isNotEmpty() && engine.docFile(existing) != null) return true
+        val req = UserPrompt.Request(
+            runId = runId,
+            kind = "document",
+            title = "Document chahiye",
+            message = "Is form me document upload karna hai. Vault se chuno ya naya upload karo.",
+            timeoutSec = 600L
+        )
+        notifyPrompt(ctx, "📎 Document chahiye", req.message)
+        val ansStr = UserPrompt.ask(req) ?: return false
+        val ans = try { JSONObject(ansStr) } catch (_: Exception) { return false }
+        if (!ans.optBoolean("approved", false)) return false
+        return handleDocumentPrompt(ctx, engine, req, ans, userProvided, history)
+    }
+
+    /** Login form par atke → user se credentials maango (local-only), same run continue. */
+    private fun askLoginProactively(
+        ctx: Context,
+        engine: FormEngine,
+        runId: String,
+        sensitiveKeys: MutableSet<String>,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        val req = UserPrompt.Request(
+            runId = runId,
+            kind = "login",
+            title = "Login chahiye",
+            message = "Ye page login maang raha hai. Username-password do — sirf is page me bhare jayenge, kahin save nahi honge.",
+            fields = listOf(
+                UserPrompt.Field("username", "Username / Email", "text"),
+                UserPrompt.Field("password", "Password", "password")
+            ),
+            timeoutSec = 600L
+        )
+        notifyPrompt(ctx, "🔑 Login chahiye", req.message)
+        val ansStr = UserPrompt.ask(req) ?: return false
+        val ans = try { JSONObject(ansStr) } catch (_: Exception) { return false }
+        if (!ans.optBoolean("approved", false)) return false
+        return handleLoginPrompt(ctx, engine, req, ans, sensitiveKeys, history)
     }
 
     /** OTP/password jaisi sensitive field? — ye values KABHI AI/server ko nahi jati. */
@@ -800,7 +1092,7 @@ object AgentLoop {
         kind: String,
         prompt: Map<String, Any?>
     ): UserPrompt.Request {
-        val fields = ((prompt["fields"] as? List<*>) ?: emptyList<Any>())
+        var fields = ((prompt["fields"] as? List<*>) ?: emptyList<Any>())
             .mapNotNull { it as? Map<String, Any?> }
             .map {
                 UserPrompt.Field(
@@ -809,6 +1101,14 @@ object AgentLoop {
                     (it["type"] as? String) ?: "text"
                 )
             }
+        // login kind: server ne fields na diye hon to default username+password
+        // (dono sensitive — dialog me mic nahi, values local-only)
+        if (kind == "login" && fields.isEmpty()) {
+            fields = listOf(
+                UserPrompt.Field("username", "Username / Email", "text"),
+                UserPrompt.Field("password", "Password", "password")
+            )
+        }
         val options = ((prompt["options"] as? List<*>) ?: emptyList<Any>())
             .mapNotNull { (it as? String)?.ifEmpty { null } }
         @Suppress("UNCHECKED_CAST")
@@ -829,6 +1129,7 @@ object AgentLoop {
             fields = fields,
             options = options,
             payment = payment,
+            docType = (prompt["doc_type"] as? String)?.ifEmpty { null } ?: "",
             timeoutSec = (prompt["timeout_s"] as? Number)?.toLong() ?: 600L
         )
     }

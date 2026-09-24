@@ -566,9 +566,13 @@ class AgentChatView(
                 }
                 val (code, taskId) = AgentApi.createTask(context, title, url)
                 msg = if (taskId.isNullOrEmpty()) {
-                    when (code) {
-                        -1 -> "Internet nahi hai 📡"
-                        401 -> "Pehle Profile tab me login karo 🔑"
+                    val offline = code == -1 || code >= 500
+                    when {
+                        code == 401 -> "Pehle Profile tab me login karo 🔑"
+                        offline && com.formmitra.app.engine.Standalone.isConfigured(context) ->
+                            startStandaloneTask(title, url)
+                        code == -1 -> "Internet nahi hai 📡 — server bhi nahi mil raha. " +
+                            "Standalone ke liye Profile me apni Groq API key save karo."
                         else -> "Task ban nahi paya (code $code). Dobara try karo."
                     }
                 } else {
@@ -589,6 +593,35 @@ class AgentChatView(
                 onDone()
             }
         }.start()
+    }
+
+    /**
+     * Offline task: StandaloneStore me save + FormRunService seedha chalao.
+     * Server bilkul involve nahi — brain = user ki Groq key (StandaloneBrain).
+     */
+    private fun startStandaloneTask(title: String, url: String): String {
+        return try {
+            val id = com.formmitra.app.engine.StandaloneStore.create(context, title, url)
+            val task = JSONObject()
+                .put("name", title)
+                .put("target_url", url)
+                .put("run_id", id)
+                .put("standalone", true)
+                .put(
+                    "steps",
+                    JSONArray().put(
+                        JSONObject()
+                            .put("type", "agent_run")
+                            .put("goal", title)
+                            .put("url", url)
+                    )
+                )
+            com.formmitra.app.engine.FormRunService.startWithTask(context, task)
+            "Server nahi mil raha — standalone mode me shuru kiya ✅\n" +
+                "(tumhari Groq key se, bina server ke). Progress notification me dikhega."
+        } catch (e: Exception) {
+            "Standalone task shuru nahi hua: ${(e.message ?: "error").take(120)}"
+        }
     }
 
     /**

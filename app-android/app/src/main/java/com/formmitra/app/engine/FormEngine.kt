@@ -1104,6 +1104,16 @@ class FormEngine(private val appContext: Context) {
     }
 
     /**
+     * Vault ka document file ke roop me do (upload ke liye).
+     * null = nahi mili / path traversal / unreadable.
+     */
+    fun docFile(doc: String): java.io.File? = try {
+        resolveUploadFile(doc, "")
+    } catch (_: Exception) {
+        null
+    }
+
+    /**
      * Image >400KB ho to compress karke <400KB lao (verify ke saath).
      * Non-image badi file → exception (chup-chaap badi upload nahi).
      */

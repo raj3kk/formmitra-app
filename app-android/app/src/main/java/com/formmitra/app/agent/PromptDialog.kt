@@ -29,13 +29,18 @@ import com.google.zxing.qrcode.QRCodeWriter
 
 /**
  * PromptDialog — agent ke "user se chahiye" sawalon ka popup.
- * kinds: otp | input | choice | payment.
+ * kinds: otp | input | choice | payment | document | login.
  *
  * - otp/input: fields bharo → agent aage badhega (loop wait kar raha hai).
  * - choice: options me se chuno (payment method choose karne ke liye bhi).
  * - payment: pehle approval (₹X pay karna hai?) → phir QR/UPI + countdown →
  *   "Payment ho gaya" → agent site par verify karega.
- * Har dialog me 🎤 mic (voice input) aur agent sawal ko bol ke bhi poochta hai.
+ * - document: vault ke docs me se chuno ya naya upload karo → agent page par
+ *   upload karega. Sirf FILENAME loop ko milta hai, content kabhi nahi.
+ * - login: username+password (mic NAHI — secret). Dono values OTP ki tarah
+ *   KABHI server/AI/history me nahi jati — sirf page me locally bhari jati hain.
+ * Har dialog me 🎤 mic (voice input) aur agent sawal ko bol ke bhi poochta hai
+ * (secret fields par mic nahi hota).
  */
 object PromptDialog {
 
@@ -54,14 +59,177 @@ object PromptDialog {
                 when (req.kind) {
                     "payment" -> showPayment(activity, req)
                     "choice" -> showChoice(activity, req)
+                    "document" -> showDocument(activity, req)
+                    "login" -> showLogin(activity, req)
                     else -> showFields(activity, req) // otp | input
                 }
-                // Sawal bol ke bhi puchho (voice)
+                // Sawal bol ke bhi puchho (voice) — secret values kabhi nahi
                 VoiceOutput.speak(activity, "${req.title}. ${req.message}".take(300))
             } catch (_: Exception) {
                 showingFor = ""
             }
         }
+    }
+
+    // ---------- document picker ----------
+
+    /** Vault docs me se chuno, ya naya upload karo. */
+    const val REQ_DOC_PICK = 4101
+    private var pendingDocPick: ((Uri?) -> Unit)? = null
+
+    /** MainActivity.onActivityResult se forward karo. */
+    fun onDocPickResult(requestCode: Int, data: Intent?) {
+        if (requestCode != REQ_DOC_PICK) return
+        val cb = pendingDocPick
+        pendingDocPick = null
+        val uri: Uri? = try { data?.data } catch (_: Exception) { null }
+        try { cb?.invoke(uri) } catch (_: Exception) { }
+    }
+
+    private fun showDocument(activity: Activity, req: UserPrompt.Request) {
+        val layout = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 32, 48, 16)
+        }
+        val hint = if (req.docType.isNotEmpty()) "\nChahiye: ${req.docType}" else ""
+        layout.addView(TextView(activity).apply {
+            text = req.message + hint
+            textSize = 15f
+            setPadding(0, 0, 0, 16)
+        })
+        var dlg: AlertDialog? = null
+        val docs = try { DocsStore.listDocs(activity) } catch (_: Exception) { emptyList() }
+        if (docs.isEmpty()) {
+            layout.addView(TextView(activity).apply {
+                text = "Vault me koi document nahi hai — neeche se naya upload karo."
+                textSize = 14f
+                setPadding(0, 0, 0, 12)
+            })
+        }
+        for (name in docs) {
+            val b = Button(activity).apply {
+                text = "📎 $name"
+                textSize = 14f
+                setOnClickListener {
+                    // Sirf FILENAME jata hai — content kabhi nahi
+                    answer(activity, req, mapOf("approved" to true, "doc" to name))
+                    dlg?.dismiss()
+                }
+            }
+            layout.addView(b)
+        }
+        val upBtn = Button(activity).apply {
+            text = "📤 Naya document upload karo"
+            textSize = 15f
+            setOnClickListener {
+                pendingDocPick = { uri ->
+                    Thread({
+                        val saved = if (uri != null) {
+                            try { DocsStore.saveDoc(activity, uri) } catch (_: Exception) { null }
+                        } else null
+                        activity.runOnUiThread {
+                            if (!saved.isNullOrEmpty()) {
+                                toast(activity, "Save ho gaya: $saved")
+                                answer(activity, req, mapOf("approved" to true, "doc" to saved))
+                                try { dlg?.dismiss() } catch (_: Exception) { }
+                            } else {
+                                toast(activity, "Document save nahi hua — dobara try karo")
+                            }
+                        }
+                    }, "fm-docsave").start()
+                }
+                try {
+                    activity.startActivityForResult(
+                        Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                            addCategory(Intent.CATEGORY_OPENABLE)
+                            type = "*/*"
+                        },
+                        REQ_DOC_PICK
+                    )
+                } catch (_: Exception) {
+                    pendingDocPick = null
+                    toast(activity, "Picker nahi khula")
+                }
+            }
+        }
+        layout.addView(upBtn)
+        dlg = AlertDialog.Builder(activity)
+            .setTitle("📎 ${req.title}")
+            .setView(ScrollView(activity).apply { addView(layout) })
+            .setCancelable(false)
+            .setNegativeButton("❌ Cancel") { _, _ ->
+                pendingDocPick = null
+                UserPrompt.cancel(req.runId)
+                showingFor = ""
+            }
+            .create()
+        dlg.show()
+    }
+
+    // ---------- login (local-only secrets) ----------
+
+    /**
+     * Username+password dialog. Dono SENSITIVE — mic/voice NAHI, aur values
+     * kahin record/transcribe nahi hoti. Loop inhe sirf page me locally
+     * bharta hai (OTP pattern); server/AI/history me kabhi nahi jati.
+     */
+    private fun showLogin(activity: Activity, req: UserPrompt.Request) {
+        val layout = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 32, 48, 16)
+        }
+        layout.addView(TextView(activity).apply {
+            text = req.message + "\n\n🔒 Ye details sirf is page me bhari jayengi — kahin save ya bheji nahi jayengi."
+            textSize = 15f
+            setPadding(0, 0, 0, 16)
+        })
+        val userEt = EditText(activity).apply {
+            hint = "Username / Email / Mobile"
+            textSize = 16f
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
+        }
+        val passEt = EditText(activity).apply {
+            hint = "Password"
+            textSize = 16f
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        layout.addView(TextView(activity).apply { text = "Username"; textSize = 14f })
+        layout.addView(userEt)
+        layout.addView(TextView(activity).apply {
+            text = "Password"; textSize = 14f; setPadding(0, 16, 0, 0)
+        })
+        layout.addView(passEt)
+        val dlg = AlertDialog.Builder(activity)
+            .setTitle("🔑 ${req.title}")
+            .setView(ScrollView(activity).apply { addView(layout) })
+            .setCancelable(false)
+            .setPositiveButton("✅ Login bhardo", null)
+            .setNegativeButton("❌ Cancel", null)
+            .create()
+        dlg.setOnShowListener {
+            dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val u = userEt.text.toString().trim()
+                val p = passEt.text.toString()
+                if (u.isEmpty() || p.isEmpty()) {
+                    toast(activity, "Dono bharo")
+                    return@setOnClickListener
+                }
+                // Values yahin rehti hain — answer me loop ko milti hain,
+                // loop unhe sirf page me bharta hai (server/AI ko kabhi nahi).
+                answer(activity, req, mapOf("approved" to true, "username" to u, "password" to p))
+                userEt.setText("")
+                passEt.setText("")
+                dlg.dismiss()
+            }
+            dlg.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+                userEt.setText("")
+                passEt.setText("")
+                UserPrompt.cancel(req.runId)
+                showingFor = ""
+                dlg.dismiss()
+            }
+        }
+        dlg.show()
     }
 
     // ---------- fields (otp / input) ----------

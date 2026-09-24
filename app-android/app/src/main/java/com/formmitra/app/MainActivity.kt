@@ -407,6 +407,10 @@ class MainActivity : Activity() {
     @Deprecated("Document picker AgentChatView ke liye")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        // Agent prompt ka document picker (vault doc chuno / naya upload)
+        try {
+            com.formmitra.app.agent.PromptDialog.onDocPickResult(requestCode, data)
+        } catch (_: Exception) { }
         if (::agentChatView.isInitialized) {
             agentChatView.handleActivityResult(requestCode, resultCode, data)
         }
