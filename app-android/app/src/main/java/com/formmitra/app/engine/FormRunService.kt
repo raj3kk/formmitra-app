@@ -19,9 +19,12 @@ import org.json.JSONObject
  *
  * Flow:
  *  1. FormTaskWorker task claim karke is service ko start karta hai.
- *  2. Service foreground notification ke saath FormEngine.runTask chalata hai.
- *  3. Progress: short tasks (<=10 steps) me har step, long me har 3 steps.
- *  4. Terminal report: done | failed | vetoed | needs_admin + notification.
+ *  2. Service foreground notification ke saath task chalata hai:
+ *     - pehla step {"type":"agent_run","goal","url"} ho to AgentLoop.runAgentTask
+ *       (AI brain loop: screenshot+DOM → /api/agent/act → step execute → repeat)
+ *     - nahi to FormEngine.runTask (v2 fixed steps)
+ *  3. Progress: fixed tasks me RunPolicy cadence; agent mode me har AI step.
+ *  4. Terminal report: done | failed | vetoed | needs_user (+ needs_admin) + notification.
  *
  * Notifications Hinglish me (user-facing copy):
  *  start: "Form bharna shuru: <name>"
@@ -78,17 +81,33 @@ class FormRunService : Service() {
         var lastReported = 0
 
         val engine = FormEngine(this)
+        val firstStep = stepsJson.optJSONObject(0)
         val result = try {
-            engine.runTask(task) { step1Based, _ ->
-                // progress cadence: RunPolicy (short: har step, long: har 3)
-                if (RunPolicy.shouldReportProgress(step1Based, total) && step1Based != lastReported) {
-                    lastReported = step1Based
+            if (firstStep != null && firstStep.optString("type") == "agent_run") {
+                // AI agent mode — AgentLoop har step khud decide karta hai
+                val goal = firstStep.optString("goal", name).ifEmpty { name }
+                val url = firstStep.optString("url", task.optString("target_url", ""))
+                AgentLoop.runAgentTask(this, engine, goal, url, runId, 40) { aiStep ->
                     val payload = JSONObject()
                         .put("status", "progress")
-                        .put("current_step", step1Based)
-                        .put("total_steps", total)
+                        .put("current_step", aiStep)
+                        .put("total_steps", 40)
+                        .put("mode", "agent")
                     FormApi.report(this, runId, payload)
-                    updateOngoing("Form bhar raha hai: $name", "Step $step1Based / $total")
+                    updateOngoing("Form bhar raha hai: $name", "AI step $aiStep / 40")
+                }
+            } else {
+                engine.runTask(task) { step1Based, _ ->
+                    // progress cadence: RunPolicy (short: har step, long: har 3)
+                    if (RunPolicy.shouldReportProgress(step1Based, total) && step1Based != lastReported) {
+                        lastReported = step1Based
+                        val payload = JSONObject()
+                            .put("status", "progress")
+                            .put("current_step", step1Based)
+                            .put("total_steps", total)
+                        FormApi.report(this, runId, payload)
+                        updateOngoing("Form bhar raha hai: $name", "Step $step1Based / $total")
+                    }
                 }
             }
         } catch (t: Throwable) {
@@ -123,6 +142,10 @@ class FormRunService : Service() {
             "needs_admin" -> notifySimple(
                 DONE_NOTIF_ID, "Dhyaan chahiye: $name",
                 "Captcha aaya hai — aapko dekhna hoga."
+            )
+            "needs_user" -> notifySimple(
+                DONE_NOTIF_ID, "Dhyaan chahiye: $name",
+                result.summary.take(120)
             )
             else -> notifySimple(
                 DONE_NOTIF_ID, "Dhyaan chahiye: $name",

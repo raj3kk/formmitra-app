@@ -50,8 +50,22 @@ object AgentApi {
         return conn
     }
 
-    private fun post(path: String, ctx: Context, body: JSONObject): ApiResult {
+    private fun post(path: String, ctx: Context, body: JSONObject): ApiResult =
+        postWithTimeout(path, ctx, body, TIMEOUT_MS)
+
+    /**
+     * POST with custom timeout. open() lazy-connect karta hai, isliye
+     * timeouts yahan override karna safe hai (connect se pehle).
+     */
+    private fun postWithTimeout(
+        path: String,
+        ctx: Context,
+        body: JSONObject,
+        timeoutMs: Int
+    ): ApiResult {
         val conn = open(path, "POST", ctx)
+        conn.connectTimeout = timeoutMs
+        conn.readTimeout = timeoutMs
         return try {
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json")
@@ -69,6 +83,27 @@ object AgentApi {
         }
     }
 
+    /**
+     * POST /api/agent/act — brain step.
+     * Request: {goal, url, page_title, dom_snapshot, screenshot_b64,
+     *           history[], stuck_count, run_id}
+     * Response: {step{action, selector{mode,value}, value, option, url, key,
+     *                  text, confidence, reason, requires_user, blocked_reason,
+     *                  user_prompt, result_summary}, provider, model}
+     * 401 = not logged in, 429 = rate limited. Timeout 60s (server AI call).
+     */
+    fun act(ctx: Context, body: JSONObject): ApiResult =
+        postWithTimeout("/api/agent/act", ctx, body, 60_000)
+
+    /**
+     * POST /api/agent/captcha — CAPTCHA analysis (AI sirf analyze karta hai).
+     * Request: {screenshot_b64, widget_kind, page_url}
+     * Response: {captcha{type, instruction, action, position_hint}}
+     * Timeout 60s.
+     */
+    fun captcha(ctx: Context, body: JSONObject): ApiResult =
+        postWithTimeout("/api/agent/captcha", ctx, body, 60_000)
+
     /** POST /api/agent/chat — poora history bhejo, reply + plan|null + missing_docs wapas. */
     fun chat(ctx: Context, messages: List<Pair<String, String>>): ApiResult {
         val arr = JSONArray()
@@ -80,7 +115,14 @@ object AgentApi {
 
     /** POST /api/app/form-tasks — sirf goto step; returns (code, taskId). */
     fun createTask(ctx: Context, name: String, url: String): Pair<Int, String?> {
-        val steps = JSONArray().put(JSONObject().put("type", "goto").put("url", url))
+        // AI agent mode: pehla step agent_run — AgentLoop har step khud
+        // decide karta hai (Phase 2 brain). Fixed goto nahi.
+        val steps = JSONArray().put(
+            JSONObject()
+                .put("type", "agent_run")
+                .put("goal", name)
+                .put("url", url)
+        )
         val body = JSONObject()
             .put("name", name)
             .put("target_url", url)

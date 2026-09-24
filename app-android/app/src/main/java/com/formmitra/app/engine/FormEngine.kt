@@ -104,6 +104,107 @@ class FormEngine(private val appContext: Context) {
         webView = null
     }
 
+    // ---------------- AI agent loop (Phase 2) ----------------
+    //
+    // AgentLoop inhi public methods ko use karta hai. Caller ko pehle start()
+    // karna hoga (background thread pe — blocking calls hain).
+
+    /**
+     * AI agent loop ke liye single step chalao.
+     * runTask jaisi safety: step blob veto + live page scan + per-step timeout.
+     * Step JSON shape: {type, url, selector{mode,value}, text, option, state,
+     *                   key, timeout_s, seconds, label} (StepParser contract).
+     */
+    @Throws(Exception::class)
+    fun runAgentStep(stepJson: JSONObject): JSONObject {
+        val s = StepParser.parse(jsonToMap(stepJson))
+        VetoCheck.find(StepParser.vetoBlob(s))?.let {
+            throw VetoException("agent step ('${s.type}') me payment keyword '$it'")
+        }
+        checkLivePageVeto()
+        return runStepWithTimeout(s)
+    }
+
+    /** AI agent loop ke liye DOM snapshot: fields + buttons + page text + url/title. */
+    fun domSnapshot(): JSONObject {
+        return unwrapJsObject(evalJsSync(SNAPSHOT_JS))
+    }
+
+    /** AI agent loop ke liye CAPTCHA detect (public wrapper). */
+    fun detectCaptcha(): JSONObject = captchaDetect()
+
+    /**
+     * DOM snapshot JS — fields: tag/type/label/placeholder/aria/id/name/rect
+     * (max 60); buttons: text + rect (max 30); page text excerpt 1500 chars.
+     * Same-origin iframes cover hote hain (cross-origin try/catch me skip).
+     */
+    private val SNAPSHOT_JS = """(function(){
+      function rect(el){
+        try{
+          var r=el.getBoundingClientRect();
+          return {x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)};
+        }catch(e){ return null; }
+      }
+      function labelText(el){
+        try{
+          var id=el.getAttribute('id');
+          if(id){
+            var lb=document.querySelector('label[for="'+id+'"]');
+            if(lb && lb.innerText) return lb.innerText.trim().slice(0,80);
+          }
+        }catch(e){}
+        try{
+          var p=el.closest('label');
+          if(p && p.innerText) return p.innerText.trim().slice(0,80);
+        }catch(e){}
+        return '';
+      }
+      function eachDoc(fn){
+        var docs=[document];
+        try{
+          Array.from(document.querySelectorAll('iframe')).forEach(function(f){
+            try{ if(f.contentDocument) docs.push(f.contentDocument); }catch(e){}
+          });
+        }catch(e){}
+        docs.forEach(fn);
+      }
+      var fields=[];
+      eachDoc(function(doc){
+        var els;
+        try{ els=doc.querySelectorAll('input,select,textarea'); }catch(e){ return; }
+        Array.from(els).forEach(function(el){
+          if(fields.length>=60) return;
+          var t='';
+          try{ t=el.getAttribute('type')||''; }catch(e){}
+          if(t==='hidden'||t==='submit'||t==='button'||t==='image') return;
+          var tag='', ph='', ar='', id='', nm='';
+          try{ tag=(el.tagName||'').toLowerCase(); }catch(e){}
+          try{ ph=(el.getAttribute('placeholder')||'').slice(0,80); }catch(e){}
+          try{ ar=(el.getAttribute('aria-label')||'').slice(0,80); }catch(e){}
+          try{ id=(el.getAttribute('id')||'').slice(0,60); }catch(e){}
+          try{ nm=(el.getAttribute('name')||'').slice(0,60); }catch(e){}
+          fields.push({tag:tag,type:t,label:labelText(el),placeholder:ph,aria:ar,id:id,name:nm,rect:rect(el)});
+        });
+      });
+      var buttons=[];
+      eachDoc(function(doc){
+        var els;
+        try{ els=doc.querySelectorAll('button,a,input[type=submit],input[type=button],[role=button]'); }catch(e){ return; }
+        Array.from(els).forEach(function(el){
+          if(buttons.length>=30) return;
+          var txt='';
+          try{ txt=((el.innerText||el.getAttribute('value')||'')+'').trim().slice(0,60); }catch(e){}
+          if(!txt) return;
+          buttons.push({text:txt,rect:rect(el)});
+        });
+      });
+      var bodyText='';
+      try{ bodyText=(document.body?document.body.innerText:'').replace(/\s+/g,' ').slice(0,1500); }catch(e){}
+      var href='', ttl='';
+      try{ href=location.href||''; ttl=document.title||''; }catch(e){}
+      return JSON.stringify({url:href,title:ttl,fields:fields,buttons:buttons,page_text:bodyText});
+    })()"""
+
     /**
      * Task chalao (blocking). onProgress(step1Based, total) har report
      * cadence pe call hota hai — caller server ko progress POST karta hai.
@@ -737,6 +838,43 @@ class FormEngine(private val appContext: Context) {
     }
 
     // ---------------- captcha ----------------
+
+    /**
+     * Coordinate tap — page CSS pixels (getBoundingClientRect) ko view
+     * pixels me badal ke WebView pe synthetic touch bhejo. Cross-origin
+     * iframe (reCAPTCHA checkbox) me JS click kaam nahi karta, isliye ye.
+     * UI thread pe dispatch hota hai; true = events bhej diye.
+     */
+    fun tapAt(xCss: Float, yCss: Float): Boolean {
+        val h = handler ?: return false
+        val latch = CountDownLatch(1)
+        var sent = false
+        h.post {
+            try {
+                val wv = webView ?: return@post
+                val scale = wv.scale
+                val vx = xCss * scale
+                val vy = yCss * scale
+                val now = android.os.SystemClock.uptimeMillis()
+                val down = android.view.MotionEvent.obtain(
+                    now, now,
+                    android.view.MotionEvent.ACTION_DOWN, vx, vy, 0
+                )
+                val up = android.view.MotionEvent.obtain(
+                    now, now + 80,
+                    android.view.MotionEvent.ACTION_UP, vx, vy, 0
+                )
+                wv.dispatchTouchEvent(down)
+                wv.dispatchTouchEvent(up)
+                down.recycle()
+                up.recycle()
+                sent = true
+            } catch (_: Exception) { }
+            latch.countDown()
+        }
+        latch.await(10, TimeUnit.SECONDS)
+        return sent
+    }
 
     /**
      * captcha_detect — recaptcha / hcaptcha / turnstile iframes, class/id me
