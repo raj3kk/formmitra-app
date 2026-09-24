@@ -192,8 +192,16 @@ class MainActivity : Activity() {
             selectTab("/")
         }
 
-        Scheduler.scheduleDigest(this)
-        Scheduler.scheduleFormTasks(this)
+        // FmApp.onCreate me WorkManager pehle hi init ho chuka hai
+        // (manual build me startup-provider manifest me nahi hota).
+        // Phir bhi belt-and-braces: scheduler kabhi launch crash na banaye —
+        // workers FmApp init ke baad normal schedule honge.
+        try {
+            Scheduler.scheduleDigest(this)
+            Scheduler.scheduleFormTasks(this)
+        } catch (t: Throwable) {
+            android.util.Log.e("MainActivity", "Scheduler failed (non-fatal)", t)
+        }
 
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
@@ -240,7 +248,11 @@ class MainActivity : Activity() {
                         this@MainActivity, req
                     )
                 }
-            } catch (_: Exception) { }
+            } catch (t: Throwable) {
+                // Poller kabhi app crash na banaye — Error (NoClassDefFound
+                // jaise) bhi pakdo; agle 3s tick par dobara try hoga.
+                android.util.Log.e("MainActivity", "prompt poll failed (non-fatal)", t)
+            }
             promptHandler.postDelayed(this, 3000)
         }
     }
