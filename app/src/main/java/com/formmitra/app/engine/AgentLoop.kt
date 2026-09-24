@@ -36,7 +36,9 @@ object AgentLoop {
         maxSteps: Int = 40,
         onProgress: (Int) -> Unit = {},
         onOfflineMode: () -> Unit = {},
-        onStandaloneMode: () -> Unit = {}
+        onStandaloneMode: () -> Unit = {},
+        /** true = server ko chhodo, har step StandaloneBrain (user ki Groq key) se */
+        forceStandalone: Boolean = false
     ): FormEngine.RunResult {
         val stepsLog = JSONArray()
         val history = ArrayList<JSONObject>()
@@ -44,6 +46,17 @@ object AgentLoop {
         var consecErrors = 0
         var stepsTaken = 0
         val recentSigs = ArrayList<String>()
+        // User se mile values (otp/email/phone/choice) — agle act() calls me context.
+        // DHYAAN: OTP/password kabhi userProvided me NAHI aate (neeche
+        // handleServerPrompt me sensitiveKeys me daal ke filter hote hain) —
+        // wo sirf page me locally bhare jate hain, AI/server ko kabhi nahi bheje jate.
+        val userProvided = JSONObject()
+        val sensitiveKeys = mutableSetOf<String>()
+        // Payment prompt ek run me ek hi baar — doosri baar seedha vetoed.
+        var paymentPrompted = false
+        // Login/document prompt bhi ek run me ek hi baar (proactive triggers ke liye)
+        var loginPrompted = false
+        var docPrompted = false
 
         // Local task: runId khaali ho to local-<timestamp> (standalone mode —
         // UI agent local task banate waqt khud bhi yehi format bhej sakta hai)
@@ -112,9 +125,14 @@ object AgentLoop {
             return stuckCount >= AgentActions.STUCK_MAX
         }
 
-        // Pre-run veto: goal + start URL
+        // Pre-run: goal/start-URL me payment keyword = form-fee expected hai.
+        // Yahan ROKO MAT — loop aage badhega; asli payment page aane par
+        // mid-loop veto assisted payment flow (user approval) chalayega.
+        // (Purana behavior turant vetoed-finish tha — wo legit fee wale
+        //  formon ko shuru hone se pehle hi maar deta tha.)
         VetoCheck.find("$goal $startUrl")?.let {
-            return finish("vetoed", "PAYMENT VETO (start): '$it' mila — '$goal'")
+            logStep(0, "precheck", true, "payment keyword '$it' — fee expected, assisted flow ready")
+            pushHistory("precheck", mapOf("keyword" to it), "ok", "payment expected")
         }
 
         try {
@@ -132,7 +150,37 @@ object AgentLoop {
                     logStep(0, "goto", true, d.toString().take(200))
                     pushHistory("goto", mapOf("action" to "goto", "url" to startUrl), "ok", "opened")
                 } catch (e: FormEngine.VetoException) {
-                    return finish("vetoed", "PAYMENT VETO: ${e.message}")
+                    // Start URL hi payment page hai (user ne payment link diya) →
+                    // assisted payment flow. Verify hua to goto retry (veto
+                    // suppress), nahi to pehle jaisa finish.
+                    if (!paymentPrompted) {
+                        paymentPrompted = true
+                        val payRes = handlePaymentPrompt(
+                            ctx, engine, startUrl, agentRunId ?: effectiveRunId
+                        )
+                        if (payRes == "verified") {
+                            engine.paymentVerifiedOnce = true
+                            pushHistory(
+                                "goto",
+                                mapOf("action" to "goto", "url" to startUrl),
+                                "ok", "payment verified, goto retry"
+                            )
+                            try {
+                                val d2 = engine.runAgentStep(
+                                    JSONObject().put("type", "goto").put("url", startUrl)
+                                )
+                                logStep(0, "goto", true, d2.toString().take(200))
+                            } catch (_: Exception) { }
+                            consecErrors = 0
+                        } else {
+                            return finish(
+                                if (payRes == "declined") "vetoed" else "needs_user",
+                                payMessage(payRes)
+                            )
+                        }
+                    } else {
+                        return finish("vetoed", "PAYMENT VETO: ${e.message}")
+                    }
                 } catch (e: Exception) {
                     return finish("failed", "start URL nahi khula: ${e.message}")
                 }
@@ -188,7 +236,25 @@ object AgentLoop {
                     .put("history", hArr)
                     .put("stuck_count", stuckCount)
                     .put("run_id", runId)
-                var res: AgentApi.ApiResult = try {
+                    // OTP/password yahan se filtered — AI/server ko kabhi nahi jate
+                    .put("user_provided", filteredUserProvided(userProvided, sensitiveKeys))
+                // forceStandalone (offline task): server ko chhodo, seedha user ki
+                // Groq key se StandaloneBrain. Server unreachable fallback neeche
+                // (per-step) waise bhi hai; ye poore run ka standalone mode hai.
+                var res: AgentApi.ApiResult = if (forceStandalone && Standalone.isConfigured(ctx)) {
+                    try { onStandaloneMode() } catch (_: Exception) { }
+                    logStep(i, "act", false, "standalone mode → StandaloneBrain (Groq direct)")
+                    val sbStep: JSONObject? = try {
+                        StandaloneBrain.decide(ctx, reqBody)
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (sbStep != null) {
+                        AgentApi.ApiResult(200, JSONObject().put("step", sbStep))
+                    } else {
+                        AgentApi.ApiResult(-1, null)
+                    }
+                } else try {
                     AgentApi.act(ctx, reqBody)
                 } catch (_: Exception) {
                     AgentApi.ApiResult(-1, null)
@@ -272,11 +338,30 @@ object AgentLoop {
                         }
                         return finish("done", "$summary$proofNote")
                     }
-                    "needs_user" -> return finish(
-                        "needs_user",
-                        ((stepMap["user_prompt"] as? String)?.ifEmpty { null }
-                            ?: "Aapki zaroorat hai — app khol ke dekh lein")
-                    )
+                    "needs_user" -> {
+                        // Structured prompt (server ne user_prompt object bheja)
+                        // → popup dikhao, user bhare, loop AAGE badhega (terminal nahi).
+                        val promptObj = stepMap["user_prompt"] as? Map<String, Any?>
+                        if (promptObj != null) {
+                            val ok = handleServerPrompt(
+                                ctx, engine, promptObj,
+                                agentRunId ?: effectiveRunId, userProvided, sensitiveKeys, history
+                            )
+                            if (!ok) {
+                                return finish(
+                                    "needs_user",
+                                    "Aapka jawab nahi mila / mana kiya — kaam ruka hai, app khol ke dekhein"
+                                )
+                            }
+                            consecErrors = 0
+                            continue
+                        }
+                        return finish(
+                            "needs_user",
+                            ((stepMap["user_prompt"] as? String)?.ifEmpty { null }
+                                ?: "Aapki zaroorat hai — app khol ke dekh lein")
+                        )
+                    }
                     "vetoed" -> return finish(
                         "vetoed",
                         ((stepMap["blocked_reason"] as? String)?.ifEmpty { null }
@@ -308,6 +393,21 @@ object AgentLoop {
                     stuckCount++
                     pushHistory(action, stepMap, "stuck", "same action 3 baar")
                     logStep(i, action, false, "stuck: same action 3 baar (stuck_count=$stuckCount)")
+                    // Login page par atke ho? → credentials maango (ek baar),
+                    // local-only fill, same run continue.
+                    if (!loginPrompted && hasPasswordField(engine)) {
+                        loginPrompted = true
+                        val loginOk = askLoginProactively(
+                            ctx, engine, agentRunId ?: effectiveRunId,
+                            sensitiveKeys, history
+                        )
+                        if (loginOk) {
+                            stuckCount = 0
+                            consecErrors = 0
+                            recentSigs.clear()
+                            continue
+                        }
+                    }
                     if (stuckCount >= AgentActions.STUCK_MAX) {
                         return finish(
                             "needs_user",
@@ -342,10 +442,47 @@ object AgentLoop {
                     pushHistory(action, stepMap, "ok", dStr)
                 } catch (e: FormEngine.VetoException) {
                     logStep(i, action, false, "VETO: ${e.message}")
+                    // Payment page beech me aaya → user se approval lo (assisted
+                    // payment). Agent KHUD kabhi pay nahi karta — user apne UPI
+                    // app se karta hai, phir agent site par verify karta hai.
+                    if (!paymentPrompted) {
+                        paymentPrompted = true
+                        val payRes = handlePaymentPrompt(
+                            ctx, engine, url, agentRunId ?: effectiveRunId
+                        )
+                        if (payRes == "verified") {
+                            // Verify ke baad: live-page veto suppress (receipt par
+                            // "payment" text hota hai), loop continue. Step-blob
+                            // veto ab bhi active — doosri payment hamesha vetoed.
+                            engine.paymentVerifiedOnce = true
+                            pushHistory(action, stepMap, "ok", "payment user ne kiya, site par verified")
+                            consecErrors = 0
+                            continue
+                        }
+                        return finish(
+                            if (payRes == "declined") "vetoed" else "needs_user",
+                            payMessage(payRes)
+                        )
+                    }
                     return finish("vetoed", "PAYMENT VETO: ${e.message}")
                 } catch (e: Exception) {
                     val msg = (e.message ?: "error").take(200)
                     pushHistory(action, stepMap, "error", msg)
+                    // Upload me file missing → user se document maango (ek baar),
+                    // same run continue. Dobara fail → neeche noteError path.
+                    if (action == "upload" && !docPrompted &&
+                        (msg.contains("file nahi mili") || msg.contains("upload:"))
+                    ) {
+                        docPrompted = true
+                        val docOk = askDocumentProactively(
+                            ctx, engine, agentRunId ?: effectiveRunId,
+                            userProvided, history
+                        )
+                        if (docOk) {
+                            consecErrors = 0
+                            continue
+                        }
+                    }
                     if (noteError(i, action, msg)) {
                         return finish(
                             "needs_user",
@@ -366,6 +503,672 @@ object AgentLoop {
             } catch (_: Exception) {
             }
         }
+    }
+
+    // =====================================================================
+    // Interactive user prompts (OTP / input / choice / payment).
+    // Loop BLOCK karke user ka jawab wait karta hai; jawab mile to kaam
+    // aage badhta hai. Timeout/cancel → false → caller needs_user finish.
+    // =====================================================================
+
+    /**
+     * Server ke structured user_prompt ko popup me badlo.
+     * true = jawab mila aur apply ho gaya (loop continue kare);
+     * false = timeout / cancel / mana.
+     */
+    private fun handleServerPrompt(
+        ctx: Context,
+        engine: FormEngine,
+        prompt: Map<String, Any?>,
+        runId: String,
+        userProvided: JSONObject,
+        sensitiveKeys: MutableSet<String>,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        val kind = (prompt["kind"] as? String)?.trim()?.ifEmpty { null } ?: "input"
+        val req = buildPromptRequest(runId, kind, prompt)
+        notifyPrompt(ctx, "🤖 ${req.title}", req.message)
+        if (kind == "payment") {
+            return doPaymentFlow(ctx, engine, req, runId) == "verified"
+        }
+        val ansStr = UserPrompt.ask(req) ?: return false
+        val ans = try { JSONObject(ansStr) } catch (_: Exception) { return false }
+        if (!ans.optBoolean("approved", false)) return false
+        when (kind) {
+            "login" -> return handleLoginPrompt(ctx, engine, req, ans, sensitiveKeys, history)
+            "document" -> return handleDocumentPrompt(ctx, engine, req, ans, userProvided, history)
+            "choice" -> {
+                val choice = ans.optString("choice", "")
+                if (choice.isNotEmpty()) userProvided.put("choice", choice)
+                history.add(
+                    JSONObject().put("action", "user_choice")
+                        .put("result", "ok").put("detail", choice.take(200))
+                )
+            }
+            else -> { // otp | input
+                // field key -> type (sensitive = otp/password: KABHI server/AI
+                // ko mat bhejo, sirf page me locally bharo)
+                val fieldTypes = ((prompt["fields"] as? List<*>) ?: emptyList<Any>())
+                    .mapNotNull { it as? Map<String, Any?> }
+                    .associate {
+                        ((it["key"] as? String) ?: "value") to
+                            ((it["type"] as? String) ?: "text")
+                    }
+                val ansKeys = ans.keys().asSequence()
+                    .filter { it != "approved" }.toList()
+                var filledAny = false
+                var secretDone = false
+                for (k in ansKeys) {
+                    val v = ans.optString(k, "")
+                    if (v.isEmpty()) continue
+                    val t = fieldTypes[k] ?: "text"
+                    if (isSensitiveField(k, t)) {
+                        // OTP/password: userProvided me NAHI — sirf local fill.
+                        sensitiveKeys.add(k)
+                        if (fillSecretLocally(engine, prompt, v)) {
+                            filledAny = true
+                            secretDone = true
+                            history.add(
+                                JSONObject().put("action", "fill_otp_local")
+                                    .put("result", "ok")
+                                    .put("detail", "OTP/password page me bhara (value hidden)")
+                            )
+                        } else {
+                            history.add(
+                                JSONObject().put("action", "fill_otp_local")
+                                    .put("result", "error")
+                                    .put("detail", "OTP field nahi mila page par")
+                            )
+                        }
+                    } else {
+                        userProvided.put(k, v)
+                        filledAny = true
+                    }
+                }
+                // Non-sensitive value + fill_selector (purana behavior):
+                // page me bharo, value userProvided me bhi rahegi.
+                @Suppress("UNCHECKED_CAST")
+                val sel = prompt["fill_selector"] as? Map<String, Any?>
+                if (!secretDone && sel != null) {
+                    val firstPlain = ansKeys.firstOrNull { k ->
+                        !isSensitiveField(k, fieldTypes[k] ?: "text") &&
+                            ans.optString(k, "").isNotEmpty()
+                    }?.let { ans.optString(it, "") }
+                    if (!firstPlain.isNullOrEmpty()) {
+                        try {
+                            val detail = engine.runAgentStep(
+                                JSONObject().put("type", "fill")
+                                    .put(
+                                        "selector", JSONObject()
+                                            .put("mode", sel["mode"] as? String ?: "css")
+                                            .put("value", sel["value"] as? String ?: "")
+                                    )
+                                    .put("text", firstPlain)
+                            )
+                            val ok = detail.optBoolean("verified", true)
+                            history.add(
+                                JSONObject().put("action", "fill_user_value")
+                                    .put("result", if (ok) "ok" else "error")
+                                    .put("detail", "user value bhara (verified=$ok)".take(200))
+                            )
+                            filledAny = ok
+                        } catch (_: Exception) {
+                            filledAny = false
+                        }
+                    }
+                }
+                if (!filledAny) {
+                    // value userProvided me hai — agle act() me brain use karega
+                    // (sensitive keys yahan kabhi nahi aate — wo upar filter hain)
+                    history.add(
+                        JSONObject().put("action", "user_input")
+                            .put("result", "ok")
+                            .put("detail", "user ne diya: ${userProvided.keys().asSequence().toList()}".take(200))
+                    )
+                }
+            }
+        }
+        return true
+    }
+
+    // =====================================================================
+    // login / document prompts (v10) — same-run handoff, secrets local-only
+    // =====================================================================
+
+    /**
+     * Login prompt: username+password DIALOG se aaye (ans), dono SENSITIVE.
+     * OTP pattern: userProvided me NAHI, server/AI ko NAHI, history me value
+     * NAHI — sirf page me locally bharo, phir submit dabane ki koshish karo.
+     * true = kuch bhara (loop continue kare).
+     */
+    private fun handleLoginPrompt(
+        ctx: Context,
+        engine: FormEngine,
+        req: UserPrompt.Request,
+        ans: JSONObject,
+        sensitiveKeys: MutableSet<String>,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        val username = ans.optString("username", "").trim()
+        val password = ans.optString("password", "")
+        if (username.isEmpty() || password.isEmpty()) return false
+        sensitiveKeys.add("username")
+        sensitiveKeys.add("password")
+        var filledAny = false
+        val uField = findLoginField(engine, "username")
+        if (uField != null) {
+            try {
+                val d = engine.runAgentStep(
+                    JSONObject().put("type", "fill")
+                        .put(
+                            "selector",
+                            JSONObject().put("mode", uField.first).put("value", uField.second)
+                        )
+                        .put("text", username)
+                )
+                if (d.optBoolean("verified", true)) filledAny = true
+            } catch (_: Exception) { }
+        }
+        val pField = findLoginField(engine, "password")
+        if (pField != null) {
+            try {
+                val d = engine.runAgentStep(
+                    JSONObject().put("type", "fill")
+                        .put(
+                            "selector",
+                            JSONObject().put("mode", pField.first).put("value", pField.second)
+                        )
+                        .put("text", password)
+                )
+                if (d.optBoolean("verified", true)) filledAny = true
+            } catch (_: Exception) { }
+        }
+        // Submit/login button dabane ki koshish (user ne "Login bhardo" dabakar approve kiya)
+        var submitted = false
+        if (filledAny) {
+            submitted = tryTapSubmit(engine)
+        }
+        history.add(
+            JSONObject().put("action", "fill_login_local")
+                .put("result", if (filledAny) "ok" else "error")
+                .put("detail", "login page me bhara (value hidden), submit=$submitted")
+        )
+        return filledAny
+    }
+
+    /**
+     * Document prompt: ans = {doc: "<vault filename>"}. Filename SIRF device
+     * par rehta hai (engine.selectedDoc) — server/AI ko kabhi nahi jata.
+     * userProvided me sirf "document_available"=true flag jata hai taaki brain
+     * ko pata chale document ready hai; upload ke liye brain {"type":"upload"}
+     * bheje (bina naam) aur engine locally-selected file use karega.
+     */
+    private fun handleDocumentPrompt(
+        ctx: Context,
+        engine: FormEngine,
+        req: UserPrompt.Request,
+        ans: JSONObject,
+        userProvided: JSONObject,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        val doc = ans.optString("doc", "").trim()
+        if (doc.isEmpty()) return false
+        val file = engine.docFile(doc)
+        if (file == null) {
+            history.add(
+                JSONObject().put("action", "document")
+                    .put("result", "error")
+                    .put("detail", "document file nahi mili (vault me check karo)")
+            )
+            return false
+        }
+        // Filename local-only: engine me set (upload fallback ke liye),
+        // server/AI ko SIRF flag jayega.
+        engine.setSelectedDoc(doc)
+        userProvided.put("document_available", true)
+        // Page par file input dikh raha ho to turant upload kar do
+        var uploaded = false
+        try {
+            if (hasFileInput(engine)) {
+                val d = engine.runAgentStep(
+                    JSONObject().put("type", "upload")
+                )
+                uploaded = d.optBoolean("uploaded", false)
+            }
+        } catch (_: Exception) { }
+        history.add(
+            JSONObject().put("action", "document")
+                .put("result", "ok")
+                .put(
+                    "detail",
+                    "document mila (name hidden, local-only), uploaded=$uploaded"
+                )
+        )
+        return true
+    }
+
+    /** Page par login field dhoondho: which = "username" | "password". */
+    private fun findLoginField(engine: FormEngine, which: String): Pair<String, String>? {
+        val snap = try { engine.domSnapshot() } catch (_: Exception) { return null }
+        val fields = snap.optJSONArray("fields") ?: return null
+        for (i in 0 until fields.length()) {
+            val f = fields.optJSONObject(i) ?: continue
+            if (f.optString("tag", "") != "input") continue
+            val t = f.optString("type", "").lowercase()
+            if (t == "hidden" || t == "submit" || t == "button" || t == "checkbox" ||
+                t == "radio" || t == "file"
+            ) continue
+            val blob = (f.optString("label", "") + " " + f.optString("placeholder", "") +
+                " " + f.optString("aria", "") + " " + f.optString("name", "") +
+                " " + f.optString("id", "")).lowercase()
+            val match = if (which == "password") {
+                t == "password" || blob.contains("password") || blob.contains("passwd")
+            } else {
+                t != "password" && (blob.contains("user") || blob.contains("email") ||
+                    blob.contains("e-mail") || blob.contains("phone") ||
+                    blob.contains("mobile") || blob.contains("login"))
+            }
+            if (!match) continue
+            val id = f.optString("id", "")
+            val nm = f.optString("name", "")
+            val ph = f.optString("placeholder", "")
+            return when {
+                id.isNotEmpty() -> "id" to id
+                nm.isNotEmpty() -> "name" to nm
+                ph.isNotEmpty() -> "placeholder" to ph
+                else -> continue
+            }
+        }
+        return null
+    }
+
+    /** Page par password field hai? (proactive login-prompt trigger ke liye) */
+    private fun hasPasswordField(engine: FormEngine): Boolean =
+        findLoginField(engine, "password") != null
+
+    /** Page par <input type=file> hai? */
+    private fun hasFileInput(engine: FormEngine): Boolean {
+        val snap = try { engine.domSnapshot() } catch (_: Exception) { return false }
+        val fields = snap.optJSONArray("fields") ?: return false
+        for (i in 0 until fields.length()) {
+            val f = fields.optJSONObject(i) ?: continue
+            if (f.optString("tag", "") == "input" &&
+                f.optString("type", "").lowercase() == "file"
+            ) return true
+        }
+        return false
+    }
+
+    /**
+     * Login/Submit button dhoondh ke tap karo. true = tap bhej diya.
+     * (User ne dialog me "Login bhardo" dabakar submit approve kiya hai.)
+     */
+    private fun tryTapSubmit(engine: FormEngine): Boolean {
+        val snap = try { engine.domSnapshot() } catch (_: Exception) { return false }
+        val buttons = snap.optJSONArray("buttons") ?: return false
+        val keys = listOf(
+            "login", "log in", "sign in", "signin", "submit", "continue",
+            "आगे", "लॉगिन", "प्रवेश"
+        )
+        for (i in 0 until buttons.length()) {
+            val b = buttons.optJSONObject(i) ?: continue
+            val text = b.optString("text", "").lowercase()
+            if (keys.none { text.contains(it) }) continue
+            val rect = b.optJSONObject("rect") ?: continue
+            val x = (rect.optDouble("x", -1.0) + rect.optDouble("w", 0.0) / 2).toFloat()
+            val y = (rect.optDouble("y", -1.0) + rect.optDouble("h", 0.0) / 2).toFloat()
+            if (x < 0 || y < 0) continue
+            return try { engine.tapAt(x, y) } catch (_: Exception) { false }
+        }
+        return false
+    }
+
+    /** Upload fail (file missing) → user se document maango, same run continue. */
+    private fun askDocumentProactively(
+        ctx: Context,
+        engine: FormEngine,
+        runId: String,
+        userProvided: JSONObject,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        // Pehle se doc mil chuka ho aur file maujood ho → dobara mat puchho
+        // (filename local-only: engine.selectedDoc se check)
+        val existingAvailable = userProvided.optBoolean("document_available", false)
+        if (existingAvailable && engine.selectedDocFile() != null) return true
+        val req = UserPrompt.Request(
+            runId = runId,
+            kind = "document",
+            title = "Document chahiye",
+            message = "Is form me document upload karna hai. Vault se chuno ya naya upload karo.",
+            timeoutSec = 600L
+        )
+        notifyPrompt(ctx, "📎 Document chahiye", req.message)
+        val ansStr = UserPrompt.ask(req) ?: return false
+        val ans = try { JSONObject(ansStr) } catch (_: Exception) { return false }
+        if (!ans.optBoolean("approved", false)) return false
+        return handleDocumentPrompt(ctx, engine, req, ans, userProvided, history)
+    }
+
+    /** Login form par atke → user se credentials maango (local-only), same run continue. */
+    private fun askLoginProactively(
+        ctx: Context,
+        engine: FormEngine,
+        runId: String,
+        sensitiveKeys: MutableSet<String>,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        val req = UserPrompt.Request(
+            runId = runId,
+            kind = "login",
+            title = "Login chahiye",
+            message = "Ye page login maang raha hai. Username-password do — sirf is page me bhare jayenge, kahin save nahi honge.",
+            fields = listOf(
+                UserPrompt.Field("username", "Username / Email", "text"),
+                UserPrompt.Field("password", "Password", "password")
+            ),
+            timeoutSec = 600L
+        )
+        notifyPrompt(ctx, "🔑 Login chahiye", req.message)
+        val ansStr = UserPrompt.ask(req) ?: return false
+        val ans = try { JSONObject(ansStr) } catch (_: Exception) { return false }
+        if (!ans.optBoolean("approved", false)) return false
+        return handleLoginPrompt(ctx, engine, req, ans, sensitiveKeys, history)
+    }
+
+    /** OTP/password jaisi sensitive field? — ye values KABHI AI/server ko nahi jati. */
+    private fun isSensitiveField(key: String, type: String): Boolean {
+        val t = type.lowercase()
+        if (t == "otp" || t == "password") return true
+        val k = key.lowercase()
+        return k.contains("otp") || k.contains("password") || k.contains("passwd") ||
+            k.contains("cvv") || k.contains("card_pin") || k == "pin"
+    }
+
+    /**
+     * OTP/password ko page me LOCAL bharo (server/AI ko value kabhi nahi bheji jati).
+     * fill_selector (server ne diya) → nahi to page par OTP field auto-detect.
+     * true = bhara + verified.
+     */
+    private fun fillSecretLocally(
+        engine: FormEngine,
+        prompt: Map<String, Any?>,
+        value: String
+    ): Boolean {
+        @Suppress("UNCHECKED_CAST")
+        val sel = prompt["fill_selector"] as? Map<String, Any?>
+        var mode = sel?.get("mode") as? String ?: ""
+        var selVal = sel?.get("value") as? String ?: ""
+        if (mode.isEmpty() || selVal.isEmpty()) {
+            val found = findOtpField(engine)
+            if (found == null) return false
+            mode = found.first
+            selVal = found.second
+        }
+        return try {
+            val detail = engine.runAgentStep(
+                JSONObject().put("type", "fill")
+                    .put(
+                        "selector",
+                        JSONObject().put("mode", mode).put("value", selVal)
+                    )
+                    .put("text", value)
+            )
+            detail.optBoolean("verified", true)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** Page par OTP field dhoondho (label/placeholder/aria/name/id me "otp"). */
+    private fun findOtpField(engine: FormEngine): Pair<String, String>? {
+        val snap = try { engine.domSnapshot() } catch (_: Exception) { return null }
+        val fields = snap.optJSONArray("fields") ?: return null
+        for (i in 0 until fields.length()) {
+            val f = fields.optJSONObject(i) ?: continue
+            val tag = f.optString("tag", "")
+            if (tag != "input" && tag != "textarea") continue
+            val t = f.optString("type", "").lowercase()
+            if (t == "hidden" || t == "submit" || t == "button" ||
+                t == "checkbox" || t == "radio" || t == "file"
+            ) continue
+            val blob = (f.optString("label", "") + " " + f.optString("placeholder", "") +
+                " " + f.optString("aria", "") + " " + f.optString("name", "") +
+                " " + f.optString("id", "")).lowercase()
+            if (!blob.contains("otp")) continue
+            val id = f.optString("id", "")
+            val nm = f.optString("name", "")
+            val ph = f.optString("placeholder", "")
+            val label = f.optString("label", "")
+            val aria = f.optString("aria", "")
+            return when {
+                id.isNotEmpty() -> "id" to id
+                nm.isNotEmpty() -> "name" to nm
+                ph.isNotEmpty() -> "placeholder" to ph
+                label.isNotEmpty() -> "label" to label
+                aria.isNotEmpty() -> "aria" to aria
+                else -> continue
+            }
+        }
+        return null
+    }
+
+    /** user_provided ka filtered copy — sensitive keys kabhi server/AI ko nahi jate. */
+    private fun filteredUserProvided(
+        src: JSONObject,
+        sensitive: Set<String>
+    ): JSONObject {
+        val o = JSONObject()
+        val keys = src.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            if (sensitive.contains(k)) continue
+            if (isSensitiveField(k, "")) continue
+            o.put(k, src.opt(k))
+        }
+        return o
+    }
+
+    /** Veto pe payment page → amount nikalo → approval+QR+countdown → verify. */
+    private fun handlePaymentPrompt(
+        ctx: Context,
+        engine: FormEngine,
+        pageUrl: String,
+        runId: String
+    ): String {
+        val pageText = try {
+            engine.domSnapshot().optString("page_text", "")
+        } catch (_: Exception) {
+            ""
+        }
+        val amount = PaymentFlow.parseAmount(pageText) ?: ""
+        val merchant = try {
+            java.net.URL(pageUrl).host ?: "site"
+        } catch (_: Exception) {
+            "site"
+        }
+        val req = UserPrompt.Request(
+            runId = runId,
+            kind = "payment",
+            title = "Payment approval",
+            message = "Site par payment page aaya hai. Aap khud apne UPI app se pay karoge — agent kabhi khud payment nahi karta.",
+            payment = UserPrompt.Payment(amount, merchant, ""),
+            timeoutSec = 600
+        )
+        notifyPrompt(ctx, "💰 Payment approval", "₹$amount — $merchant")
+        return doPaymentFlow(ctx, engine, req, runId)
+    }
+
+    /**
+     * Payment flow: server ko 'requested' → user jawab wait → 'paid_claimed' →
+     * site par success keywords verify → 'verified'.
+     * @return verified | declined | timeout | unverified
+     */
+    private fun doPaymentFlow(
+        ctx: Context,
+        engine: FormEngine,
+        req: UserPrompt.Request,
+        runId: String
+    ): String {
+        val pay = req.payment
+        try {
+            AgentApi.patchPayment(
+                ctx, runId,
+                JSONObject().put("status", "requested")
+                    .put("amount", pay?.amount ?: "")
+                    .put("merchant", pay?.merchant ?: "")
+                    .put("upi_id", pay?.upiId ?: "")
+            )
+        } catch (_: Exception) { }
+        val ansStr = UserPrompt.ask(req)
+        if (ansStr == null) {
+            try {
+                AgentApi.patchPayment(
+                    ctx, runId,
+                    JSONObject().put("status", "failed").put("reason", "timeout")
+                )
+            } catch (_: Exception) { }
+            return "timeout"
+        }
+        val ans = try { JSONObject(ansStr) } catch (_: Exception) { JSONObject() }
+        if (!ans.optBoolean("approved", false)) {
+            try {
+                AgentApi.patchPayment(
+                    ctx, runId,
+                    JSONObject().put("status", "failed").put("reason", "declined")
+                )
+            } catch (_: Exception) { }
+            return "declined"
+        }
+        if (!ans.optBoolean("payment_done", false)) {
+            try {
+                AgentApi.patchPayment(
+                    ctx, runId,
+                    JSONObject().put("status", "failed")
+                        .put("reason", ans.optString("reason", "unknown"))
+                )
+            } catch (_: Exception) { }
+            return "timeout"
+        }
+        val method = ans.optString("method", "")
+        try {
+            AgentApi.patchPayment(
+                ctx, runId,
+                JSONObject().put("status", "paid_claimed").put("method", method)
+            )
+        } catch (_: Exception) { }
+        // Verify: site par success keywords dhoondo (max 3 round, 3s gap)
+        repeat(3) {
+            val text = try {
+                engine.domSnapshot().optString("page_text", "")
+            } catch (_: Exception) {
+                ""
+            }
+            if (PaymentFlow.isSuccessText(text)) {
+                try {
+                    AgentApi.patchPayment(
+                        ctx, runId,
+                        JSONObject().put("status", "verified")
+                            .put("verified_at", System.currentTimeMillis())
+                    )
+                } catch (_: Exception) { }
+                return "verified"
+            }
+            try { Thread.sleep(3000) } catch (_: Exception) { }
+        }
+        try {
+            AgentApi.patchPayment(
+                ctx, runId,
+                JSONObject().put("status", "failed").put("reason", "unverified")
+            )
+        } catch (_: Exception) { }
+        return "unverified"
+    }
+
+    private fun payMessage(res: String): String = when (res) {
+        "declined" -> "Aapne payment se mana kiya — kaam roka gaya 🛑"
+        "timeout" -> "Payment ka time khatm ho gaya — dobara try karein ⏳"
+        "unverified" -> "Payment verify nahi hua site par — aap khud check karke retry karein ⚠️"
+        else -> "Payment poora nahi hua — kaam ruka ⚠️"
+    }
+
+    /** Prompt map → UserPrompt.Request. */
+    private fun buildPromptRequest(
+        runId: String,
+        kind: String,
+        prompt: Map<String, Any?>
+    ): UserPrompt.Request {
+        var fields = ((prompt["fields"] as? List<*>) ?: emptyList<Any>())
+            .mapNotNull { it as? Map<String, Any?> }
+            .map {
+                UserPrompt.Field(
+                    (it["key"] as? String) ?: "value",
+                    (it["label"] as? String) ?: "Likho",
+                    (it["type"] as? String) ?: "text"
+                )
+            }
+        // login kind: server ne fields na diye hon to default username+password
+        // (dono sensitive — dialog me mic nahi, values local-only)
+        if (kind == "login" && fields.isEmpty()) {
+            fields = listOf(
+                UserPrompt.Field("username", "Username / Email", "text"),
+                UserPrompt.Field("password", "Password", "password")
+            )
+        }
+        val options = ((prompt["options"] as? List<*>) ?: emptyList<Any>())
+            .mapNotNull { (it as? String)?.ifEmpty { null } }
+        @Suppress("UNCHECKED_CAST")
+        val payMap = prompt["payment"] as? Map<String, Any?>
+        val payment = if (kind == "payment" || payMap != null) {
+            UserPrompt.Payment(
+                (payMap?.get("amount") as? String) ?: "",
+                (payMap?.get("merchant") as? String) ?: "",
+                (payMap?.get("upi_id") as? String) ?: ""
+            )
+        } else null
+        return UserPrompt.Request(
+            runId = runId,
+            kind = kind,
+            title = (prompt["title"] as? String)?.ifEmpty { null } ?: "Madad chahiye",
+            message = (prompt["message"] as? String)?.ifEmpty { null }
+                ?: "Agent ko aapki zaroorat hai",
+            fields = fields,
+            options = options,
+            payment = payment,
+            docType = (prompt["doc_type"] as? String)?.ifEmpty { null } ?: "",
+            timeoutSec = (prompt["timeout_s"] as? Number)?.toLong() ?: 600L
+        )
+    }
+
+    /** Prompt aaye to notification bhi (user kisi bhi tab/app me ho). */
+    private fun notifyPrompt(ctx: Context, title: String, msg: String) {
+        try {
+            val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE)
+                as android.app.NotificationManager
+            val chId = "fm_prompts"
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                nm.createNotificationChannel(
+                    android.app.NotificationChannel(
+                        chId, "Agent sawal",
+                        android.app.NotificationManager.IMPORTANCE_HIGH
+                    )
+                )
+            }
+            val intent = android.content.Intent(
+                ctx, com.formmitra.app.MainActivity::class.java
+            ).putExtra("open_tab", "/agent")
+            val pi = android.app.PendingIntent.getActivity(
+                ctx, 99, intent,
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT or
+                    android.app.PendingIntent.FLAG_IMMUTABLE
+            )
+            val nb = android.app.Notification.Builder(ctx, chId)
+                .setContentTitle(title)
+                .setContentText(msg.take(120))
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+            nm.notify(9011, nb.build())
+        } catch (_: Exception) { }
     }
 
     /**

@@ -55,6 +55,15 @@ class FormEngine(private val appContext: Context) {
     private var handler: Handler? = null
     private var webView: WebView? = null
 
+    /**
+     * Assisted payment verify hone ke baad AgentLoop ise true karta hai.
+     * Uske baad: live-page veto + goto-URL veto suppress (success/receipt
+     * page par "payment" text hota hai — dobara prompt nahi chahiye).
+     * Step-blob veto (AI ka payment action: card bharna, "Pay Now" dabana)
+     * KABHI suppress nahi hota — doosri payment hamesha vetoed rahegi.
+     */
+    @Volatile var paymentVerifiedOnce: Boolean = false
+
     /** Engine thread start + hidden WebView. Blocking; caller background pe ho. */
     fun start() {
         if (thread != null) return
@@ -140,22 +149,32 @@ class FormEngine(private val appContext: Context) {
             return runUploadStep(stepJson)
         }
         val s = StepParser.parse(jsonToMap(stepJson))
-        VetoCheck.find(StepParser.vetoBlob(s))?.let {
-            throw VetoException("agent step ('${s.type}') me payment keyword '$it'")
+        // Step-blob veto: AI ka payment action KABHI allow nahi — sirf goto
+        // tab skip jab assisted payment pehle verify ho chuki ho (success URL).
+        val skipStepVeto = paymentVerifiedOnce && s.type == "goto"
+        if (!skipStepVeto) {
+            VetoCheck.find(StepParser.vetoBlob(s))?.let {
+                throw VetoException("agent step ('${s.type}') me payment keyword '$it'")
+            }
         }
-        checkLivePageVeto()
+        // Live-page veto: payment verify ke baad suppress (receipt page par
+        // "payment successful" text hota hai).
+        if (!paymentVerifiedOnce) checkLivePageVeto()
         return runStepWithTimeout(s)
     }
 
     /** upload step: apna timeout path (StepSpec ke bahar). */
     @Throws(Exception::class)
     private fun runUploadStep(raw: JSONObject): JSONObject {
+        // Veto locally-selected doc naam par bhi (payment keyword scan)
+        val vetoName = raw.optString("doc", "").trim()
+            .ifEmpty { selectedDoc?.trim() ?: "" }
         VetoCheck.find(
-            "${raw.optString("doc", "")} ${raw.optString("path", "")}"
+            "$vetoName ${raw.optString("path", "")}"
         )?.let {
             throw VetoException("upload step me payment keyword '$it'")
         }
-        checkLivePageVeto()
+        if (!paymentVerifiedOnce) checkLivePageVeto()
         val exec = Executors.newSingleThreadExecutor()
         return try {
             val fut = exec.submit<JSONObject> { executeUpload(raw) }
@@ -1047,6 +1066,24 @@ class FormEngine(private val appContext: Context) {
     private var pendingUploadFile: java.io.File? = null
     private var pendingUploadLatch: CountDownLatch? = null
 
+    /**
+     * User-prompt se chuna hua document (vault filename) — LOCAL-ONLY.
+     * Ye kabhi network request me nahi jata: upload step me {"type":"upload"}
+     * (bina doc naam) aaye to engine isi file ko use karta hai.
+     */
+    private var selectedDoc: String? = null
+
+    /** Document prompt ka chuna hua filename set karo (device-local). */
+    fun setSelectedDoc(doc: String?) {
+        selectedDoc = doc?.trim()?.ifEmpty { null }
+    }
+
+    /** Locally-selected document ki file (proactive re-prompt check ke liye). */
+    fun selectedDocFile(): java.io.File? {
+        val d = selectedDoc ?: return null
+        return docFile(d)
+    }
+
     private fun handleFileChooser(cb: ValueCallback<Array<Uri>>?): Boolean {
         val callback = cb ?: return false
         val file = pendingUploadFile
@@ -1085,6 +1122,16 @@ class FormEngine(private val appContext: Context) {
         }
         if (!f.isFile || !f.canRead()) throw Exception("upload: docs me file nahi mili: $doc")
         return f
+    }
+
+    /**
+     * Vault ka document file ke roop me do (upload ke liye).
+     * null = nahi mili / path traversal / unreadable.
+     */
+    fun docFile(doc: String): java.io.File? = try {
+        resolveUploadFile(doc, "")
+    } catch (_: Exception) {
+        null
     }
 
     /**
@@ -1167,8 +1214,12 @@ class FormEngine(private val appContext: Context) {
 
     /** upload step execute — file resolve → decrypt → compress → input click → auto-supply. */
     private fun executeUpload(raw: JSONObject): JSONObject {
+        // doc naam step me ho to wahi; nahi to user-prompt ka locally-selected
+        // document (selectedDoc) — filename kabhi server se aata nahi, na jata hai.
+        val docName = raw.optString("doc", "").trim()
+            .ifEmpty { selectedDoc?.trim() ?: "" }
         val file = resolveUploadFile(
-            raw.optString("doc", "").trim(),
+            docName,
             raw.optString("path", "").trim()
         )
         // docs dir ki file CryptoVault-encrypted ho sakti hai (UI agent
