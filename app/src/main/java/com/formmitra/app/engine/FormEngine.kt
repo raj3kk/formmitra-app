@@ -1163,35 +1163,68 @@ class FormEngine(private val appContext: Context) {
         return unwrapJsString(evalJsSync(js)) == "CLICKED"
     }
 
-    /** upload step execute — file resolve → compress → input click → auto-supply. */
+    /** upload step execute — file resolve → decrypt → compress → input click → auto-supply. */
     private fun executeUpload(raw: JSONObject): JSONObject {
         val file = resolveUploadFile(
             raw.optString("doc", "").trim(),
             raw.optString("path", "").trim()
         )
-        val final = maybeCompressImage(file)
-        val sel = raw.optJSONObject("selector")
-        val selMode = sel?.optString("mode", "") ?: ""
-        val selVal = sel?.optString("value", "") ?: ""
-        pendingUploadFile = final
-        val latch = CountDownLatch(1)
-        pendingUploadLatch = latch
+        // docs dir ki file CryptoVault-encrypted ho sakti hai (UI agent
+        // save karte waqt encrypt karta hai) → cache me decrypt karke temp
+        // banao; purani plaintext file ho to fallback (as-is).
+        val uploadSrc = maybeDecryptDoc(file)
         try {
-            if (!clickFileInput(selMode, selVal)) {
-                throw Exception("upload: file input nahi mila")
+            val final = maybeCompressImage(uploadSrc)
+            val sel = raw.optJSONObject("selector")
+            val selMode = sel?.optString("mode", "") ?: ""
+            val selVal = sel?.optString("value", "") ?: ""
+            pendingUploadFile = final
+            val latch = CountDownLatch(1)
+            pendingUploadLatch = latch
+            try {
+                if (!clickFileInput(selMode, selVal)) {
+                    throw Exception("upload: file input nahi mila")
+                }
+                if (!latch.await(30, TimeUnit.SECONDS)) {
+                    throw Exception("upload: file chooser timeout (30s)")
+                }
+            } finally {
+                pendingUploadFile = null
+                pendingUploadLatch = null
             }
-            if (!latch.await(30, TimeUnit.SECONDS)) {
-                throw Exception("upload: file chooser timeout (30s)")
-            }
+            Thread.sleep(1000)
+            return JSONObject()
+                .put("uploaded", true)
+                .put("file", file.name)
+                .put("bytes", final.length())
         } finally {
-            pendingUploadFile = null
-            pendingUploadLatch = null
+            // decrypt ka temp saaf karo (original chhedo mat)
+            if (uploadSrc != file) {
+                try { uploadSrc.delete() } catch (_: Exception) { }
+            }
         }
-        Thread.sleep(1000)
-        return JSONObject()
-            .put("uploaded", true)
-            .put("file", final.name)
-            .put("bytes", final.length())
+    }
+
+    /**
+     * docs dir ki encrypted file → cache me decrypted temp. Plaintext purani
+     * file ya docs-dir-bahar (absolute path) → as-is wapas.
+     */
+    private fun maybeDecryptDoc(file: java.io.File): java.io.File {
+        val docsDir = java.io.File(appContext.filesDir, "docs")
+        val canonBase = try { docsDir.canonicalPath } catch (_: Exception) { docsDir.absolutePath }
+        val canonFile = try { file.canonicalPath } catch (_: Exception) { "" }
+        if (!canonFile.startsWith(canonBase + java.io.File.separator)) return file
+        return try {
+            val plain = CryptoVault.decryptFile(appContext, file)
+            val tmp = java.io.File(
+                appContext.cacheDir,
+                "dec_${System.currentTimeMillis()}_${file.name}"
+            )
+            tmp.outputStream().use { it.write(plain) }
+            tmp
+        } catch (_: Exception) {
+            file // purani plaintext file — fallback
+        }
     }
 
     /**

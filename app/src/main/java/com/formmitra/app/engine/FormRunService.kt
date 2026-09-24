@@ -88,19 +88,30 @@ class FormRunService : Service() {
                 val goal = firstStep.optString("goal", name).ifEmpty { name }
                 val url = firstStep.optString("url", task.optString("target_url", ""))
                 var offlineMode = false
+                var standaloneMode = false
                 AgentLoop.runAgentTask(
                     this, engine, goal, url, runId, 40,
                     onProgress = { aiStep ->
+                        val mode = when {
+                            standaloneMode -> "agent_standalone"
+                            offlineMode -> "agent_offline"
+                            else -> "agent"
+                        }
                         val payload = JSONObject()
                             .put("status", "progress")
                             .put("current_step", aiStep)
                             .put("total_steps", 40)
-                            .put("mode", if (offlineMode) "agent_offline" else "agent")
+                            .put("mode", mode)
                         FormApi.report(this, runId, payload)
-                        val suffix = if (offlineMode) " (offline mode)" else ""
+                        val suffix = when {
+                            standaloneMode -> " (standalone)"
+                            offlineMode -> " (offline mode)"
+                            else -> ""
+                        }
                         updateOngoing("Form bhar raha hai: $name", "AI step $aiStep / 40$suffix")
                     },
-                    onOfflineMode = { offlineMode = true }
+                    onOfflineMode = { offlineMode = true },
+                    onStandaloneMode = { standaloneMode = true }
                 )
             } else {
                 engine.runTask(task) { step1Based, _ ->

@@ -35,7 +35,8 @@ object AgentLoop {
         runId: String,
         maxSteps: Int = 40,
         onProgress: (Int) -> Unit = {},
-        onOfflineMode: () -> Unit = {}
+        onOfflineMode: () -> Unit = {},
+        onStandaloneMode: () -> Unit = {}
     ): FormEngine.RunResult {
         val stepsLog = JSONArray()
         val history = ArrayList<JSONObject>()
@@ -44,12 +45,16 @@ object AgentLoop {
         var stepsTaken = 0
         val recentSigs = ArrayList<String>()
 
+        // Local task: runId khaali ho to local-<timestamp> (standalone mode —
+        // UI agent local task banate waqt khud bhi yehi format bhej sakta hai)
+        val effectiveRunId = runId.ifEmpty { "local-${System.currentTimeMillis()}" }
+
         // Resume state: agent_run shuru hote hi save (kill/reboot ke baad
         // UI agent checkPending se resume karega). Terminal par clear.
-        try { AgentResume.save(ctx, goal, startUrl, runId) } catch (_: Exception) { }
+        try { AgentResume.save(ctx, goal, startUrl, effectiveRunId) } catch (_: Exception) { }
         // Server-side run record (best-effort — fail ho to bina reporting chalao)
         var agentRunId: String? = null
-        try { agentRunId = RunReporter.createRun(ctx, goal, startUrl, runId) } catch (_: Exception) { }
+        try { agentRunId = RunReporter.createRun(ctx, goal, startUrl, effectiveRunId) } catch (_: Exception) { }
 
         fun logStep(i: Int, action: String, ok: Boolean, detail: String) {
             stepsLog.put(
@@ -183,10 +188,27 @@ object AgentLoop {
                     .put("history", hArr)
                     .put("stuck_count", stuckCount)
                     .put("run_id", runId)
-                val res: AgentApi.ApiResult = try {
+                var res: AgentApi.ApiResult = try {
                     AgentApi.act(ctx, reqBody)
                 } catch (_: Exception) {
                     AgentApi.ApiResult(-1, null)
+                }
+                // Server unreachable (network fail ya HTTP 5xx) + user ki Groq
+                // key saved hai → standalone brain (direct Groq, no server).
+                // 401 (login) / 429 (limit) par NAHI — wo needs_user handoff.
+                if ((res.code == -1 || res.code in 500..599) && Standalone.isConfigured(ctx)) {
+                    logStep(i, "act", false, "server down (code=${res.code}) → standalone brain")
+                    try { onStandaloneMode() } catch (_: Exception) { }
+                    val sbStep: JSONObject? = try {
+                        StandaloneBrain.decide(ctx, reqBody)
+                    } catch (_: Exception) {
+                        null
+                    }
+                    res = if (sbStep != null) {
+                        AgentApi.ApiResult(200, JSONObject().put("step", sbStep))
+                    } else {
+                        AgentApi.ApiResult(-1, null)
+                    }
                 }
                 // AI unreachable (network fail ya HTTP 5xx) → deterministic
                 // offline fallback. 401 (login) / 429 (limit) par NAHI —

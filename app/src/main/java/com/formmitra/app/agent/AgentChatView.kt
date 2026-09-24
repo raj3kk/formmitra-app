@@ -15,10 +15,12 @@ import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
+import android.text.InputType
 import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import com.formmitra.app.engine.Standalone
 import android.widget.Button
 import android.widget.EditText
 import android.widget.HorizontalScrollView
@@ -59,6 +61,9 @@ class AgentChatView(
     private lateinit var retryBtn: Button
     private var bannerGoal = ""
     private var bannerUrl = ""
+
+    // standalone status chip
+    private lateinit var standaloneChip: TextView
 
     // voice input
     private var recognizer: SpeechRecognizer? = null
@@ -114,7 +119,21 @@ class AgentChatView(
             textSize = 13f
             setOnClickListener { showHistory() }
         })
+        header.addView(Button(context).apply {
+            text = "⚙️"
+            textSize = 13f
+            setOnClickListener { showStandaloneSettings() }
+        })
         addView(header)
+
+        // Standalone status chip
+        standaloneChip = TextView(context).apply {
+            textSize = 12f
+            setTextColor(Color.parseColor("#5F6368"))
+            setPadding(pad, dp(2), pad, dp(2))
+        }
+        addView(standaloneChip)
+        refreshStandaloneChip()
 
         // needs_user banner (polling se dikhega)
         bannerBox = LinearLayout(context).apply {
@@ -625,10 +644,109 @@ class AgentChatView(
         dlg.show()
     }
 
+    // ---------- standalone mode settings ----------
+
+    private fun isStandaloneConfigured(): Boolean = try {
+        Standalone.isConfigured(context)
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun standaloneSaveKey(key: String) {
+        try {
+            Standalone.saveKey(context, key)
+        } catch (_: Exception) {
+            toast("Key save nahi hui — dobara try karo")
+        }
+    }
+
+    private fun standaloneClearKey() {
+        try {
+            Standalone.clearKey(context)
+        } catch (_: Exception) {
+            // best effort
+        }
+    }
+
+    private fun refreshStandaloneChip() {
+        standaloneChip.text = if (isStandaloneConfigured())
+            "Standalone: ON (key saved) ✅"
+        else
+            "Standalone: OFF"
+    }
+
+    private fun showStandaloneSettings() {
+        val configured = isStandaloneConfigured()
+        val keyInput = EditText(context).apply {
+            hint = if (configured) "•••••••• (nayi key yahan likho)"
+                   else "Groq API key yahan likho"
+            textSize = 15f
+            inputType =
+                InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val body = LinearLayout(context).apply {
+            orientation = VERTICAL
+            val p = dp(16)
+            setPadding(p, dp(8), p, 0)
+        }
+        body.addView(TextView(context).apply {
+            text = "Server ya net na ho to app aapki Groq API key se seedha AI se " +
+                "baat karegi. Key sirf aapke phone me encrypted rehti hai."
+            textSize = 14f
+            setTextColor(Color.parseColor("#5F6368"))
+        })
+        body.addView(
+            keyInput,
+            LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(10), 0, 0) }
+        )
+        val srcRow = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        srcRow.addView(TextView(context).apply {
+            text = "Key: console.groq.com → API Keys (free)"
+            textSize = 13f
+            setTextColor(Color.parseColor("#5F6368"))
+            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+        })
+        srcRow.addView(Button(context).apply {
+            text = "Link kholo"
+            textSize = 13f
+            setOnClickListener { onOpenLink("https://console.groq.com/keys") }
+        })
+        body.addView(srcRow)
+        val dlg = AlertDialog.Builder(context)
+            .setTitle("Standalone mode (bina server)")
+            .setView(body)
+            .setPositiveButton("Save") { _, _ ->
+                val key = keyInput.text.toString().trim()
+                if (key.isEmpty()) {
+                    toast("Key khaali hai")
+                    return@setPositiveButton
+                }
+                standaloneSaveKey(key)
+                keyInput.setText("")
+                refreshStandaloneChip()
+                toast("Key save ho gayi ✅")
+            }
+            .setNegativeButton("Band karo", null)
+        if (configured) {
+            dlg.setNeutralButton("Hatao") { _, _ ->
+                standaloneClearKey()
+                refreshStandaloneChip()
+                toast("Key hata di gayi")
+            }
+        }
+        dlg.show()
+    }
+
     // ---------- needs_user banner + polling ----------
 
     /** MainActivity.selectTab se — Agent tab dikha to polling shuru. */
     fun onTabShown() {
+        refreshStandaloneChip()
         if (polling) return
         polling = true
         pollHandler.post(pollRunnable)
