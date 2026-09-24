@@ -291,18 +291,10 @@ class MainActivity : Activity() {
 
     // ---------- agent resume ----------
 
-    /**
-     * Engine ka AgentResume object (doosra agent bana raha hai) — reflection
-     * se access, taaki uske bina bhi ye file compile ho aur app chale.
-     * Class mil gayi to asli checkPending/clear chalta hai.
-     */
+    /** Engine ka AgentResume object — direct call (class hamesha present hai). */
     private fun checkAgentResume(): Triple<String, String, String?>? {
         return try {
-            val cls = Class.forName("com.formmitra.app.engine.AgentResume")
-            val inst = cls.getField("INSTANCE").get(null)
-            @Suppress("UNCHECKED_CAST")
-            cls.getMethod("checkPending", android.content.Context::class.java)
-                .invoke(inst, this) as? Triple<String, String, String?>
+            com.formmitra.app.engine.AgentResume.checkPending(this)
         } catch (_: Exception) {
             null
         }
@@ -310,9 +302,7 @@ class MainActivity : Activity() {
 
     private fun clearAgentResume() {
         try {
-            val cls = Class.forName("com.formmitra.app.engine.AgentResume")
-            val inst = cls.getField("INSTANCE").get(null)
-            cls.getMethod("clear", android.content.Context::class.java).invoke(inst, this)
+            com.formmitra.app.engine.AgentResume.clear(this)
         } catch (_: Exception) { }
     }
 

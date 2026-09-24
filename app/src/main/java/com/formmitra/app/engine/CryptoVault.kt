@@ -3,6 +3,7 @@ package com.formmitra.app.engine
 import android.content.Context
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import org.json.JSONObject
 import java.io.File
 import java.security.KeyStore
 import javax.crypto.Cipher
@@ -116,5 +117,71 @@ object CryptoVault {
     fun decryptFile(ctx: Context, src: File): ByteArray {
         val blob = src.inputStream().use { it.readBytes() }
         return decryptBytes(blob)
+    }
+}
+
+/**
+ * VaultProfileCache — user ke vault profile (naam, phone, address...) ka
+ * encrypted local cache. Server reachable ho to fresh profile laake cache
+ * update hota hai; server unreachable ho to cache se kaam chalta hai —
+ * isliye standalone/offline mode sach me server ke bina kaam karta hai.
+ * Cache CryptoVault me AES-256-GCM se encrypted hai.
+ */
+object VaultProfileCache {
+    private const val KEY = "vault_profile_cache_v1"
+
+    /** Profile cache karo (encrypted). Khaali profile cache nahi hoti. */
+    fun save(ctx: Context, profile: Map<String, String>) {
+        if (profile.isEmpty()) return
+        try {
+            val obj = JSONObject()
+            for ((k, v) in profile) obj.put(k, v)
+            CryptoVault.putSecure(ctx, KEY, obj.toString())
+        } catch (_: Exception) { }
+    }
+
+    /** Cached profile, ya null (koi cache nahi ya corrupt). */
+    fun load(ctx: Context): Map<String, String>? {
+        val raw = CryptoVault.getSecure(ctx, KEY) ?: return null
+        return try {
+            val obj = JSONObject(raw)
+            val out = HashMap<String, String>()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val v = obj.optString(k, "").trim()
+                if (v.isNotEmpty()) out[k] = v
+            }
+            out.takeIf { it.isNotEmpty() }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Vault profile lao: pehle server (fresh), fail ho to encrypted cache.
+     * Dono fail → khaali map. Duplicate fetchVaultProfile ka single source.
+     */
+    fun fetch(ctx: Context): Map<String, String> {
+        val fresh = try {
+            val p = com.formmitra.app.agent.AgentApi.profile(ctx)
+            if (p == null) null else {
+                val out = HashMap<String, String>()
+                val keys = p.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val v = p.optString(k, "").trim()
+                    if (v.isNotEmpty()) out[k] = v
+                }
+                out
+            }
+        } catch (_: Exception) {
+            null
+        }
+        if (fresh != null && fresh.isNotEmpty()) {
+            save(ctx, fresh)
+            return fresh
+        }
+        return load(ctx) ?: emptyMap()
     }
 }

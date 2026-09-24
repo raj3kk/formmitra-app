@@ -250,7 +250,7 @@ object AgentLoop {
                     }
                     continue
                 }
-                val stepMap = jsonToMap(stepJson)
+                val stepMap = engine.jsonToMap(stepJson)
                 val action = (stepMap["action"] as? String)?.trim() ?: ""
 
                 // (e) terminal actions — execute nahi hote
@@ -523,21 +523,6 @@ object AgentLoop {
         val dx = nearest.cx - wx; val dy = nearest.cy - wy
         if (dx * dx + dy * dy > 500 * 500) return null // bahut door — galat field me type nahi karenge
         return nearest.mode to nearest.value
-    }
-
-    private fun jsonToMap(o: JSONObject): Map<String, Any?> {
-        val m = HashMap<String, Any?>()
-        val keys = o.keys()
-        while (keys.hasNext()) {
-            val k = keys.next()
-            m[k] = when (val v = o.opt(k)) {
-                is JSONObject -> jsonToMap(v)
-                is JSONArray -> v // arrays (fields/buttons) yahan map nahi hote
-                JSONObject.NULL -> null
-                else -> v
-            }
-        }
-        return m
     }
 
     private fun mapToJson(m: Map<String, Any?>): JSONObject {

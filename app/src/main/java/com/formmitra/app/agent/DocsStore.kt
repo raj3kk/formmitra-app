@@ -4,11 +4,13 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
+import com.formmitra.app.engine.CryptoVault
 import java.io.File
 
 /**
- * DocsStore — user ke documents (photo/PDF) filesDir/docs/ me save rakhta hai.
- * Engine ka upload step yahin se file uthata hai.
+ * DocsStore — user ke documents (photo/PDF) filesDir/docs/ me ENCRYPTED save rakhta hai.
+ * Android Keystore (AES-256-GCM) se encrypt hota hai; engine upload se pehle decrypt karta hai.
+ * Purani plaintext files bhi engine me chalti rahengi (backward compatible).
  */
 object DocsStore {
 
@@ -44,6 +46,12 @@ object DocsStore {
             cr.openInputStream(uri)?.use { ins ->
                 dest.outputStream().use { outs -> ins.copyTo(outs) }
             } ?: return null
+            // Vault encryption: file ko Keystore AES-256-GCM se encrypt karo.
+            // Fail ho to plaintext hi rehne do (engine backward-compat padh lega).
+            try {
+                val plain = dest.readBytes()
+                CryptoVault.encryptFile(ctx, plain, dest)
+            } catch (_: Exception) { }
             // Engine baad me bhi padh sake — permission persist karo
             try {
                 cr.takePersistableUriPermission(
@@ -57,11 +65,4 @@ object DocsStore {
     }
 
     /** Save ki hui files ke naam (sorted). */
-    fun listDocs(ctx: Context): List<String> {
-        return try {
-            docsDir(ctx).listFiles()?.map { it.name }?.sorted() ?: emptyList()
-        } catch (_: Exception) {
-            emptyList()
-        }
-    }
 }

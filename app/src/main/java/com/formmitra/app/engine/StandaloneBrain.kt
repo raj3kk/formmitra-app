@@ -214,20 +214,7 @@ Rules:
             "DOM snapshot:\n$snapStr"
     }
 
-    /** Vault profile (server wala; fail ho to khaali map). */
-    private fun fetchVaultProfile(ctx: Context): Map<String, String> {
-        return try {
-            val p = AgentApi.profile(ctx) ?: return emptyMap()
-            val out = HashMap<String, String>()
-            val keys = p.keys()
-            while (keys.hasNext()) {
-                val k = keys.next()
-                val v = p.optString(k, "").trim()
-                if (v.isNotEmpty()) out[k] = v
-            }
-            out
-        } catch (_: Exception) {
-            emptyMap()
-        }
-    }
+    /** Vault profile lao — server → encrypted local cache → khaali. */
+    private fun fetchVaultProfile(ctx: Context): Map<String, String> =
+        VaultProfileCache.fetch(ctx)
 }

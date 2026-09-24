@@ -50,22 +50,9 @@ object LocalFallback {
         "reference", "acknowledg", "सफल"
     )
 
-    /** Vault profile lao — field → value. Fail ho to khaali map. */
-    private fun fetchVaultProfile(ctx: Context): Map<String, String> {
-        return try {
-            val p = AgentApi.profile(ctx) ?: return emptyMap()
-            val out = HashMap<String, String>()
-            val keys = p.keys()
-            while (keys.hasNext()) {
-                val k = keys.next()
-                val v = p.optString(k, "").trim()
-                if (v.isNotEmpty()) out[k] = v
-            }
-            out
-        } catch (_: Exception) {
-            emptyMap()
-        }
-    }
+    /** Vault profile lao — field → value. Server → encrypted cache → khaali. */
+    private fun fetchVaultProfile(ctx: Context): Map<String, String> =
+        VaultProfileCache.fetch(ctx)
 
     /** Field descriptor → vault value, ya null (koi keyword match nahi). */
     private fun matchValue(

@@ -1,7 +1,6 @@
 package com.formmitra.app.engine
 
 import android.content.Context
-import android.webkit.CookieManager
 import com.formmitra.app.BuildConfig
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -32,11 +31,8 @@ object FormApi {
         return id
     }
 
-    private fun sessionCookie(): String? = try {
-        CookieManager.getInstance().getCookie(BuildConfig.SITE_URL)
-    } catch (_: Exception) {
-        null
-    }
+    private fun sessionCookie(): String? =
+        com.formmitra.app.agent.AgentApi.sessionCookie()
 
     private fun open(path: String, method: String, ctx: Context): HttpURLConnection {
         val url = URL(BuildConfig.SITE_URL.trimEnd('/') + path)

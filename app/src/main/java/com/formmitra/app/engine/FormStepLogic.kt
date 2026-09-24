@@ -9,7 +9,7 @@ package com.formmitra.app.engine
  * single source of truth hai.
  */
 object VetoCheck {
-    /** workflows.ts PAYMENT_KEYWORDS ki exact copy (order bhi same). */
+    /** workflows.ts PAYMENT_KEYWORDS ki exact copy (order bhi same) + Hindi shabd. */
     val KEYWORDS = listOf(
         "checkout",
         "payment",
@@ -28,7 +28,16 @@ object VetoCheck {
         "billing",
         "card number",
         "cardnumber",
-        "cvv"
+        "cvv",
+        // Hindi payment shabd
+        "भुगतान",
+        "पेमेंट",
+        "खरीदें",
+        "ऑर्डर करें",
+        "भुगतान करें",
+        "कार्ट में डालें",
+        "अभी खरीदें",
+        "कीमत चुकाएं"
     )
 
     /**
@@ -69,7 +78,8 @@ object StepParser {
     val TYPES = setOf(
         "goto", "fill", "select", "toggle", "press", "click",
         "wait_for_element", "wait_for_text", "wait_for_navigation",
-        "screenshot", "captcha_detect", "captcha_solve", "back", "forward"
+        "screenshot", "captcha_detect", "captcha_solve", "back", "forward",
+        "upload"
     )
 
     @Suppress("UNCHECKED_CAST")

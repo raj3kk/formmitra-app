@@ -31,13 +31,14 @@ import java.util.concurrent.TimeoutException
  *  - Payment/purchase-looking content = HARD VETO → status "vetoed".
  *    Check hota hai: task name + target_url (run se pehle), har step ka
  *    text blob, aur har step se pehle live page ka URL + title + body text.
- *  - CAPTCHA kabhi bypass/fake nahi: captcha_solve sirf screenshot server
- *    ko bhejta hai → run "needs_admin" pe rukta hai.
+ *  - CAPTCHA: AI analyze karta hai (type + position), engine khud solve
+ *    karta hai — max 3 attempts, uske baad run "needs_user" pe rukta hai
+ *    (user khud karke "dobara chalao" dabata hai). Kabhi bypass/fake nahi.
  *
  * Step vocabulary (server contract):
  *  goto, fill, select, toggle, press, click, wait_for_element,
  *  wait_for_text, wait_for_navigation, screenshot, captcha_detect,
- *  captcha_solve, back, forward.
+ *  captcha_solve, back, forward, upload.
  */
 class FormEngine(private val appContext: Context) {
 
@@ -432,7 +433,8 @@ class FormEngine(private val appContext: Context) {
         }
     }
 
-    private fun jsonToMap(o: JSONObject): Map<String, Any?> {
+    /** JSONObject → Map (recursive). AgentLoop bhi istemal karta hai. */
+    fun jsonToMap(o: JSONObject): Map<String, Any?> {
         val m = HashMap<String, Any?>()
         val keys = o.keys()
         while (keys.hasNext()) {
@@ -1073,7 +1075,7 @@ class FormEngine(private val appContext: Context) {
             return f
         }
         if (doc.isEmpty()) throw Exception("upload: 'doc' ya 'path' chahiye")
-        val docsDir = java.io.File(appContext.filesDir, "docs")
+        val docsDir = com.formmitra.app.agent.DocsStore.docsDir(appContext)
         val f = java.io.File(docsDir, doc)
         // path traversal guard — docs dir ke bahar nahi
         val canonBase = try { docsDir.canonicalPath } catch (_: Exception) { docsDir.absolutePath }
@@ -1210,7 +1212,7 @@ class FormEngine(private val appContext: Context) {
      * file ya docs-dir-bahar (absolute path) → as-is wapas.
      */
     private fun maybeDecryptDoc(file: java.io.File): java.io.File {
-        val docsDir = java.io.File(appContext.filesDir, "docs")
+        val docsDir = com.formmitra.app.agent.DocsStore.docsDir(appContext)
         val canonBase = try { docsDir.canonicalPath } catch (_: Exception) { docsDir.absolutePath }
         val canonFile = try { file.canonicalPath } catch (_: Exception) { "" }
         if (!canonFile.startsWith(canonBase + java.io.File.separator)) return file
@@ -1229,9 +1231,12 @@ class FormEngine(private val appContext: Context) {
 
     /**
      * LocalFallback ke liye: submit/next/continue jaisa button dhoondh ke
-     * click karo. @return {clicked, text}. Nahi mila to Exception.
+     * click karo. Click se PEHLE live-page payment veto — payment/checkout
+     * page par submit kabhi nahi dabta (hard veto, har mode me).
+     * @return {clicked, text}. Nahi mila to Exception.
      */
     fun clickSubmitButton(): JSONObject {
+        checkLivePageVeto()
         val js = """(function(){
           var pats=[/submit/i,/^next$/i,/continue/i,/आगे/,/जमा करें/,/भेजें/,/save/i];
           var docs=[document];

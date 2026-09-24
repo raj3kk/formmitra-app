@@ -31,7 +31,8 @@ object AgentApi {
 
     data class ApiResult(val code: Int, val json: JSONObject?)
 
-    private fun sessionCookie(): String? = try {
+    /** WebView session cookie — FormApi bhi istemal karta hai. */
+    fun sessionCookie(): String? = try {
         CookieManager.getInstance().getCookie(BuildConfig.SITE_URL)
     } catch (_: Exception) {
         null

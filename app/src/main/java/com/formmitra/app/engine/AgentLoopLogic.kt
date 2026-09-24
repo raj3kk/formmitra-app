@@ -44,7 +44,7 @@ object AgentActions {
         "upload" to "upload"
     )
     /** Confidence isse kam ho to step reject (andha action nahi chalega). */
-    const val MIN_CONFIDENCE = 0.5
+    const val MIN_CONFIDENCE = 0.55
     /** Lagatar itne repeat signatures = stuck. */
     const val STUCK_REPEATS = 3
     /** stuck_count itna ho to user ko handoff. */

@@ -35,11 +35,10 @@ import org.json.JSONObject
  * FormMitra v3 Phase 1 — native intake chat UI.
  *
  * "Agent" tab ab WebView /agent nahi, ye native view dikhata hai.
- * Flow: greeting → user msg → POST /api/agent/chat → reply bubble +
+ * Phase 1+ chat: greeting → user msg → POST /api/agent/chat → reply bubble +
  * plan card (agar plan aaya) → "Shuru karo" → createTask + runNow.
- *
- * Sirf Phase 1: chat + plan + task enqueue. Koi browser operator /
- * captcha / standalone / voice yahan nahi hai.
+ * Run history + proof, needs_user banner + resume, Hindi voice input,
+ * standalone mode settings (Groq key, encrypted) — sab yahin hai.
  */
 class AgentChatView(
     context: Context,
