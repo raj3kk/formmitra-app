@@ -1226,8 +1226,13 @@ class FormEngine(private val appContext: Context) {
         // save karte waqt encrypt karta hai) → cache me decrypt karke temp
         // banao; purani plaintext file ho to fallback (as-is).
         val uploadSrc = maybeDecryptDoc(file)
+        // maybeCompressImage naya temp banata hai jab compress hua (HIGH-2:
+        // ye plaintext copy cache me reh jati thi) — use ke turant baad
+        // finally me delete karo.
+        var compressedTmp: java.io.File? = null
         try {
             val final = maybeCompressImage(uploadSrc)
+            if (final != uploadSrc) compressedTmp = final
             val sel = raw.optJSONObject("selector")
             val selMode = sel?.optString("mode", "") ?: ""
             val selVal = sel?.optString("value", "") ?: ""
@@ -1254,6 +1259,13 @@ class FormEngine(private val appContext: Context) {
             // decrypt ka temp saaf karo (original chhedo mat)
             if (uploadSrc != file) {
                 try { uploadSrc.delete() } catch (_: Exception) { }
+            }
+            // HIGH-2: compress ki plaintext copy bhi saaf karo. Upload ho
+            // chuka hai — chooser ko file upar Thread.sleep(1000) se pehle
+            // mil chuki hai; originals (file/uploadSrc) chhedo mat.
+            val ct = compressedTmp
+            if (ct != null && ct != uploadSrc && ct != file) {
+                try { ct.delete() } catch (_: Exception) { }
             }
         }
     }
