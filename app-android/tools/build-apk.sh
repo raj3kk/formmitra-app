@@ -1,5 +1,5 @@
 #!/bin/bash
-# FormMitra APK build v1 — aapt2 + kotlinc + d8 + apksigner (no Gradle).
+# FormMitra APK build v2 — aapt2 + kotlinc + d8 + apksigner (no Gradle).
 # Pattern: ~/workspace/browse-agent/app-android/tools/build-apk.sh (READ-ONLY reuse).
 # Clean client app: WebView shell + WorkManager digest. NO automation, NO accessibility.
 # ~~~~~ SOURCE OF TRUTH ~~~~~
@@ -18,9 +18,11 @@ rm -rf $OUT && mkdir -p $OUT/{aar,classes,dex,res}
 export JAVA_HOME=$PTOOLS/jdk-17
 export PATH=$JAVA_HOME/bin:$PATH
 APPID="com.formmitra.app"
-VERSION_CODE=1
-VERSION_NAME="1.0.0-v1"
+VERSION_CODE=2
+VERSION_NAME="1.0.1-v2"
 SITE_URL="https://formmitra-git-main-webbuilder1.vercel.app/"
+# Output APK name parameterized — v1 APK (formmitra-v1.apk) untouched rehta hai.
+APK_NAME="formmitra-v2.apk"
 
 # BuildConfig.java sync (manual build me Gradle nahi hai)
 sed -i -e "s/VERSION_NAME = \"[^\"]*\"/VERSION_NAME = \"$VERSION_NAME\"/" \
@@ -126,7 +128,7 @@ if [ ! -f $FA/tools/formmitra-release.keystore ]; then
     -dname "CN=FormMitra,O=FormMitra,C=IN" 2>/dev/null
 fi
 $BT/apksigner sign --ks $FA/tools/formmitra-release.keystore --ks-pass pass:formmitra123 \
-  --key-pass pass:formmitra123 --out $FA/tools/formmitra-v1.apk aligned.apk
-$BT/apksigner verify --print-certs $FA/tools/formmitra-v1.apk | head -3
-ls -lh $FA/tools/formmitra-v1.apk
+  --key-pass pass:formmitra123 --out $FA/tools/$APK_NAME aligned.apk
+$BT/apksigner verify --print-certs $FA/tools/$APK_NAME | head -3
+ls -lh $FA/tools/$APK_NAME
 echo "APK-OK"

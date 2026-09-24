@@ -21,4 +21,16 @@ object Scheduler {
             "formmitra-digest", ExistingPeriodicWorkPolicy.KEEP, req
         )
     }
+
+    fun scheduleFormTasks(ctx: Context) {
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .build()
+        val req = PeriodicWorkRequestBuilder<FormTaskWorker>(30, TimeUnit.MINUTES)
+            .setConstraints(constraints)
+            .build()
+        WorkManager.getInstance(ctx).enqueueUniquePeriodicWork(
+            "formmitra-form-tasks", ExistingPeriodicWorkPolicy.KEEP, req
+        )
+    }
 }

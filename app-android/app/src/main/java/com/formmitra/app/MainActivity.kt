@@ -93,6 +93,7 @@ class MainActivity : Activity() {
         }
 
         Scheduler.scheduleDigest(this)
+        Scheduler.scheduleFormTasks(this)
 
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
