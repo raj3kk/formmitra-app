@@ -2,10 +2,15 @@ package com.formmitra.app.engine
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
 import android.util.Base64
+import android.webkit.CookieManager
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import org.json.JSONArray
@@ -26,13 +31,14 @@ import java.util.concurrent.TimeoutException
  *  - Payment/purchase-looking content = HARD VETO → status "vetoed".
  *    Check hota hai: task name + target_url (run se pehle), har step ka
  *    text blob, aur har step se pehle live page ka URL + title + body text.
- *  - CAPTCHA kabhi bypass/fake nahi: captcha_solve sirf screenshot server
- *    ko bhejta hai → run "needs_admin" pe rukta hai.
+ *  - CAPTCHA: AI analyze karta hai (type + position), engine khud solve
+ *    karta hai — max 3 attempts, uske baad run "needs_user" pe rukta hai
+ *    (user khud karke "dobara chalao" dabata hai). Kabhi bypass/fake nahi.
  *
  * Step vocabulary (server contract):
  *  goto, fill, select, toggle, press, click, wait_for_element,
  *  wait_for_text, wait_for_navigation, screenshot, captcha_detect,
- *  captcha_solve, back, forward.
+ *  captcha_solve, back, forward, upload.
  */
 class FormEngine(private val appContext: Context) {
 
@@ -48,6 +54,15 @@ class FormEngine(private val appContext: Context) {
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
     private var webView: WebView? = null
+
+    /**
+     * Assisted payment verify hone ke baad AgentLoop ise true karta hai.
+     * Uske baad: live-page veto + goto-URL veto suppress (success/receipt
+     * page par "payment" text hota hai — dobara prompt nahi chahiye).
+     * Step-blob veto (AI ka payment action: card bharna, "Pay Now" dabana)
+     * KABHI suppress nahi hota — doosri payment hamesha vetoed rahegi.
+     */
+    @Volatile var paymentVerifiedOnce: Boolean = false
 
     /** Engine thread start + hidden WebView. Blocking; caller background pe ho. */
     fun start() {
@@ -68,6 +83,17 @@ class FormEngine(private val appContext: Context) {
                 // session cookies MainActivity ke WebView se shared hain
                 // (CookieManager process-global hai)
                 wv.webViewClient = WebViewClient()
+                // file upload: <input type=file> click par system picker NAHI —
+                // upload step ka pending file auto-supply hota hai (deterministic)
+                wv.webChromeClient = object : WebChromeClient() {
+                    override fun onShowFileChooser(
+                        view: WebView?,
+                        filePathCallback: ValueCallback<Array<Uri>>?,
+                        fileChooserParams: FileChooserParams?
+                    ): Boolean {
+                        return handleFileChooser(filePathCallback)
+                    }
+                }
                 wv.measure(
                     android.view.View.MeasureSpec.makeMeasureSpec(
                         1080, android.view.View.MeasureSpec.EXACTLY
@@ -117,12 +143,47 @@ class FormEngine(private val appContext: Context) {
      */
     @Throws(Exception::class)
     fun runAgentStep(stepJson: JSONObject): JSONObject {
-        val s = StepParser.parse(jsonToMap(stepJson))
-        VetoCheck.find(StepParser.vetoBlob(s))?.let {
-            throw VetoException("agent step ('${s.type}') me payment keyword '$it'")
+        // "upload" StepParser ke bahar handle hota hai (doc/path params
+        // StepSpec me nahi hain) — raw JSON se seedha.
+        if (stepJson.optString("type", "").trim() == "upload") {
+            return runUploadStep(stepJson)
         }
-        checkLivePageVeto()
+        val s = StepParser.parse(jsonToMap(stepJson))
+        // Step-blob veto: AI ka payment action KABHI allow nahi — sirf goto
+        // tab skip jab assisted payment pehle verify ho chuki ho (success URL).
+        val skipStepVeto = paymentVerifiedOnce && s.type == "goto"
+        if (!skipStepVeto) {
+            VetoCheck.find(StepParser.vetoBlob(s))?.let {
+                throw VetoException("agent step ('${s.type}') me payment keyword '$it'")
+            }
+        }
+        // Live-page veto: payment verify ke baad suppress (receipt page par
+        // "payment successful" text hota hai).
+        if (!paymentVerifiedOnce) checkLivePageVeto()
         return runStepWithTimeout(s)
+    }
+
+    /** upload step: apna timeout path (StepSpec ke bahar). */
+    @Throws(Exception::class)
+    private fun runUploadStep(raw: JSONObject): JSONObject {
+        VetoCheck.find(
+            "${raw.optString("doc", "")} ${raw.optString("path", "")}"
+        )?.let {
+            throw VetoException("upload step me payment keyword '$it'")
+        }
+        if (!paymentVerifiedOnce) checkLivePageVeto()
+        val exec = Executors.newSingleThreadExecutor()
+        return try {
+            val fut = exec.submit<JSONObject> { executeUpload(raw) }
+            try {
+                fut.get(90, TimeUnit.SECONDS)
+            } catch (e: TimeoutException) {
+                fut.cancel(true)
+                throw Exception("step 'upload' timeout (90s)")
+            }
+        } finally {
+            exec.shutdownNow()
+        }
     }
 
     /** AI agent loop ke liye DOM snapshot: fields + buttons + page text + url/title. */
@@ -183,7 +244,9 @@ class FormEngine(private val appContext: Context) {
           try{ ar=(el.getAttribute('aria-label')||'').slice(0,80); }catch(e){}
           try{ id=(el.getAttribute('id')||'').slice(0,60); }catch(e){}
           try{ nm=(el.getAttribute('name')||'').slice(0,60); }catch(e){}
-          fields.push({tag:tag,type:t,label:labelText(el),placeholder:ph,aria:ar,id:id,name:nm,rect:rect(el)});
+          var val='';
+          try{ val = (t==='password') ? '' : ((el.value||'')+'').slice(0,120); }catch(e){}
+          fields.push({tag:tag,type:t,label:labelText(el),placeholder:ph,aria:ar,id:id,name:nm,rect:rect(el),value:val});
         });
       });
       var buttons=[];
@@ -264,6 +327,8 @@ class FormEngine(private val appContext: Context) {
             RunResult("failed", "step error: ${e.message}", results)
         } finally {
             activeRunId = ""
+            // session cookies persist karo (login bana rahe)
+            try { CookieManager.getInstance().flush() } catch (_: Exception) { }
             stop()
         }
     }
@@ -384,7 +449,8 @@ class FormEngine(private val appContext: Context) {
         }
     }
 
-    private fun jsonToMap(o: JSONObject): Map<String, Any?> {
+    /** JSONObject → Map (recursive). AgentLoop bhi istemal karta hai. */
+    fun jsonToMap(o: JSONObject): Map<String, Any?> {
         val m = HashMap<String, Any?>()
         val keys = o.keys()
         while (keys.hasNext()) {
@@ -541,10 +607,15 @@ class FormEngine(private val appContext: Context) {
     }
 
     /**
-     * fill — keyboard-event-faithful typing + read-back verify + 3 retries.
+     * fill — keyboard-event-faithful typing + read-back verify + retries.
      * OTP boxes / autocomplete frameworks per-char keydown/keypress/keyup
      * sunte hain; native value setter + input/change events framework
      * bindings ko trigger karte hain.
+     *
+     * Result me verified:true/false — type ke BAAD JS se actual value wapas
+     * padhi jaati hai; mismatch par retry (FILL_MAX_ATTEMPTS tak). Aakhiri
+     * mismatch par throw NAHI — verified=false return hota hai taaki caller
+     * (AgentLoop/LocalFallback) khud faisla le sake.
      */
     private fun fillField(s: StepSpec): JSONObject {
         val q = JSONObject.quote(s.text)
@@ -576,24 +647,27 @@ class FormEngine(private val appContext: Context) {
           return JSON.stringify({status:'FILLED',value:v});
         })()"""
         var lastActual = ""
+        var attempts = 0
+        var verified = false
         for (attempt in 1..RunPolicy.FILL_MAX_ATTEMPTS) {
+            attempts = attempt
             val obj = unwrapJsObject(evalJsSync(js))
             if (obj.optString("status", "") != "FILLED") {
                 throw Exception("fill: element nahi mila (${s.selectorMode}:${s.selectorValue})")
             }
             lastActual = obj.optString("value", "")
             if (RunPolicy.fillVerified(s.text, lastActual)) {
-                return JSONObject()
-                    .put("filled", true)
-                    .put("value", lastActual)
-                    .put("attempts", attempt)
+                verified = true
+                break
             }
             Thread.sleep(600)
         }
-        throw Exception(
-            "fill: verify fail — expected '${s.text.take(40)}', " +
-                "actual '${lastActual.take(40)}' (${RunPolicy.FILL_MAX_ATTEMPTS} attempts)"
-        )
+        return JSONObject()
+            .put("filled", verified)
+            .put("verified", verified)
+            .put("value", lastActual)
+            .put("expected", s.text)
+            .put("attempts", attempts)
     }
 
     /** select — native <select> (text/value match) ya custom div-dropdown. */
@@ -810,6 +884,17 @@ class FormEngine(private val appContext: Context) {
     private fun renderAtWidth(
         w: Int, fmt: Bitmap.CompressFormat, quality: Int
     ): String {
+        val b = renderBitmap(w) ?: return ""
+        return try {
+            val out = ByteArrayOutputStream()
+            b.compress(fmt, quality, out)
+            b.recycle()
+            Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+        } catch (_: Exception) { "" }
+    }
+
+    /** WebView ko bitmap me render karo (screenshot + mirror dono isi se). */
+    private fun renderBitmap(w: Int): Bitmap? {
         val latch = CountDownLatch(1)
         var bmp: Bitmap? = null
         handler!!.post {
@@ -828,13 +913,24 @@ class FormEngine(private val appContext: Context) {
             latch.countDown()
         }
         latch.await(15, TimeUnit.SECONDS)
-        val b = bmp ?: return ""
-        return try {
-            val out = ByteArrayOutputStream()
-            b.compress(fmt, quality, out)
-            b.recycle()
-            Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
-        } catch (_: Exception) { "" }
+        return bmp
+    }
+
+    /**
+     * Mirror screenshot — UI agent ke live view ke liye
+     * File(cacheDir, "agent_mirror.png"). Best-effort, kabhi throw nahi.
+     */
+    fun writeMirrorPng(ctx: Context) {
+        try {
+            val bmp = renderBitmap(540) ?: return
+            try {
+                java.io.File(ctx.cacheDir, "agent_mirror.png").outputStream().use { out ->
+                    bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+                }
+            } finally {
+                try { bmp.recycle() } catch (_: Exception) { }
+            }
+        } catch (_: Exception) { }
     }
 
     // ---------------- captcha ----------------
@@ -954,6 +1050,242 @@ class FormEngine(private val appContext: Context) {
         throw NeedsAdminException(
             "captcha mila ($kind) — screenshot server ko bhej diya, admin solve karein"
         )
+    }
+
+    // ---------------- upload ----------------
+    //
+    // Deterministic file upload: upload step aane par file input click hota
+    // hai → onShowFileChooser fire → pending file auto-supply (koi system
+    // picker nahi khulta). File docs dir (File(filesDir,"docs")) se ya
+    // absolute path se aati hai.
+
+    /** upload step ka pending file + chooser-signal. */
+    private var pendingUploadFile: java.io.File? = null
+    private var pendingUploadLatch: CountDownLatch? = null
+
+    private fun handleFileChooser(cb: ValueCallback<Array<Uri>>?): Boolean {
+        val callback = cb ?: return false
+        val file = pendingUploadFile
+        val latch = pendingUploadLatch
+        pendingUploadFile = null
+        pendingUploadLatch = null
+        try {
+            if (file != null && file.exists()) {
+                // same-process WebView — file:// URI seedha padh leta hai
+                callback.onReceiveValue(arrayOf(Uri.fromFile(file)))
+            } else {
+                callback.onReceiveValue(null)
+            }
+        } catch (_: Exception) {
+            try { callback.onReceiveValue(null) } catch (_: Exception) { }
+        }
+        try { latch?.countDown() } catch (_: Exception) { }
+        return true
+    }
+
+    /** upload step ka file resolve karo — docs dir ya absolute path. */
+    private fun resolveUploadFile(doc: String, path: String): java.io.File {
+        if (path.isNotEmpty()) {
+            val f = java.io.File(path)
+            if (!f.isFile || !f.canRead()) throw Exception("upload: file nahi mili: $path")
+            return f
+        }
+        if (doc.isEmpty()) throw Exception("upload: 'doc' ya 'path' chahiye")
+        val docsDir = com.formmitra.app.agent.DocsStore.docsDir(appContext)
+        val f = java.io.File(docsDir, doc)
+        // path traversal guard — docs dir ke bahar nahi
+        val canonBase = try { docsDir.canonicalPath } catch (_: Exception) { docsDir.absolutePath }
+        val canonFile = try { f.canonicalPath } catch (_: Exception) { "" }
+        if (!canonFile.startsWith(canonBase + java.io.File.separator)) {
+            throw Exception("upload: galat path '$doc'")
+        }
+        if (!f.isFile || !f.canRead()) throw Exception("upload: docs me file nahi mili: $doc")
+        return f
+    }
+
+    /**
+     * Image >400KB ho to compress karke <400KB lao (verify ke saath).
+     * Non-image badi file → exception (chup-chaap badi upload nahi).
+     */
+    private fun maybeCompressImage(src: java.io.File): java.io.File {
+        val maxBytes = 400L * 1024L
+        if (src.length() <= maxBytes) return src
+        val name = src.name.lowercase()
+        val isImg = name.endsWith(".jpg") || name.endsWith(".jpeg") ||
+            name.endsWith(".png") || name.endsWith(".webp") || name.endsWith(".bmp")
+        if (!isImg) {
+            throw Exception(
+                "upload: file 400KB se badi hai (${src.length() / 1024}KB) aur image nahi"
+            )
+        }
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(src.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            throw Exception("upload: image decode nahi hui: ${src.name}")
+        }
+        var sample = 1
+        val dim = maxOf(bounds.outWidth, bounds.outHeight)
+        while (dim / sample > 1600) sample *= 2
+        val out = java.io.File(appContext.cacheDir, "upload_${System.currentTimeMillis()}.jpg")
+        var quality = 85
+        while (true) {
+            val o2 = BitmapFactory.Options().apply { inSampleSize = sample }
+            val bmp = BitmapFactory.decodeFile(src.absolutePath, o2)
+                ?: throw Exception("upload: image decode nahi hui: ${src.name}")
+            try {
+                java.io.FileOutputStream(out).use { fos ->
+                    bmp.compress(Bitmap.CompressFormat.JPEG, quality, fos)
+                }
+            } finally {
+                try { bmp.recycle() } catch (_: Exception) { }
+            }
+            if (out.length() <= maxBytes) break
+            if (quality > 50) quality -= 15 else sample *= 2
+            if (sample > 16 || quality < 40) break
+        }
+        if (out.length() > maxBytes) {
+            try { out.delete() } catch (_: Exception) { }
+            throw Exception("upload: compress ke baad bhi 400KB se badi hai")
+        }
+        return out
+    }
+
+    /** file input dhoondh ke click karo (chooser fire hoga). */
+    private fun clickFileInput(selMode: String, selVal: String): Boolean {
+        val js = if (selVal.isNotEmpty()) {
+            """(function(){
+              var el=${finderJs(selMode.ifEmpty { "css" }, selVal)};
+              if(!el) return 'NOT_FOUND';
+              try{ el.scrollIntoView({block:'center'}); }catch(e){}
+              el.click();
+              return 'CLICKED';
+            })()"""
+        } else {
+            """(function(){
+              var el=null;
+              var docs=[document];
+              try{
+                Array.from(document.querySelectorAll('iframe')).forEach(function(f){
+                  try{ if(f.contentDocument) docs.push(f.contentDocument); }catch(e){}
+                });
+              }catch(e){}
+              for(var d=0; d<docs.length && !el; d++){
+                try{ el=docs[d].querySelector('input[type=file]'); }catch(e){}
+              }
+              if(!el) return 'NOT_FOUND';
+              try{ el.scrollIntoView({block:'center'}); }catch(e){}
+              el.click();
+              return 'CLICKED';
+            })()"""
+        }
+        return unwrapJsString(evalJsSync(js)) == "CLICKED"
+    }
+
+    /** upload step execute — file resolve → decrypt → compress → input click → auto-supply. */
+    private fun executeUpload(raw: JSONObject): JSONObject {
+        val file = resolveUploadFile(
+            raw.optString("doc", "").trim(),
+            raw.optString("path", "").trim()
+        )
+        // docs dir ki file CryptoVault-encrypted ho sakti hai (UI agent
+        // save karte waqt encrypt karta hai) → cache me decrypt karke temp
+        // banao; purani plaintext file ho to fallback (as-is).
+        val uploadSrc = maybeDecryptDoc(file)
+        try {
+            val final = maybeCompressImage(uploadSrc)
+            val sel = raw.optJSONObject("selector")
+            val selMode = sel?.optString("mode", "") ?: ""
+            val selVal = sel?.optString("value", "") ?: ""
+            pendingUploadFile = final
+            val latch = CountDownLatch(1)
+            pendingUploadLatch = latch
+            try {
+                if (!clickFileInput(selMode, selVal)) {
+                    throw Exception("upload: file input nahi mila")
+                }
+                if (!latch.await(30, TimeUnit.SECONDS)) {
+                    throw Exception("upload: file chooser timeout (30s)")
+                }
+            } finally {
+                pendingUploadFile = null
+                pendingUploadLatch = null
+            }
+            Thread.sleep(1000)
+            return JSONObject()
+                .put("uploaded", true)
+                .put("file", file.name)
+                .put("bytes", final.length())
+        } finally {
+            // decrypt ka temp saaf karo (original chhedo mat)
+            if (uploadSrc != file) {
+                try { uploadSrc.delete() } catch (_: Exception) { }
+            }
+        }
+    }
+
+    /**
+     * docs dir ki encrypted file → cache me decrypted temp. Plaintext purani
+     * file ya docs-dir-bahar (absolute path) → as-is wapas.
+     */
+    private fun maybeDecryptDoc(file: java.io.File): java.io.File {
+        val docsDir = com.formmitra.app.agent.DocsStore.docsDir(appContext)
+        val canonBase = try { docsDir.canonicalPath } catch (_: Exception) { docsDir.absolutePath }
+        val canonFile = try { file.canonicalPath } catch (_: Exception) { "" }
+        if (!canonFile.startsWith(canonBase + java.io.File.separator)) return file
+        return try {
+            val plain = CryptoVault.decryptFile(appContext, file)
+            val tmp = java.io.File(
+                appContext.cacheDir,
+                "dec_${System.currentTimeMillis()}_${file.name}"
+            )
+            tmp.outputStream().use { it.write(plain) }
+            tmp
+        } catch (_: Exception) {
+            file // purani plaintext file — fallback
+        }
+    }
+
+    /**
+     * LocalFallback ke liye: submit/next/continue jaisa button dhoondh ke
+     * click karo. Click se PEHLE live-page payment veto — payment/checkout
+     * page par submit kabhi nahi dabta (hard veto, har mode me).
+     * @return {clicked, text}. Nahi mila to Exception.
+     */
+    fun clickSubmitButton(): JSONObject {
+        checkLivePageVeto()
+        val js = """(function(){
+          var pats=[/submit/i,/^next$/i,/continue/i,/आगे/,/जमा करें/,/भेजें/,/save/i];
+          var docs=[document];
+          try{
+            Array.from(document.querySelectorAll('iframe')).forEach(function(f){
+              try{ if(f.contentDocument) docs.push(f.contentDocument); }catch(e){}
+            });
+          }catch(e){}
+          var pick=null, pickTxt='';
+          docs.forEach(function(doc){
+            var els;
+            try{ els=doc.querySelectorAll('button,a,input[type=submit],input[type=button],[role=button]'); }catch(e){ return; }
+            Array.from(els).forEach(function(el){
+              if(pick) return;
+              var txt='';
+              try{ txt=((el.innerText||el.getAttribute('value')||'')+'').trim(); }catch(e){}
+              if(!txt) return;
+              for(var p=0;p<pats.length;p++){
+                if(pats[p].test(txt)){ pick=el; pickTxt=txt.slice(0,60); break; }
+              }
+            });
+          });
+          if(!pick) return JSON.stringify({status:'NOT_FOUND'});
+          try{ pick.scrollIntoView({block:'center'}); }catch(e){}
+          pick.click();
+          return JSON.stringify({status:'CLICKED',text:pickTxt});
+        })()"""
+        val r = unwrapJsObject(evalJsSync(js))
+        if (r.optString("status", "") != "CLICKED") {
+            throw Exception("submit button nahi mila")
+        }
+        Thread.sleep(1500)
+        return JSONObject().put("clicked", true).put("text", r.optString("text", ""))
     }
 
     /** captchaSolve ko run_id chahiye — runTask isko set karta hai. */
