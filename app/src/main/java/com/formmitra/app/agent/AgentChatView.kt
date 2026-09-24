@@ -651,11 +651,13 @@ class AgentChatView(
         false
     }
 
-    private fun standaloneSaveKey(key: String) {
-        try {
+    /** @return true = key save ho gayi, false = fail. */
+    private fun standaloneSaveKey(key: String): Boolean {
+        return try {
             Standalone.saveKey(context, key)
+            true
         } catch (_: Exception) {
-            toast("Key save nahi hui — dobara try karo")
+            false
         }
     }
 
@@ -725,10 +727,13 @@ class AgentChatView(
                     toast("Key khaali hai")
                     return@setPositiveButton
                 }
-                standaloneSaveKey(key)
-                keyInput.setText("")
-                refreshStandaloneChip()
-                toast("Key save ho gayi ✅")
+                if (standaloneSaveKey(key)) {
+                    keyInput.setText("")
+                    refreshStandaloneChip()
+                    toast("Key save ho gayi ✅")
+                } else {
+                    toast("Key save nahi hui — dobara try karo")
+                }
             }
             .setNegativeButton("Band karo", null)
         if (configured) {

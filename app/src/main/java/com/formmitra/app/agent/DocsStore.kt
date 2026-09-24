@@ -46,12 +46,17 @@ object DocsStore {
             cr.openInputStream(uri)?.use { ins ->
                 dest.outputStream().use { outs -> ins.copyTo(outs) }
             } ?: return null
-            // Vault encryption: file ko Keystore AES-256-GCM se encrypt karo.
-            // Fail ho to plaintext hi rehne do (engine backward-compat padh lega).
+            // Vault encryption (fail-closed): file ko Keystore AES-256-GCM se
+            // encrypt karo. Fail ho to plaintext file DELETE karo aur null
+            // wapas do — aadhi-encrypted ya plaintext vault me kabhi nahi.
+            // (Purani plaintext files ka read-fallback engine me ab bhi hai.)
             try {
                 val plain = dest.readBytes()
                 CryptoVault.encryptFile(ctx, plain, dest)
-            } catch (_: Exception) { }
+            } catch (_: Exception) {
+                try { dest.delete() } catch (_: Exception) { }
+                return null
+            }
             // Engine baad me bhi padh sake — permission persist karo
             try {
                 cr.takePersistableUriPermission(
