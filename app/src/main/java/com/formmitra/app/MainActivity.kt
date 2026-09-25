@@ -26,43 +26,58 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.formmitra.app.agent.AgentChatView
+import com.formmitra.app.agent.HomeView
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 
+/**
+ * FormMitra v16 — tabs: Home (Mitra chat embedded), History, Wallet, Profile.
+ * (+ Admin tab sirf owner email par.)
+ *
+ * Home = native HomeView (services strip + live-browser button + agent chat).
+ * Wallet/Profile/Admin = website WebView me. Purane Agent/Browser/Tracking/
+ * Jobs tabs hata diye — services Home strip se khulte hain.
+ */
 class MainActivity : Activity() {
 
     private lateinit var webView: WebView
+    private lateinit var homeView: HomeView
     private lateinit var agentChatView: AgentChatView
-    private var agentVisible = false
+    private var homeVisible = false
     private lateinit var historyView: com.formmitra.app.agent.HistoryView
     private var historyVisible = false
 
-    // Browser mirror tab (live agent screenshot)
+    // Live browser mirror (ab tab nahi — Home ke "🔴 Live" button se)
     private lateinit var browserMirrorView: LinearLayout
     private lateinit var mirrorImg: ImageView
     private lateinit var mirrorEmpty: TextView
-    private var browserVisible = false
+    private var mirrorVisible = false
     private val mirrorHandler = Handler(Looper.getMainLooper())
     private val mirrorRunnable = object : Runnable {
         override fun run() {
-            if (!browserVisible) return
+            if (!mirrorVisible) return
             refreshMirror()
             mirrorHandler.postDelayed(this, 3000)
         }
     }
 
-    private lateinit var navButtons: List<Button>
-    private val tabs = listOf(
+    private lateinit var navInner: LinearLayout
+    private var navButtons: List<Button> = emptyList()
+    private var activePath = "/"
+    private var isOwner = false
+
+    private val ownerEmail = "priyadarshirajindia@gmail.com"
+
+    private val baseTabs = listOf(
         "Home" to "/",
-        "Tracking" to "/tracking",
-        "Jobs" to "/jobs",
-        "Agent" to "/agent",
-        "Browser" to "/browser",
         "History" to "/history",
-        "Admin" to "/admin/agents",
+        "Wallet" to "/wallet",
         "Profile" to "/profile"
     )
+
+    private fun currentTabs() =
+        if (isOwner) baseTabs + ("Admin" to "/admin") else baseTabs
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -87,37 +102,55 @@ class MainActivity : Activity() {
             databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
         }
-        // v14 audit: third-party cookies ON rakhe hain (jaanch ke baad faisla).
-        // Wajah: form automation me embedded widgets (payment/SSO iframes)
-        // third-party cookies ke bina toot jate hain; ye single-user ka apna
-        // automation WebView hai, general browser nahi — compatibility jeetti.
+        // v14 audit: third-party cookies ON (form automation ke embedded
+        // widgets — payment/SSO iframes — inke bina toot jate hain; ye
+        // single-user ka apna automation WebView hai).
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
                 view: WebView, request: WebResourceRequest
             ): Boolean = false
+
+            override fun onPageFinished(view: WebView, url: String) {
+                super.onPageFinished(view, url)
+                // Owner check: /profile page ke text me owner email dikhe
+                // to Admin tab dikhao (fail-closed: na dikhe to tab nahi).
+                if (!isOwner && url.trimEnd('/') == baseUrl() + "/profile") {
+                    checkOwner(view)
+                }
+            }
         }
         root.addView(webView)
 
-        // v3 Phase 1: "Agent" tab = native intake chat (WebView /agent ki jagah)
-        agentChatView = AgentChatView(this) { url -> openLinkInWebView(url) }.apply {
+        // Home: native — services strip + live button + Mitra chat
+        agentChatView = AgentChatView(
+            this,
+            { url -> openLinkInWebView(url) },
+            { selectTab("/profile") }
+        )
+        homeView = HomeView(
+            this,
+            agentChatView,
+            onOpenService = { path -> selectTab(path) },
+            onShowMirror = { showMirror() }
+        ).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
             )
-            visibility = android.view.View.GONE
+            visibility = View.GONE
         }
-        root.addView(agentChatView)
+        root.addView(homeView)
 
-        // History tab — native runs history (cafe wala hisaab)
+        // History tab — native runs history
         historyView = com.formmitra.app.agent.HistoryView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
             )
-            visibility = android.view.View.GONE
+            visibility = View.GONE
         }
         root.addView(historyView)
 
-        // Browser mirror tab — engine ka agent_mirror.png har 3s refresh
+        // Live browser mirror — engine ka agent_mirror.png har 3s refresh
         browserMirrorView = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -125,7 +158,7 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
             )
             setBackgroundColor(Color.parseColor("#111111"))
-            visibility = android.view.View.GONE
+            visibility = View.GONE
         }
         mirrorEmpty = TextView(this).apply {
             text = "Koi live browser nahi chal raha"
@@ -140,35 +173,20 @@ class MainActivity : Activity() {
             )
             scaleType = ImageView.ScaleType.FIT_CENTER
             adjustViewBounds = true
-            visibility = android.view.View.GONE
+            visibility = View.GONE
         }
         browserMirrorView.addView(mirrorImg)
         root.addView(browserMirrorView)
 
-        // Bottom nav — HorizontalScrollView (8 tabs phone par cramped na hon)
-        val navInner = LinearLayout(this).apply {
+        // Bottom nav — 4 tabs (+ owner par Admin)
+        navInner = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             )
         }
-        navButtons = tabs.map { (label, path) ->
-            Button(this).apply {
-                text = label
-                textSize = 13f
-                minWidth = (88 * resources.displayMetrics.density).toInt()
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply {
-                    val m = (4 * resources.displayMetrics.density).toInt()
-                    setMargins(m, 0, m, 0)
-                }
-                setOnClickListener { selectTab(path) }
-            }
-        }
-        navButtons.forEach { navInner.addView(it) }
         val navScroll = android.widget.HorizontalScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -179,23 +197,21 @@ class MainActivity : Activity() {
         }
         root.addView(navScroll)
         setContentView(root)
+        buildNav()
 
         // Deep link (notification tap) ya fresh launch
         val deepUrl = intent.getStringExtra("deep_url")
-        val openTab = intent.getStringExtra("open_tab")
+        val openTab = intent.getStringExtra("open_tab")?.let { mapLegacyTab(it) }
         if (!deepUrl.isNullOrEmpty()) {
             loadDeepUrl(deepUrl)
         } else if (!openTab.isNullOrEmpty()) {
-            // Prompt notification tap → seedha Agent tab (popup poller dikhayega)
             selectTab(openTab)
         } else {
             selectTab("/")
         }
 
-        // FmApp.onCreate me WorkManager pehle hi init ho chuka hai
-        // (manual build me startup-provider manifest me nahi hota).
-        // Phir bhi belt-and-braces: scheduler kabhi launch crash na banaye —
-        // workers FmApp init ke baad normal schedule honge.
+        // FmApp.onCreate me WorkManager pehle hi init ho chuka hai (v15 fix).
+        // Belt-and-braces: scheduler kabhi launch crash na banaye.
         try {
             Scheduler.scheduleDigest(this)
             Scheduler.scheduleFormTasks(this)
@@ -214,20 +230,50 @@ class MainActivity : Activity() {
         maybeShowResumeDialog()
     }
 
+    /** Purane tab paths (notification/deep-link) → naye tabs. */
+    private fun mapLegacyTab(path: String): String = when (path) {
+        "/agent", "/browser" -> "/"
+        else -> path
+    }
+
+    private fun buildNav() {
+        navInner.removeAllViews()
+        val tabs = currentTabs()
+        navButtons = tabs.map { (label, path) ->
+            Button(this).apply {
+                text = label
+                textSize = 14f
+                minWidth = (96 * resources.displayMetrics.density).toInt()
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    val m = (6 * resources.displayMetrics.density).toInt()
+                    setMargins(m, 0, m, 0)
+                }
+                setOnClickListener { selectTab(path) }
+            }
+        }
+        navButtons.forEach { navInner.addView(it) }
+        updateNavHighlight(activePath)
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         val deepUrl = intent.getStringExtra("deep_url")
         if (!deepUrl.isNullOrEmpty()) loadDeepUrl(deepUrl)
-        val openTab = intent.getStringExtra("open_tab")
+        val openTab = intent.getStringExtra("open_tab")?.let { mapLegacyTab(it) }
         if (!openTab.isNullOrEmpty()) selectTab(openTab)
     }
 
     override fun onResume() {
         super.onResume()
         // App-wide prompt poller: user kisi bhi tab me ho, agent ka sawal
-        // (OTP/input/choice/payment) popup me aayega. Agent tab ka apna
-        // poller bhi hai — isShowing guard se double-dialog nahi hoga.
+        // (OTP/input/choice/payment) popup me aayega.
         promptHandler.post(promptPollRunnable)
+        if (homeVisible) {
+            try { homeView.refreshLiveButton() } catch (_: Exception) { }
+        }
     }
 
     override fun onPause() {
@@ -249,8 +295,6 @@ class MainActivity : Activity() {
                     )
                 }
             } catch (t: Throwable) {
-                // Poller kabhi app crash na banaye — Error (NoClassDefFound
-                // jaise) bhi pakdo; agle 3s tick par dobara try hoga.
                 android.util.Log.e("MainActivity", "prompt poll failed (non-fatal)", t)
             }
             promptHandler.postDelayed(this, 3000)
@@ -260,90 +304,132 @@ class MainActivity : Activity() {
     private fun baseUrl(): String = BuildConfig.SITE_URL.trimEnd('/')
 
     private fun selectTab(path: String) {
-        val wasAgent = agentVisible
-        agentVisible = false
+        val wasHome = homeVisible
+        homeVisible = false
         historyVisible = false
-        browserVisible = false
+        mirrorVisible = false
         mirrorHandler.removeCallbacks(mirrorRunnable)
-        agentChatView.visibility = View.GONE
+        homeView.visibility = View.GONE
         historyView.visibility = View.GONE
         browserMirrorView.visibility = View.GONE
         webView.visibility = View.GONE
-        if (wasAgent && path != "/agent") agentChatView.onTabHidden()
-        when (path) {
-            "/agent" -> {
-                // Native chat tab — WebView hide, chat view show
-                agentChatView.visibility = View.VISIBLE
-                agentVisible = true
+        if (wasHome && path != "/") agentChatView.onTabHidden()
+        val tabPaths = currentTabs().map { it.second }.toSet()
+        when {
+            path == "/" -> {
+                homeView.visibility = View.VISIBLE
+                homeVisible = true
                 agentChatView.onTabShown()
+                try { homeView.refreshLiveButton() } catch (_: Exception) { }
             }
-            "/history" -> {
-                // Native history tab
+            path == "/history" -> {
                 historyView.visibility = View.VISIBLE
                 historyVisible = true
                 historyView.onTabShown()
             }
-            "/browser" -> {
-                // Live browser mirror — engine ka screenshot
-                browserMirrorView.visibility = View.VISIBLE
-                browserVisible = true
-                mirrorHandler.post(mirrorRunnable)
-            }
-            else -> {
+            tabPaths.contains(path) -> {
+                // Wallet / Profile / Admin — website WebView me
                 webView.visibility = View.VISIBLE
                 webView.loadUrl(baseUrl() + path)
             }
+            else -> {
+                // Service paths (/tracking, /jobs, /scholarships, /resume)
+                // WebView me, nav me Home highlight
+                webView.visibility = View.VISIBLE
+                val full = baseUrl() + path
+                if (webView.url != full) webView.loadUrl(full)
+            }
         }
-        updateNavHighlight(path)
+        activePath = if (tabPaths.contains(path)) path else "/"
+        updateNavHighlight(activePath)
+    }
+
+    /** Home ke "🔴 Live" button se — agent ka live browser dikhao. */
+    private fun showMirror() {
+        homeVisible = false
+        historyVisible = false
+        mirrorHandler.removeCallbacks(mirrorRunnable)
+        homeView.visibility = View.GONE
+        historyView.visibility = View.GONE
+        webView.visibility = View.GONE
+        agentChatView.onTabHidden()
+        browserMirrorView.visibility = View.VISIBLE
+        mirrorVisible = true
+        mirrorHandler.post(mirrorRunnable)
+        activePath = "/"
+        updateNavHighlight("/")
     }
 
     /** Plan card ke official link ko main WebView me kholo. */
     private fun openLinkInWebView(url: String) {
-        if (agentVisible) agentChatView.onTabHidden()
-        agentVisible = false
-        browserVisible = false
+        if (homeVisible) agentChatView.onTabHidden()
+        homeVisible = false
+        historyVisible = false
+        mirrorVisible = false
         mirrorHandler.removeCallbacks(mirrorRunnable)
-        agentChatView.visibility = View.GONE
+        homeView.visibility = View.GONE
         historyView.visibility = View.GONE
         browserMirrorView.visibility = View.GONE
         webView.visibility = View.VISIBLE
         webView.loadUrl(url)
-        updateNavHighlight("/agent")
+        activePath = "/"
+        updateNavHighlight("/")
     }
 
     private fun loadDeepUrl(fullUrl: String) {
         val path = fullUrl.removePrefix(baseUrl())
-        if (tabs.any { it.second == path }) {
+        val tabPaths = setOf("/", "/history", "/wallet", "/profile", "/admin")
+        if (path in tabPaths) {
             selectTab(path)
         } else {
-            if (agentVisible) agentChatView.onTabHidden()
-            agentVisible = false
-            browserVisible = false
+            if (homeVisible) agentChatView.onTabHidden()
+            homeVisible = false
+            historyVisible = false
+            mirrorVisible = false
             mirrorHandler.removeCallbacks(mirrorRunnable)
-            agentChatView.visibility = View.GONE
+            homeView.visibility = View.GONE
             historyView.visibility = View.GONE
             browserMirrorView.visibility = View.GONE
             webView.visibility = View.VISIBLE
             webView.loadUrl(fullUrl)
-            updateNavHighlight(path)
+            activePath = "/"
+            updateNavHighlight("/")
         }
     }
 
-    private fun updateNavHighlight(activePath: String) {
+    /** /profile page ke text me owner email → Admin tab (fail-closed). */
+    private fun checkOwner(view: WebView) {
+        try {
+            view.evaluateJavascript(
+                "(function(){return document.body?document.body.innerText.slice(0,6000):'';})()"
+            ) { res ->
+                if (!isOwner && res != null && res.contains(ownerEmail)) {
+                    isOwner = true
+                    runOnUiThread { buildNav() }
+                }
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun updateNavHighlight(active: String) {
+        val tabs = currentTabs()
         tabs.forEachIndexed { idx, (_, path) ->
-            val active = path == activePath
+            if (idx >= navButtons.size) return@forEachIndexed
+            val on = path == active
             navButtons[idx].setTextColor(
-                if (active) Color.parseColor("#0E7C5B") else Color.DKGRAY
+                if (on) Color.parseColor("#0E7C5B") else Color.DKGRAY
             )
             navButtons[idx].setTypeface(
-                null, if (active) Typeface.BOLD else Typeface.NORMAL
+                null, if (on) Typeface.BOLD else Typeface.NORMAL
             )
         }
     }
 
     @Deprecated("Use OnBackPressedDispatcher on newer APIs")
     override fun onBackPressed() {
-        if (agentVisible || browserVisible || historyVisible) {
+        if (mirrorVisible) {
+            selectTab("/")
+        } else if (homeVisible || historyVisible) {
             super.onBackPressed()
         } else if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
     }
@@ -363,14 +449,13 @@ class MainActivity : Activity() {
                 }
             } else null
             runOnUiThread {
-                if (!browserVisible) return@runOnUiThread
+                if (!mirrorVisible) return@runOnUiThread
                 val old = (mirrorImg.drawable as? BitmapDrawable)?.bitmap
                 if (bmp != null) {
                     mirrorEmpty.visibility = View.GONE
                     mirrorImg.visibility = View.VISIBLE
                     mirrorImg.setImageBitmap(bmp)
                 } else {
-                    mirrorImg.setImageDrawable(null)
                     mirrorImg.visibility = View.GONE
                     mirrorEmpty.visibility = View.VISIBLE
                 }
@@ -410,7 +495,7 @@ class MainActivity : Activity() {
                     if (!taskId.isNullOrEmpty()) {
                         com.formmitra.app.agent.AgentApi.runNow(this, taskId)
                     }
-                    runOnUiThread { selectTab("/agent") }
+                    runOnUiThread { selectTab("/") }
                 }.start()
             }
             .setNegativeButton("Chhodo") { _, _ -> clearAgentResume() }
@@ -423,7 +508,6 @@ class MainActivity : Activity() {
     @Deprecated("Document picker AgentChatView ke liye")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        // Agent prompt ka document picker (vault doc chuno / naya upload)
         try {
             com.formmitra.app.agent.PromptDialog.onDocPickResult(requestCode, data)
         } catch (_: Exception) { }

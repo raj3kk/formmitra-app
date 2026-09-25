@@ -15,17 +15,16 @@ import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
-import android.text.InputType
 import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.EditorInfo
 import com.formmitra.app.engine.Standalone
 import com.formmitra.app.engine.UserPrompt
 import com.formmitra.app.engine.PrecheckLogic
 import android.widget.Button
 import android.widget.EditText
-import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -34,17 +33,24 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * FormMitra v3 Phase 1 — native intake chat UI.
+ * FormMitra v16 — native Mitra chat, Home tab me embedded.
  *
- * "Agent" tab ab WebView /agent nahi, ye native view dikhata hai.
- * Phase 1+ chat: greeting → user msg → POST /api/agent/chat → reply bubble +
- * plan card (agar plan aaya) → "Shuru karo" → createTask + runNow.
- * Run history + proof, needs_user banner + resume, Hindi voice input,
- * standalone mode settings (Groq key, encrypted) — sab yahin hai.
+ * v16 changes (user demands):
+ * - Send path hardened: fail par saaf error + retry button (silent fail nahi);
+ *   401 par "Login karo" button (Profile tab kholta hai); 75s watchdog.
+ * - Verify-before-save gate: personal details wala message PEHLE verify card
+ *   me dikhta hai — Proceed dabane par hi server ko jata hai (bina Proceed
+ *   ke save ho hi nahi sakta). Edit ka option built-in.
+ * - "Shuru karo" se pehle bhi details ka verify card (vault + session merge).
+ * - Voice: live partial transcription, sun-ne ka clear indicator, hi-IN →
+ *   en-IN fallback, error codes ke saaf messages.
+ * - Attach (📎): koi bhi file type (limited selector hata diya).
+ * - User-side API key screens hata diye (standalone engine code intact hai).
  */
 class AgentChatView(
     context: Context,
-    private val onOpenLink: (String) -> Unit
+    private val onOpenLink: (String) -> Unit,
+    private val onOpenProfile: () -> Unit = {}
 ) : LinearLayout(context) {
 
     private val history = mutableListOf<Pair<String, String>>()
@@ -56,6 +62,14 @@ class AgentChatView(
     private var typingView: View? = null
     private var waiting = false
 
+    // send watchdog + retry
+    private val sendWatchdog = Handler(Looper.getMainLooper())
+    private var sendToken = 0
+    private var lastFailedText: String? = null
+
+    // verify-before-save: is session me verify ho chuki details
+    private val sessionDetails = LinkedHashMap<String, String>()
+
     // needs_user banner
     private lateinit var bannerBox: LinearLayout
     private lateinit var bannerText: TextView
@@ -63,15 +77,13 @@ class AgentChatView(
     private var bannerGoal = ""
     private var bannerUrl = ""
 
-    // standalone status chip
-    private lateinit var standaloneChip: TextView
-
     // voice input
     private var recognizer: SpeechRecognizer? = null
     private var listening = false
     private var voiceFallbackTried = false
+    private var voiceBaseText = ""
 
-    // task status polling (sirf Agent tab visible ho tabhi)
+    // task status polling (sirf Home/chat visible ho tabhi)
     private val pollHandler = Handler(Looper.getMainLooper())
     private var polling = false
     private val pollRunnable = object : Runnable {
@@ -102,7 +114,7 @@ class AgentChatView(
         setBackgroundColor(Color.WHITE)
         val pad = dp(12)
 
-        // Header: title + History button
+        // Header: title + Details button
         val header = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -116,25 +128,11 @@ class AgentChatView(
             layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
         })
         header.addView(Button(context).apply {
-            text = "📜 History"
+            text = "📋 Details"
             textSize = 13f
-            setOnClickListener { showHistory() }
-        })
-        header.addView(Button(context).apply {
-            text = "⚙️"
-            textSize = 13f
-            setOnClickListener { showStandaloneSettings() }
+            setOnClickListener { showDetailsCard() }
         })
         addView(header)
-
-        // Standalone status chip
-        standaloneChip = TextView(context).apply {
-            textSize = 12f
-            setTextColor(Color.parseColor("#5F6368"))
-            setPadding(pad, dp(2), pad, dp(2))
-        }
-        addView(standaloneChip)
-        refreshStandaloneChip()
 
         // v14: CAPTCHA auto-solve consent toggle (default ON, persisted)
         addView(LinearLayout(context).apply {
@@ -201,35 +199,7 @@ class AgentChatView(
         scroll.addView(messageList)
         addView(scroll)
 
-        // Suggestion chips
-        val chipScroll = HorizontalScrollView(context).apply {
-            layoutParams = LayoutParams(
-                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
-            )
-            isHorizontalScrollBarEnabled = false
-        }
-        val chipRow = LinearLayout(context).apply {
-            orientation = HORIZONTAL
-            setPadding(pad, dp(4), pad, dp(4))
-        }
-        listOf("Caste certificate", "PAN card", "Scholarship", "Passport").forEach { label ->
-            val chip = TextView(context).apply {
-                text = label
-                textSize = 13f
-                setTextColor(Color.parseColor(accent))
-                setPadding(dp(14), dp(8), dp(14), dp(8))
-                background = chipBg()
-                setOnClickListener { sendMessage(label) }
-            }
-            val lp = LayoutParams(
-                LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 0, dp(8), 0) }
-            chipRow.addView(chip, lp)
-        }
-        chipScroll.addView(chipRow)
-        addView(chipScroll)
-
-        // Input row: [📎] [text] [🎤] [➤]
+        // Input row: [📎] [text] [🎤] [🔊] [➤]
         val inputRow = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -247,10 +217,16 @@ class AgentChatView(
         input = EditText(context).apply {
             hint = "Yahan likho…"
             textSize = 15f
+            imeOptions = EditorInfo.IME_ACTION_SEND
             layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
             background = inputBg()
             setPadding(dp(14), dp(10), dp(14), dp(10))
-            setOnEditorActionListener { v, _, _ -> sendMessage((v as TextView).text.toString()); true }
+            setOnEditorActionListener { v, actionId, _ ->
+                if (actionId == EditorInfo.IME_ACTION_SEND) {
+                    sendMessage((v as TextView).text.toString())
+                    true
+                } else false
+            }
         }
         inputRow.addView(input)
         micBtn = Button(context).apply {
@@ -262,7 +238,7 @@ class AgentChatView(
             setOnClickListener { onMicClick() }
         }
         inputRow.addView(micBtn)
-        // 🔊 speaker toggle — agent ke jawab bol ke sunao (Phase 5 voice)
+        // 🔊 speaker toggle — agent ke jawab bol ke sunao
         val speakBtn = Button(context).apply {
             text = if (VoiceOutput.isEnabled(context)) "🔊" else "🔇"
             textSize = 18f
@@ -312,14 +288,6 @@ class AgentChatView(
         return d
     }
 
-    private fun chipBg(): GradientDrawable {
-        val d = GradientDrawable()
-        d.setColor(Color.parseColor("#E8F5F0"))
-        d.setStroke(dp(1), Color.parseColor(accent))
-        d.cornerRadius = dp(20).toFloat()
-        return d
-    }
-
     private fun inputBg(): GradientDrawable {
         val d = GradientDrawable()
         d.setColor(Color.parseColor("#F7F7F7"))
@@ -345,7 +313,6 @@ class AgentChatView(
             layoutParams = LayoutParams(
                 LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT
             ).apply { width = LayoutParams.WRAP_CONTENT }
-            // Bubble max ~80% width
             maxWidth = (resources.displayMetrics.widthPixels * 0.82).toInt()
         }
         wrap.addView(tv)
@@ -355,6 +322,48 @@ class AgentChatView(
 
     private fun addUserBubble(text: String) = addBubble(text, true)
     private fun addAssistantBubble(text: String) = addBubble(text, false)
+
+    /**
+     * Error bubble — laal, neeche action button ke saath (Retry / Login).
+     * Silent fail kabhi nahi: har failure user ko dikhega.
+     */
+    private fun addErrorBubble(
+        text: String,
+        actionLabel: String?,
+        onAction: (() -> Unit)?
+    ) {
+        val wrap = LinearLayout(context).apply {
+            orientation = VERTICAL
+            gravity = Gravity.START
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(4), 0, dp(4)) }
+        }
+        val tv = TextView(context).apply {
+            this.text = text
+            textSize = 14f
+            setTextColor(Color.parseColor("#7A1F1F"))
+            background = bubbleBg("#FDECEA", false)
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            maxWidth = (resources.displayMetrics.widthPixels * 0.85).toInt()
+        }
+        wrap.addView(tv)
+        if (actionLabel != null && onAction != null) {
+            val b = Button(context).apply {
+                this.text = actionLabel
+                textSize = 13f
+                setOnClickListener { onAction() }
+            }
+            wrap.addView(
+                b,
+                LayoutParams(
+                    LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT
+                ).apply { setMargins(0, dp(4), 0, 0) }
+            )
+        }
+        messageList.addView(wrap)
+        scrollToBottom()
+    }
 
     private fun showTyping() {
         val tv = TextView(context).apply {
@@ -398,7 +407,6 @@ class AgentChatView(
             LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
         ).apply { setMargins(0, dp(6), 0, dp(6)) }
 
-        // Title
         card.addView(TextView(context).apply {
             text = plan.optString("title", "Form")
             textSize = 17f
@@ -406,7 +414,6 @@ class AgentChatView(
             setTextColor(Color.parseColor("#202124"))
         })
 
-        // Official link
         val link = plan.optString("official_link", "")
         if (link.isNotEmpty()) {
             card.addView(TextView(context).apply {
@@ -421,7 +428,6 @@ class AgentChatView(
             })
         }
 
-        // Login badge
         val loginNeeded = plan.optBoolean("login_needed", false)
         card.addView(TextView(context).apply {
             text = if (loginNeeded) "🔒 Login lagega" else "🔓 Bina login"
@@ -430,7 +436,6 @@ class AgentChatView(
             setPadding(0, 0, 0, dp(6))
         })
 
-        // Kya-kya lagega checklist
         val docs = plan.optJSONArray("required_docs")
         if (docs != null && docs.length() > 0) {
             card.addView(TextView(context).apply {
@@ -451,7 +456,6 @@ class AgentChatView(
             }
         }
 
-        // Estimated steps
         val steps = plan.optInt("estimated_steps", 0)
         if (steps > 0) {
             card.addView(TextView(context).apply {
@@ -462,7 +466,6 @@ class AgentChatView(
             })
         }
 
-        // Warnings
         val warns = plan.optJSONArray("warnings")
         if (warns != null && warns.length() > 0) {
             for (i in 0 until warns.length()) {
@@ -478,7 +481,7 @@ class AgentChatView(
             }
         }
 
-        // Shuru karo button
+        // Shuru karo — verify gate ke saath (details ho to pehle verify card)
         val startBtn = Button(context).apply {
             text = "▶ Shuru karo"
             textSize = 15f
@@ -493,12 +496,52 @@ class AgentChatView(
         }
         startBtn.setOnClickListener {
             startBtn.isEnabled = false
-            startBtn.text = "⏳ Task ban raha hai…"
-            enqueueTask(
-                title = plan.optString("title", "Form"),
-                url = link,
-                onDone = { post { startBtn.text = "▶ Shuru karo"; startBtn.isEnabled = true } }
-            )
+            startBtn.text = "⏳ Details la raha hun…"
+            Thread {
+                // Vault profile + session details merge karke verify card
+                val merged = LinkedHashMap<String, String>()
+                try {
+                    val vault = AgentApi.profile(context)
+                    if (vault != null) {
+                        for (k in DetailExtractor.orderedKeys()) {
+                            val v = vault.optString(k, "").trim()
+                            if (v.isNotEmpty() && v != "null") merged[k] = v
+                        }
+                    }
+                } catch (_: Exception) { }
+                for ((k, v) in sessionDetails) merged[k] = v
+                post {
+                    if (merged.isEmpty()) {
+                        beginEnqueue(plan, link, startBtn)
+                    } else {
+                        showVerifyDialog(
+                            merged,
+                            title = "✔️ Aage badhne se pehle verify karo",
+                            subtitle = "Agent inhi details se kaam karega. " +
+                                "Proceed dabane par hi task banega.",
+                            positiveLabel = "✅ Proceed",
+                            onProceed = { verified ->
+                                // User ne theek kiya ho to server ko correction bhejo
+                                val diffs = verified.filter { (k, v) -> merged[k] != v }
+                                if (diffs.isNotEmpty()) {
+                                    sessionDetails.putAll(verified)
+                                    doSend(
+                                        "Meri in details ko theek kar do: " +
+                                            diffs.entries.joinToString(", ") {
+                                                "${DetailExtractor.label(it.key)}: ${it.value}"
+                                            }
+                                    )
+                                }
+                                beginEnqueue(plan, link, startBtn)
+                            },
+                            onCancel = {
+                                startBtn.text = "▶ Shuru karo"
+                                startBtn.isEnabled = true
+                            }
+                        )
+                    }
+                }
+            }.start()
         }
         card.addView(startBtn)
 
@@ -506,34 +549,105 @@ class AgentChatView(
         scrollToBottom()
     }
 
+    private fun beginEnqueue(plan: JSONObject, link: String, startBtn: Button) {
+        startBtn.text = "⏳ Task ban raha hai…"
+        enqueueTask(
+            title = plan.optString("title", "Form"),
+            url = link,
+            onDone = { post { startBtn.text = "▶ Shuru karo"; startBtn.isEnabled = true } }
+        )
+    }
+
     // ---------- flow ----------
 
+    /**
+     * Verify-before-save gate: message me nayi personal details dikhin to
+     * PEHLE verify card — Proceed par hi message server ko jayega.
+     */
     fun sendMessage(raw: String) {
         val text = raw.trim()
         if (text.isEmpty() || waiting) return
+        val candidates = DetailExtractor.extract(text)
+        val fresh = candidates.filterKeys { !sessionDetails.containsKey(it) }
+        if (fresh.isNotEmpty()) {
+            showVerifyDialog(
+                fresh,
+                title = "✔️ Details verify karo",
+                subtitle = "Ye details save hongi. Sahi hain to Proceed dabao — " +
+                    "bina Proceed ke kuch save nahi hoga.",
+                positiveLabel = "✅ Sahi hai — bhejo",
+                onProceed = { verified ->
+                    sessionDetails.putAll(verified)
+                    var finalText = text
+                    val edited = verified.filter { (k, v) -> candidates[k] != v }
+                    if (edited.isNotEmpty()) {
+                        finalText += "\n(Sahi: " + edited.entries.joinToString(", ") {
+                            "${DetailExtractor.label(it.key)}=${it.value}"
+                        } + ")"
+                    }
+                    doSend(finalText)
+                },
+                onCancel = { toast("Message nahi bheja — details save nahi hui") }
+            )
+            return
+        }
+        doSend(text)
+    }
+
+    /** Asli send — gate se guzarne ke baad. Retry bhi yahi aata hai. */
+    private fun doSend(text: String) {
+        val t = text.trim()
+        if (t.isEmpty() || waiting) return
         waiting = true
+        lastFailedText = t
         input.text.clear()
         sendBtn.isEnabled = false
-        addUserBubble(text)
-        history.add("user" to text)
+        addUserBubble(t)
+        history.add("user" to t)
         showTyping()
+        // Watchdog: 75s me jawab na aaye to stuck state todo + retry do
+        val token = ++sendToken
+        sendWatchdog.removeCallbacksAndMessages(null)
+        sendWatchdog.postDelayed({
+            if (waiting && token == sendToken) {
+                waiting = false
+                sendBtn.isEnabled = true
+                hideTyping()
+                addErrorBubble(
+                    "⏳ Server se jawab nahi aaya (timeout).",
+                    "🔁 Dobara bhejo"
+                ) { lastFailedText?.let { doSend(it) } }
+            }
+        }, 75_000)
         Thread {
-            val res = AgentApi.chat(context, history.toList())
+            val res = try {
+                AgentApi.chat(context, history.toList())
+            } catch (_: Exception) {
+                AgentApi.ApiResult(-1, null)
+            }
             post {
+                if (token != sendToken) return@post // purana watchdog token
+                sendWatchdog.removeCallbacksAndMessages(null)
                 hideTyping()
                 waiting = false
                 sendBtn.isEnabled = true
                 when (res.code) {
-                    -1 -> addAssistantBubble("Internet nahi hai 📡")
-                    401 -> addAssistantBubble("Pehle Profile tab me login karo 🔑")
+                    -1 -> addErrorBubble(
+                        "📡 Internet nahi lag raha — message nahi gaya.",
+                        "🔁 Dobara bhejo"
+                    ) { lastFailedText?.let { doSend(it) } }
+                    401 -> addErrorBubble(
+                        "🔑 Pehle login karna hoga — tabhi agent baat karega.",
+                        "🔑 Login karo"
+                    ) { onOpenProfile() }
                     429 -> addAssistantBubble("Aaj ka limit khatam, kal try karo ⏳")
                     200 -> {
+                        lastFailedText = null
                         val json = res.json
                         val reply = json?.optString("reply", "")?.trim().orEmpty()
                         if (reply.isNotEmpty()) {
                             addAssistantBubble(reply)
                             history.add("assistant" to reply)
-                            // Agent ka jawab bol ke bhi sunao (voice output)
                             VoiceOutput.speak(context, reply)
                         }
                         val plan = json?.optJSONObject("plan")
@@ -545,17 +659,188 @@ class AgentChatView(
                                 .filter { it.isNotEmpty() }
                             if (names.isNotEmpty()) {
                                 addAssistantBubble(
-                                    "📎 Ye docs profile me ready rakho: " +
+                                    "📎 Ye docs 📎 button se kabhi bhi bhej sakte ho: " +
                                         names.joinToString(", ")
                                 )
                             }
                         }
                         if (reply.isEmpty() && plan == null) {
-                            addAssistantBubble("Kuch gadbad hui, dobara bolo.")
+                            addErrorBubble(
+                                "🤖 Jawab khaali aaya.",
+                                "🔁 Dobara bhejo"
+                            ) { lastFailedText?.let { doSend(it) } }
                         }
                     }
-                    else -> addAssistantBubble("Kuch gadbad hui, dobara bolo.")
+                    else -> addErrorBubble(
+                        "⚠️ Server se dikkat (code ${res.code}) — message nahi gaya.",
+                        "🔁 Dobara bhejo"
+                    ) { lastFailedText?.let { doSend(it) } }
                 }
+            }
+        }.start()
+    }
+
+    // ---------- verify dialog ----------
+
+    /**
+     * Details ka verify card: arrange karke dikhao, har field editable,
+     * Proceed par hi aage badho. Bina Proceed ke kuch nahi hota.
+     */
+    private fun showVerifyDialog(
+        fields: Map<String, String>,
+        title: String,
+        subtitle: String,
+        positiveLabel: String,
+        onProceed: (Map<String, String>) -> Unit,
+        onCancel: () -> Unit = {}
+    ) {
+        val act = context as? Activity ?: run { onCancel(); return }
+        val layout = LinearLayout(act).apply {
+            orientation = VERTICAL
+            setPadding(48, 24, 48, 8)
+        }
+        layout.addView(TextView(act).apply {
+            text = subtitle
+            textSize = 14f
+            setTextColor(Color.parseColor("#5F6368"))
+            setPadding(0, 0, 0, dp(12))
+        })
+        val edits = LinkedHashMap<String, EditText>()
+        for (k in DetailExtractor.orderedKeys()) {
+            val v = fields[k] ?: continue
+            layout.addView(TextView(act).apply {
+                text = DetailExtractor.label(k)
+                textSize = 13f
+                setTextColor(Color.parseColor("#80868B"))
+                setPadding(0, dp(6), 0, 0)
+            })
+            val et = EditText(act).apply {
+                setText(v)
+                textSize = 16f
+                setTextColor(Color.parseColor("#202124"))
+            }
+            layout.addView(et)
+            edits[k] = et
+        }
+        // unknown extra fields (agar ho)
+        for ((k, v) in fields) {
+            if (edits.containsKey(k)) continue
+            layout.addView(TextView(act).apply {
+                text = DetailExtractor.label(k)
+                textSize = 13f
+                setTextColor(Color.parseColor("#80868B"))
+                setPadding(0, dp(6), 0, 0)
+            })
+            val et = EditText(act).apply { setText(v); textSize = 16f }
+            layout.addView(et)
+            edits[k] = et
+        }
+        val dlg = AlertDialog.Builder(act)
+            .setTitle(title)
+            .setView(ScrollView(act).apply { addView(layout) })
+            .setCancelable(false)
+            .setPositiveButton(positiveLabel, null)
+            .setNegativeButton("❌ Mat bhejo", null)
+            .create()
+        dlg.setOnShowListener {
+            dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val final = LinkedHashMap<String, String>()
+                edits.forEach { (k, et) ->
+                    val v = et.text.toString().trim()
+                    if (v.isNotEmpty()) final[k] = v
+                }
+                dlg.dismiss()
+                onProceed(final)
+            }
+            dlg.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+                dlg.dismiss()
+                onCancel()
+            }
+        }
+        dlg.show()
+    }
+
+    /** 📋 Details — vault + session ki details arrange karke dikhao + theek karo. */
+    private fun showDetailsCard() {
+        toast("Details la raha hun…")
+        Thread {
+            val merged = LinkedHashMap<String, String>()
+            try {
+                val vault = AgentApi.profile(context)
+                if (vault != null) {
+                    for (k in DetailExtractor.orderedKeys()) {
+                        val v = vault.optString(k, "").trim()
+                        if (v.isNotEmpty() && v != "null") merged[k] = v
+                    }
+                }
+            } catch (_: Exception) { }
+            for ((k, v) in sessionDetails) merged[k] = v
+            post {
+                val act = context as? Activity ?: return@post
+                if (merged.isEmpty()) {
+                    AlertDialog.Builder(act)
+                        .setTitle("📋 Meri details")
+                        .setMessage(
+                            "Abhi koi details save nahi hain.\n\n" +
+                                "Chat me apna naam, phone, email wagera batao — " +
+                                "bhejne se pehle verify card aayega."
+                        )
+                        .setPositiveButton("Theek hai", null)
+                        .show()
+                    return@post
+                }
+                val layout = LinearLayout(act).apply {
+                    orientation = VERTICAL
+                    setPadding(48, 24, 48, 8)
+                }
+                for (k in DetailExtractor.orderedKeys()) {
+                    val v = merged[k] ?: continue
+                    layout.addView(TextView(act).apply {
+                        text = DetailExtractor.label(k)
+                        textSize = 13f
+                        setTextColor(Color.parseColor("#80868B"))
+                        setPadding(0, dp(6), 0, 0)
+                    })
+                    layout.addView(TextView(act).apply {
+                        text = v
+                        textSize = 16f
+                        setTypeface(null, Typeface.BOLD)
+                        setTextColor(Color.parseColor("#202124"))
+                    })
+                }
+                AlertDialog.Builder(act)
+                    .setTitle("📋 Meri details")
+                    .setView(ScrollView(act).apply { addView(layout) })
+                    .setPositiveButton("Band karo", null)
+                    .setNeutralButton("✏️ Theek karo", null)
+                    .create().apply {
+                        setOnShowListener {
+                            getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                                dismiss()
+                                showVerifyDialog(
+                                    merged,
+                                    title = "✏️ Details theek karo",
+                                    subtitle = "Jo galat hai use theek karo, phir Save dabao.",
+                                    positiveLabel = "💾 Save karo",
+                                    onProceed = { verified ->
+                                        sessionDetails.putAll(verified)
+                                        val diffs = verified.filter { (k, v) -> merged[k] != v }
+                                        if (diffs.isNotEmpty()) {
+                                            doSend(
+                                                "Meri in details ko update kar do: " +
+                                                    diffs.entries.joinToString(", ") {
+                                                        "${DetailExtractor.label(it.key)}: ${it.value}"
+                                                    }
+                                            )
+                                        } else {
+                                            toast("Koi badlav nahi")
+                                        }
+                                    }
+                                )
+                            }
+                        }
+                        show()
+                    }
             }
         }.start()
     }
@@ -593,14 +878,14 @@ class AgentChatView(
                         offline && com.formmitra.app.engine.Standalone.isConfigured(context) ->
                             startStandaloneTask(title, url)
                         code == -1 -> "Internet nahi hai 📡 — server bhi nahi mil raha. " +
-                            "Standalone ke liye Profile me apni Groq API key save karo."
+                            "Standalone ab server-managed hai."
                         else -> "Task ban nahi paya (code $code). Dobara try karo."
                     }
                 } else {
                     val runCode = AgentApi.runNow(context, taskId)
                     if (runCode in 200..299) {
                         "Background me shuru ho gaya ✅ — 30 min ke andar " +
-                            "phone uthayega. /admin/forms me progress dekho."
+                            "phone uthayega. History tab me progress dekho."
                     } else if (runCode == -1) {
                         "Internet nahi hai 📡"
                     } else {
@@ -618,7 +903,7 @@ class AgentChatView(
 
     /**
      * Offline task: StandaloneStore me save + FormRunService seedha chalao.
-     * Server bilkul involve nahi — brain = user ki Groq key (StandaloneBrain).
+     * Server bilkul involve nahi — brain = saved key (StandaloneBrain).
      */
     private fun startStandaloneTask(title: String, url: String): String {
         return try {
@@ -639,7 +924,7 @@ class AgentChatView(
                 )
             com.formmitra.app.engine.FormRunService.startWithTask(context, task)
             "Server nahi mil raha — standalone mode me shuru kiya ✅\n" +
-                "(tumhari Groq key se, bina server ke). Progress notification me dikhega."
+                "Progress notification me dikhega."
         } catch (e: Exception) {
             "Standalone task shuru nahi hua: ${(e.message ?: "error").take(120)}"
         }
@@ -685,7 +970,38 @@ class AgentChatView(
         return m
     }
 
-    // ---------- runs history ----------
+    // ---------- needs_user banner + polling ----------
+
+    /** MainActivity.selectTab se — Home dikha to polling shuru. */
+    fun onTabShown() {
+        // TTS engine warm karo taaki pehla jawab turant bole (lost na ho)
+        try { VoiceOutput.init(context) } catch (_: Exception) { }
+        if (polling) return
+        polling = true
+        pollHandler.post(pollRunnable)
+    }
+
+    /** Home chhupa to polling band. */
+    fun onTabHidden() {
+        polling = false
+        pollHandler.removeCallbacks(pollRunnable)
+    }
+
+    private fun pollTaskStatus() {
+        Thread {
+            val runs = try { AgentApi.listRuns(context) } catch (_: Exception) { null }
+            val prompt = UserPrompt.pendingRequest()
+            post {
+                handlePollResult(runs)
+                if (prompt != null) {
+                    val act = context as? Activity
+                    if (act != null && !PromptDialog.isShowing(prompt.runId)) {
+                        PromptDialog.show(act, prompt)
+                    }
+                }
+            }
+        }.start()
+    }
 
     private fun runFd(item: JSONObject): JSONObject? = item.optJSONObject("form_data")
 
@@ -706,211 +1022,6 @@ class AgentChatView(
         val s = fd?.optString("summary", "").orEmpty()
         if (s.isNotEmpty()) return s
         return fd?.optString("error", "").orEmpty()
-    }
-
-    private fun runDate(item: JSONObject): String {
-        val c = item.optString("created_at", "")
-        return if (c.length >= 10) c.substring(0, 10) else c
-    }
-
-    private fun statusBadge(s: String): String = when (s) {
-        "done" -> "✅ Ho gaya"
-        "needs_user", "needs_attention" -> "⚠️ Dhyaan chahiye"
-        "failed" -> "❌ Fail"
-        "vetoed" -> "🛑 Roka gaya"
-        "in_progress", "running", "progress" -> "⏳ Chal raha"
-        "queued" -> "⏳ Queue me"
-        else -> s.ifEmpty { "?" }
-    }
-
-    private fun showHistory() {
-        Thread {
-            val runs = AgentApi.listRuns(context)
-            post {
-                if (runs == null) {
-                    toast("History nahi mili 📡")
-                    return@post
-                }
-                if (runs.length() == 0) {
-                    toast("Abhi koi run nahi hai")
-                    return@post
-                }
-                val items = (0 until runs.length())
-                    .map { runs.optJSONObject(it) ?: JSONObject() }
-                val labels = items.map { item ->
-                    "${runGoal(item)}\n${statusBadge(item.optString("status", ""))} • ${runDate(item)}"
-                }.toTypedArray()
-                AlertDialog.Builder(context)
-                    .setTitle("📜 Runs history")
-                    .setItems(labels) { _, which -> showRunDetail(items[which]) }
-                    .setNegativeButton("Band karo", null)
-                    .show()
-            }
-        }.start()
-    }
-
-    private fun showRunDetail(item: JSONObject) {
-        val fd = runFd(item)
-        val goal = runGoal(item)
-        val url = runUrl(item)
-        val steps = fd?.optInt("steps_taken", -1) ?: -1
-        val summary = runSummary(item)
-        val proof = fd?.optString("proof_url", "").orEmpty()
-        val started = fd?.optString("started_at", "").orEmpty()
-        val finished = fd?.optString("finished_at", "").orEmpty()
-        val sb = StringBuilder()
-        sb.append("Status: ${statusBadge(item.optString("status", ""))}\n")
-        if (url.isNotEmpty()) sb.append("Link: $url\n")
-        if (steps >= 0) sb.append("Steps: $steps\n")
-        if (started.isNotEmpty()) sb.append("Shuru: $started\n")
-        if (finished.isNotEmpty()) sb.append("Khatm: $finished\n")
-        if (summary.isNotEmpty()) sb.append("\n$summary")
-        val dlg = AlertDialog.Builder(context)
-            .setTitle(goal)
-            .setMessage(sb.toString())
-            .setNegativeButton("Band karo", null)
-        if (proof.isNotEmpty()) {
-            dlg.setNeutralButton("🖼️ Proof dekho") { _, _ -> onOpenLink(proof) }
-        }
-        dlg.show()
-    }
-
-    // ---------- standalone mode settings ----------
-
-    private fun isStandaloneConfigured(): Boolean = try {
-        Standalone.isConfigured(context)
-    } catch (_: Exception) {
-        false
-    }
-
-    /** @return true = key save ho gayi, false = fail. */
-    private fun standaloneSaveKey(key: String): Boolean {
-        return try {
-            Standalone.saveKey(context, key)
-            true
-        } catch (_: Exception) {
-            false
-        }
-    }
-
-    private fun standaloneClearKey() {
-        try {
-            Standalone.clearKey(context)
-        } catch (_: Exception) {
-            // best effort
-        }
-    }
-
-    private fun refreshStandaloneChip() {
-        standaloneChip.text = if (isStandaloneConfigured())
-            "Standalone: ON (key saved) ✅"
-        else
-            "Standalone: OFF"
-    }
-
-    private fun showStandaloneSettings() {
-        val configured = isStandaloneConfigured()
-        val keyInput = EditText(context).apply {
-            hint = if (configured) "•••••••• (nayi key yahan likho)"
-                   else "Groq API key yahan likho"
-            textSize = 15f
-            inputType =
-                InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-        }
-        val body = LinearLayout(context).apply {
-            orientation = VERTICAL
-            val p = dp(16)
-            setPadding(p, dp(8), p, 0)
-        }
-        body.addView(TextView(context).apply {
-            text = "Server ya net na ho to app aapki Groq API key se seedha AI se " +
-                "baat karegi. Key sirf aapke phone me encrypted rehti hai."
-            textSize = 14f
-            setTextColor(Color.parseColor("#5F6368"))
-        })
-        body.addView(
-            keyInput,
-            LayoutParams(
-                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, dp(10), 0, 0) }
-        )
-        val srcRow = LinearLayout(context).apply {
-            orientation = HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        srcRow.addView(TextView(context).apply {
-            text = "Key: console.groq.com → API Keys (free)"
-            textSize = 13f
-            setTextColor(Color.parseColor("#5F6368"))
-            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
-        })
-        srcRow.addView(Button(context).apply {
-            text = "Link kholo"
-            textSize = 13f
-            setOnClickListener { onOpenLink("https://console.groq.com/keys") }
-        })
-        body.addView(srcRow)
-        val dlg = AlertDialog.Builder(context)
-            .setTitle("Standalone mode (bina server)")
-            .setView(body)
-            .setPositiveButton("Save") { _, _ ->
-                val key = keyInput.text.toString().trim()
-                if (key.isEmpty()) {
-                    toast("Key khaali hai")
-                    return@setPositiveButton
-                }
-                if (standaloneSaveKey(key)) {
-                    keyInput.setText("")
-                    refreshStandaloneChip()
-                    toast("Key save ho gayi ✅")
-                } else {
-                    toast("Key save nahi hui — dobara try karo")
-                }
-            }
-            .setNegativeButton("Band karo", null)
-        if (configured) {
-            dlg.setNeutralButton("Hatao") { _, _ ->
-                standaloneClearKey()
-                refreshStandaloneChip()
-                toast("Key hata di gayi")
-            }
-        }
-        dlg.show()
-    }
-
-    // ---------- needs_user banner + polling ----------
-
-    /** MainActivity.selectTab se — Agent tab dikha to polling shuru. */
-    fun onTabShown() {
-        // TTS engine warm karo taaki pehla jawab turant bole (lost na ho)
-        try { VoiceOutput.init(context) } catch (_: Exception) { }
-        refreshStandaloneChip()
-        if (polling) return
-        polling = true
-        pollHandler.post(pollRunnable)
-    }
-
-    /** Agent tab chhupa to polling band. */
-    fun onTabHidden() {
-        polling = false
-        pollHandler.removeCallbacks(pollRunnable)
-    }
-
-    private fun pollTaskStatus() {
-        Thread {
-            val runs = try { AgentApi.listRuns(context) } catch (_: Exception) { null }
-            val prompt = UserPrompt.pendingRequest()
-            post {
-                handlePollResult(runs)
-                // Interactive prompt khula ho to popup dikhao (OTP/payment/choice)
-                if (prompt != null) {
-                    val act = context as? Activity
-                    if (act != null && !PromptDialog.isShowing(prompt.runId)) {
-                        PromptDialog.show(act, prompt)
-                    }
-                }
-            }
-        }.start()
     }
 
     private fun handlePollResult(runs: JSONArray?) {
@@ -956,7 +1067,6 @@ class AgentChatView(
         retryBtn.isEnabled = false
         Thread {
             var msg: String
-            // Retry se pehle bhi precheck (pichhle experience se faisla)
             val verdict = runPrecheck(bannerUrl, bannerGoal)
             if (verdict != null && !verdict.feasible) {
                 msg = PrecheckLogic.verdictText(verdict) + "\n\nRetry nahi kiya."
@@ -992,7 +1102,7 @@ class AgentChatView(
         }.start()
     }
 
-    // ---------- voice input (Hindi) ----------
+    // ---------- voice input ----------
 
     private fun onMicClick() {
         if (listening) {
@@ -1014,17 +1124,18 @@ class AgentChatView(
     /** MainActivity.onRequestPermissionsResult se forward hota hai. */
     fun onVoicePermissionResult(granted: Boolean) {
         if (granted) startListening("hi-IN")
-        else toast("Mic permission chahiye 🎤")
+        else toast("Mic permission chahiye 🎤 — Settings me de do")
     }
 
     private fun startListening(lang: String) {
         val ctx = context
         if (!SpeechRecognizer.isRecognitionAvailable(ctx)) {
-            toast("Voice nahi mila")
+            toast("Is phone me voice nahi mila")
             return
         }
         stopListening()
         voiceFallbackTried = lang != "hi-IN"
+        voiceBaseText = try { input.text.toString() } catch (_: Exception) { "" }
         try {
             recognizer = SpeechRecognizer.createSpeechRecognizer(ctx).apply {
                 setRecognitionListener(voiceListener)
@@ -1035,13 +1146,25 @@ class AgentChatView(
                     )
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
                     putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                    // Live transcription: bolte waqt hi text dikhe
+                    putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                    putExtra(
+                        "android.speech.extra.SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS",
+                        2500
+                    )
+                    putExtra(
+                        "android.speech.extra.SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS",
+                        2500
+                    )
                 }
                 startListening(ri)
             }
             listening = true
             micBtn.text = "⏹"
+            input.hint = "🎤 Sun raha hun… bolo"
         } catch (_: Exception) {
-            toast("Voice nahi mila")
+            stopListening()
+            toast("Voice shuru nahi hua")
         }
     }
 
@@ -1052,7 +1175,10 @@ class AgentChatView(
         } catch (_: Exception) { }
         recognizer = null
         listening = false
-        micBtn.text = "🎤"
+        try {
+            micBtn.text = "🎤"
+            input.hint = "Yahan likho…"
+        } catch (_: Exception) { }
     }
 
     private val voiceListener = object : RecognitionListener {
@@ -1061,38 +1187,66 @@ class AgentChatView(
         override fun onRmsChanged(rmsdB: Float) {}
         override fun onBufferReceived(buffer: ByteArray?) {}
         override fun onEndOfSpeech() {}
-        override fun onPartialResults(partialResults: Bundle?) {}
         override fun onEvent(eventType: Int, params: Bundle?) {}
+
+        /** Bolte waqt live text input me dikhao — user ko pata chale sun raha hai. */
+        override fun onPartialResults(partialResults: Bundle?) {
+            if (!listening) return
+            val t = partialResults
+                ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                ?.firstOrNull()?.trim().orEmpty()
+            if (t.isNotEmpty()) {
+                input.setText(if (voiceBaseText.isBlank()) t else "$voiceBaseText $t")
+                input.setSelection(input.text.length)
+            }
+        }
+
         override fun onError(error: Int) {
             if (!voiceFallbackTried) {
                 // hi-IN fail → en-IN ek baar try karo
                 startListening("en-IN")
-            } else {
-                stopListening()
-                toast("Suna nahi gaya, dobara bolo")
+                return
             }
+            stopListening()
+            val msg = when (error) {
+                SpeechRecognizer.ERROR_NO_MATCH,
+                SpeechRecognizer.ERROR_SPEECH_TIMEOUT ->
+                    "Suna nahi gaya — thoda saaf aur paas se bolo 🎤"
+                SpeechRecognizer.ERROR_NETWORK,
+                SpeechRecognizer.ERROR_NETWORK_TIMEOUT ->
+                    "Voice ke liye internet chahiye 📡"
+                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ->
+                    "Mic permission nahi mili 🎤"
+                SpeechRecognizer.ERROR_RECOGNIZER_BUSY ->
+                    "Voice busy hai — 2 second ruk ke dobara dabao"
+                else -> "Voice me dikkat — dobara try karo"
+            }
+            toast(msg)
         }
 
         override fun onResults(results: Bundle?) {
-            val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            val text = list?.firstOrNull()?.trim().orEmpty()
+            val t = results
+                ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                ?.firstOrNull()?.trim().orEmpty()
             stopListening()
-            if (text.isNotEmpty()) {
-                val cur = input.text.toString()
-                input.setText(if (cur.isBlank()) text else "$cur $text")
+            if (t.isNotEmpty()) {
+                val cur = voiceBaseText.ifBlank { input.text.toString() }
+                input.setText(if (cur.isBlank()) t else "$cur $t")
                 input.setSelection(input.text.length)
+            } else {
+                toast("Kuch suna nahi gaya — dobara bolo")
             }
         }
     }
 
-    // ---------- document picker ----------
+    // ---------- document picker (koi bhi file) ----------
 
     private fun onAttachClick() {
         val act = context as? Activity ?: return
+        // Limited type selector hataya — user koi bhi document bhej sakta hai
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*"
-            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "application/pdf"))
         }
         try {
             act.startActivityForResult(intent, REQ_DOC_PICK)
@@ -1107,12 +1261,12 @@ class AgentChatView(
         if (resultCode != Activity.RESULT_OK) return
         val uri = data?.data ?: return
         Thread {
-            val name = DocsStore.saveDoc(context, uri)
+            val ok = DocsStore.saveDoc(context, uri) != null
             post {
-                if (name != null) {
-                    toast("Saved: $name — agent upload step me istemaal hoga")
+                if (ok) {
+                    toast("Document save ho gaya ✅ — agent upload step me istemaal hoga")
                 } else {
-                    toast("File save nahi hui")
+                    toast("File save nahi hui — dobara try karo")
                 }
             }
         }.start()
