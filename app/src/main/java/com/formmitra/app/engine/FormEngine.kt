@@ -412,6 +412,7 @@ class FormEngine(private val appContext: Context) {
             "captcha_solve" -> captchaSolve(s)
             "back" -> { goBack(); JSONObject().put("nav", "back") }
             "forward" -> { goForward(); JSONObject().put("nav", "forward") }
+            "scroll" -> scrollPage(s)
             else -> throw Exception("unsupported step: '${s.type}'")
         }
     }
@@ -856,6 +857,29 @@ class FormEngine(private val appContext: Context) {
         }
         latch.await(5, TimeUnit.SECONDS)
         Thread.sleep(1500)
+    }
+
+    /** scroll — L1: selector ho to element center me lao, nahi to page
+     *  ek screen neeche scroll karo (lazy-load / lambe form ke liye). */
+    private fun scrollPage(s: StepSpec): JSONObject {
+        val js = if (s.selectorValue.isNotBlank()) {
+            """(function(){
+              var el=${finderJs(s.selectorMode.ifBlank { "css" }, s.selectorValue)};
+              if(!el) return 'NOT_FOUND';
+              try{ el.scrollIntoView({block:'center'}); }catch(e){}
+              return 'SCROLLED';
+            })()"""
+        } else {
+            """(function(){
+              try{ window.scrollBy(0, Math.floor(window.innerHeight*0.8)); }catch(e){}
+              return 'SCROLLED';
+            })()"""
+        }
+        if (evalJsSync(js).trim('"') != "SCROLLED") {
+            throw Exception("scroll: element nahi mila (${s.selectorMode}:${s.selectorValue})")
+        }
+        Thread.sleep(800)
+        return JSONObject().put("scrolled", true)
     }
 
     /** forward — WebView history forward + settle wait. */

@@ -14,12 +14,15 @@ package com.formmitra.app.engine
  *    result_summary}
  */
 object AgentActions {
-    /** Server se aane wale allowed actions (contract whitelist). */
+    /** Server se aane wale allowed actions (contract whitelist).
+     *  v21: server brain ab scroll/screenshot/captcha_* bhi bhej sakta hai
+     *  (BRAIN_ALLOWED_ACTIONS) — ye set usi se sync hai. */
     val ALL = setOf(
         "fill", "select", "toggle", "press", "click", "goto",
         "wait_for_text", "wait_for_element", "wait_for_navigation",
         "back", "forward",
-        "upload", "done", "needs_user", "vetoed"
+        "upload", "scroll", "screenshot", "captcha_detect", "captcha_solve",
+        "done", "needs_user", "vetoed"
     )
     /** Terminal actions — execute nahi hote, loop finish karte hain. */
     val TERMINAL = setOf("done", "needs_user", "vetoed")
@@ -44,7 +47,11 @@ object AgentActions {
         "wait_for_navigation" to "wait_for_navigation",
         "back" to "back",
         "forward" to "forward",
-        "upload" to "upload"
+        "upload" to "upload",
+        "scroll" to "scroll",
+        "screenshot" to "screenshot",
+        "captcha_detect" to "captcha_detect",
+        "captcha_solve" to "captcha_solve"
     )
     /** Confidence isse kam ho to step reject (andha action nahi chalega). */
     const val MIN_CONFIDENCE = 0.55

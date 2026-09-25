@@ -126,6 +126,36 @@ fun main() {
     val fspec = agentStepToSpec(mapOf("action" to "forward"))
     check("forward spec mapping", StepParser.parse(fspec).type == "forward")
 
+    // ---- 6. v21: server-brain contract sync (upload/scroll/back/screenshot/captcha_solve) ----
+    check(
+        "scroll allowed (selector optional)",
+        validateAgentStep(mapOf("action" to "scroll")) == null
+    )
+    check(
+        "scroll with selector allowed",
+        validateAgentStep(mapOf("action" to "scroll", "selector" to sel("css", "#more"))) == null
+    )
+    check(
+        "screenshot allowed",
+        validateAgentStep(mapOf("action" to "screenshot")) == null
+    )
+    check(
+        "captcha_solve allowed",
+        validateAgentStep(mapOf("action" to "captcha_solve")) == null
+    )
+    check(
+        "captcha_detect allowed",
+        validateAgentStep(mapOf("action" to "captcha_detect")) == null
+    )
+    val scspec = agentStepToSpec(mapOf("action" to "scroll", "selector" to sel("css", "#more")))
+    check("scroll spec mapping", StepParser.parse(scspec).type == "scroll")
+    val shspec = agentStepToSpec(mapOf("action" to "screenshot"))
+    check("screenshot spec mapping", StepParser.parse(shspec).type == "screenshot")
+    val csspec = agentStepToSpec(mapOf("action" to "captcha_solve"))
+    check("captcha_solve spec mapping", StepParser.parse(csspec).type == "captcha_solve")
+    val cdspec = agentStepToSpec(mapOf("action" to "captcha_detect"))
+    check("captcha_detect spec mapping", StepParser.parse(cdspec).type == "captcha_detect")
+
     if (failures > 0) {
         println("$failures FAILURES")
         kotlin.system.exitProcess(1)

@@ -49,7 +49,7 @@ fun main() {
         "wait_for_element", "wait_for_text", "wait_for_navigation",
         "screenshot", "captcha_detect", "captcha_solve", "back", "forward"
     )
-    check("type count = 15 (14 + upload)", StepParser.TYPES.size == 15)
+    check("type count = 16 (15 + scroll)", StepParser.TYPES.size == 16)
     for (t in types) {
         val s = StepParser.parse(mapOf("type" to t))
         check("parse type '$t'", s.type == t)
