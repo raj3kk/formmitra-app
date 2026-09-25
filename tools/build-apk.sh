@@ -143,7 +143,7 @@ test -f $OUT/gen/com/formmitra/app/R.java
 echo "== 3. kotlinc =="
 find $APP/java -name "*.kt" -o -name "*.java" > $OUT/sources.txt
 wc -l $OUT/sources.txt
-$PTOOLS/kotlinc/bin/kotlinc -jvm-target 17 -no-reflect \
+$PTOOLS/kotlinc/bin/kotlinc -J-Xmx2g -jvm-target 17 -no-reflect \
   -cp "$CP" -d $OUT/classes @$OUT/sources.txt 2>&1 | grep -v "^warning:"; test ${PIPESTATUS[0]} -eq 0
 
 echo "== 3b. library R classes =="
