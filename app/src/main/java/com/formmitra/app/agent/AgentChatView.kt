@@ -670,6 +670,53 @@ class AgentChatView(
                                 "🔁 Dobara bhejo"
                             ) { lastFailedText?.let { doSend(it) } }
                         }
+                        // VERIFY-BEFORE-SAVE contract (server 4c5e1df2): bina
+                        // confirmed:true ke chat draft_profile + needs_confirmation
+                        // wapas karta hai — usi existing verify dialog me dikhao.
+                        // Proceed = PUT /api/agent/profile se save, Cancel = kuch nahi.
+                        val draftObj = json?.optJSONObject("draft_profile")
+                        if (json?.optBoolean("needs_confirmation", false) == true &&
+                            draftObj != null && draftObj.length() > 0
+                        ) {
+                            val draftMap = LinkedHashMap<String, String>()
+                            for (k in DetailExtractor.orderedKeys()) {
+                                val v = draftObj.optString(k, "").trim()
+                                if (v.isNotEmpty() && v != "null") draftMap[k] = v
+                            }
+                            val extraKeys = draftObj.keys()
+                            while (extraKeys.hasNext()) {
+                                val k = extraKeys.next()
+                                if (!draftMap.containsKey(k)) {
+                                    val v = draftObj.optString(k, "").trim()
+                                    if (v.isNotEmpty() && v != "null") draftMap[k] = v
+                                }
+                            }
+                            if (draftMap.isNotEmpty()) {
+                                showVerifyDialog(
+                                    draftMap,
+                                    title = "✔️ Details verify karo",
+                                    subtitle = "AI ne ye details nikali hain. Sahi hain to Proceed dabao — " +
+                                        "bina Proceed ke kuch save nahi hoga.",
+                                    positiveLabel = "✅ Sahi hai — save karo",
+                                    onProceed = { verified ->
+                                        sessionDetails.putAll(verified)
+                                        Thread {
+                                            val ok = try {
+                                                AgentApi.saveProfile(context, verified)
+                                            } catch (_: Exception) { false }
+                                            post {
+                                                toast(if (ok) "✓ Details save ho gayi" else "⚠️ Save me dikkat — baad me try karo")
+                                            }
+                                        }.start()
+                                    },
+                                    onCancel = { toast("Details save nahi hui") }
+                                )
+                            }
+                        }
+                        val savedArr = json?.optJSONArray("saved")
+                        if (savedArr != null && savedArr.length() > 0) {
+                            toast("✓ Details save ho gayi")
+                        }
                     }
                     else -> addErrorBubble(
                         "⚠️ Server se dikkat (code ${res.code}) — message nahi gaya.",

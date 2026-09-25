@@ -202,6 +202,38 @@ object AgentApi {
         }
     }
 
+    /**
+     * PUT /api/agent/profile — vault profile save.
+     * VERIFY-BEFORE-SAVE contract: `confirmed` absent bhejo → server save karta hai
+     * (confirmed:false = draft mode, save nahi hota).
+     * @return true agar 2xx aaya.
+     */
+    fun saveProfile(ctx: Context, fields: Map<String, String>): Boolean {
+        val body = JSONObject()
+        for ((k, v) in fields) body.put(k, v)
+        val res = put("/api/agent/profile", ctx, body)
+        return res.code in 200..299
+    }
+
+    private fun put(path: String, ctx: Context, body: JSONObject): ApiResult {
+        val conn = open(path, "PUT", ctx)
+        return try {
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            val json = try { if (text.isNotBlank()) JSONObject(text) else null }
+            catch (_: Exception) { null }
+            ApiResult(code, json)
+        } catch (_: Exception) {
+            ApiResult(-1, null)
+        } finally {
+            conn.disconnect()
+        }
+    }
+
     private fun get(path: String, ctx: Context): ApiResult {
         val conn = open(path, "GET", ctx)
         return try {
