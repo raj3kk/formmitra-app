@@ -46,7 +46,12 @@ class HomeView(
 
     private val liveBtn: Button
 
-    private fun dp(v: Int): Int = with(UiKit) { dp(v) }
+    // v23 FIX: pehle `with(UiKit) { dp(v) }` tha — UiKit.dp ek Context
+    // extension hai, UiKit receiver par apply nahi hota, isliye dp(v)
+    // khud ko hi call karke infinite recursion → StackOverflowError
+    // (v21/v22 launch crash). Ab seedha formula.
+    private fun dp(v: Int): Int =
+        (v * resources.displayMetrics.density).toInt()
 
     /** Work-wise category: key = server ko bheja jane wala exact `category` value. */
     private data class WorkCat(

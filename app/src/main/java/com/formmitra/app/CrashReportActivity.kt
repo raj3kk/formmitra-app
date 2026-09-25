@@ -25,6 +25,17 @@ class CrashReportActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val report = CrashCatcher.readReport(this)
+        // v23: poori report MBs ki ho sakti hai (StackOverflow trace) —
+        // clipboard par chhota, kaam ka hissa bhejo taaki copy fail na ho.
+        val copyText = run {
+            val lines = report.lines()
+            val head = lines.take(40)
+            val tail = if (lines.size > 50) lines.takeLast(10) else emptyList()
+            val mid = if (lines.size > 50)
+                listOf("... [beech ki ${lines.size - 50} lines kati — poori report app ke files me hai] ...")
+            else emptyList()
+            (head + mid + tail).joinToString("\n").take(48_000)
+        }
         val summary = if (report.isEmpty()) {
             "Report nahi mili."
         } else {
@@ -78,7 +89,7 @@ class CrashReportActivity : Activity() {
             setOnClickListener {
                 try {
                     val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
-                    cm.setPrimaryClip(ClipData.newPlainText("crash", report))
+                    cm.setPrimaryClip(ClipData.newPlainText("crash", copyText))
                     Toast.makeText(
                         this@CrashReportActivity,
                         "Copy ho gaya — hume bhej do",

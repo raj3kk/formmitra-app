@@ -18,8 +18,8 @@ rm -rf $OUT && mkdir -p $OUT/{aar,classes,dex,res}
 export JAVA_HOME=$PTOOLS/jdk-17
 export PATH=$JAVA_HOME/bin:$PATH
 APPID="com.formmitra.app"
-VERSION_CODE=22
-VERSION_NAME="1.0.22-v22"
+VERSION_CODE=23
+VERSION_NAME="1.0.23-v23"
 SITE_URL="https://formmitra-git-main-webbuilder1.vercel.app/"
 # Output APK name parameterized — v1 APK (formmitra-v1.apk) untouched rehta hai.
 APK_NAME="formmitra-v${VERSION_CODE}.apk"
