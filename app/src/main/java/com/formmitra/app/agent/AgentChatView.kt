@@ -670,10 +670,12 @@ class AgentChatView(
                                 "🔁 Dobara bhejo"
                             ) { lastFailedText?.let { doSend(it) } }
                         }
-                        // VERIFY-BEFORE-SAVE contract (server 4c5e1df2): bina
-                        // confirmed:true ke chat draft_profile + needs_confirmation
-                        // wapas karta hai — usi existing verify dialog me dikhao.
-                        // Proceed = PUT /api/agent/profile se save, Cancel = kuch nahi.
+                        // VERIFY-BEFORE-SAVE contract (server app/api/agent/profile/route.ts):
+                        // CHAT route bina user-confirmation ke draft_profile +
+                        // needs_confirmation wapas karta hai — usi existing verify
+                        // dialog me dikhao. Proceed = user ne verify kiya →
+                        // PUT /api/agent/profile (confirmed:true) se save.
+                        // Cancel = kuch nahi.
                         val draftObj = json?.optJSONObject("draft_profile")
                         if (json?.optBoolean("needs_confirmation", false) == true &&
                             draftObj != null && draftObj.length() > 0

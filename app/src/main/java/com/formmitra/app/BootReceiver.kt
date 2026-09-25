@@ -3,6 +3,11 @@ package com.formmitra.app
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.util.Log
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
+import java.util.concurrent.TimeUnit
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -13,30 +18,29 @@ class BootReceiver : BroadcastReceiver() {
                 Scheduler.scheduleDigest(context)
                 Scheduler.scheduleFormTasks(context)
             } catch (t: Throwable) {
-                android.util.Log.e("BootReceiver", "Scheduler failed (non-fatal)", t)
+                Log.e("BootReceiver", "Scheduler failed (non-fatal)", t)
             }
             // Standalone (offline) tasks: reboot par dobara uthao — ye poori
             // tarah local hain, isliye auto-resume safe hai.
             try {
-                val pending = com.formmitra.app.engine.StandaloneStore.pending(context)
-                for (t in pending) {
-                    val task = org.json.JSONObject()
-                        .put("name", t.goal)
-                        .put("target_url", t.url)
-                        .put("run_id", t.id)
-                        .put("standalone", true)
-                        .put(
-                            "steps",
-                            org.json.JSONArray().put(
-                                org.json.JSONObject()
-                                    .put("type", "agent_run")
-                                    .put("goal", t.goal)
-                                    .put("url", t.url)
-                            )
-                        )
-                    com.formmitra.app.engine.FormRunService.startWithTask(context, task)
+                StandaloneResumeWorker.resumeStandalone(context)
+            } catch (e: Exception) {
+                // H4: khaali catch me resume silently skip NAHI hoga — Log.e +
+                // WorkManager one-time retry (2 min baad).
+                Log.e("BootReceiver", "standalone resume failed — one-time retry scheduled", e)
+                try {
+                    val req = OneTimeWorkRequestBuilder<StandaloneResumeWorker>()
+                        .setInitialDelay(2, TimeUnit.MINUTES)
+                        .build()
+                    WorkManager.getInstance(context).enqueueUniqueWork(
+                        "formmitra-standalone-resume-retry",
+                        ExistingWorkPolicy.REPLACE,
+                        req
+                    )
+                } catch (e2: Exception) {
+                    Log.e("BootReceiver", "retry schedule bhi fail hua", e2)
                 }
-            } catch (_: Exception) { }
+            }
         }
     }
 }

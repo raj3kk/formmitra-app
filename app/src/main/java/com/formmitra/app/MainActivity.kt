@@ -529,6 +529,12 @@ class MainActivity : Activity() {
                 grantResults[0] == PackageManager.PERMISSION_GRANTED
             agentChatView.onVoicePermissionResult(granted)
         }
+        // H5: PromptDialog ke mic ka permission result (chat wale flow jaisa).
+        if (requestCode == com.formmitra.app.agent.PromptDialog.REQ_PROMPT_VOICE_PERM) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            com.formmitra.app.agent.PromptDialog.onVoicePermissionResult(this, granted)
+        }
     }
 
     // Fire-and-forget update check — 404/offline: chup-chaap ignore.

@@ -79,6 +79,9 @@ class FormRunService : Service() {
         val stepsJson = task.optJSONArray("steps") ?: JSONArray()
         val total = stepsJson.length()
         var lastReported = 0
+        // Standalone (offline) task: server bilkul nahi — Groq direct + local store
+        val standalone = task.optBoolean("standalone", false) ||
+            runId.startsWith("local-")
 
         val engine = FormEngine(this)
         val firstStep = stepsJson.optJSONObject(0)
@@ -93,7 +96,7 @@ class FormRunService : Service() {
                     this, engine, goal, url, runId, 40,
                     onProgress = { aiStep ->
                         val mode = when {
-                            standaloneMode -> "agent_standalone"
+                            standalone || standaloneMode -> "agent_standalone"
                             offlineMode -> "agent_offline"
                             else -> "agent"
                         }
@@ -104,14 +107,15 @@ class FormRunService : Service() {
                             .put("mode", mode)
                         FormApi.report(this, runId, payload)
                         val suffix = when {
-                            standaloneMode -> " (standalone)"
+                            standalone || standaloneMode -> " (standalone)"
                             offlineMode -> " (offline mode)"
                             else -> ""
                         }
                         updateOngoing("Form bhar raha hai: $name", "AI step $aiStep / 40$suffix")
                     },
                     onOfflineMode = { offlineMode = true },
-                    onStandaloneMode = { standaloneMode = true }
+                    onStandaloneMode = { standaloneMode = true },
+                    forceStandalone = standalone
                 )
             } else {
                 engine.runTask(task) { step1Based, _ ->
@@ -145,6 +149,12 @@ class FormRunService : Service() {
         try {
             FormApi.report(this, runId, terminal)
         } catch (_: Exception) { }
+        // Standalone task ka terminal status local store me (reboot-resume ke liye)
+        if (standalone) {
+            try {
+                StandaloneStore.setStatus(this, runId, result.status)
+            } catch (_: Exception) { }
+        }
 
         // User notification (Hinglish)
         when (result.status) {

@@ -204,13 +204,16 @@ object AgentApi {
 
     /**
      * PUT /api/agent/profile — vault profile save.
-     * VERIFY-BEFORE-SAVE contract: `confirmed` absent bhejo → server save karta hai
-     * (confirmed:false = draft mode, save nahi hota).
+     * VERIFY-BEFORE-SAVE contract (server app/api/agent/profile/route.ts):
+     * confirmed:false = draft mode (save NAHI hota); confirmed:true/absent = save.
+     * Ye call hamesha user ke Proceed (verify dialog) ke BAAD hoti hai, isliye
+     * confirmed:true explicit bhejo — intent unambiguous rahe.
      * @return true agar 2xx aaya.
      */
     fun saveProfile(ctx: Context, fields: Map<String, String>): Boolean {
         val body = JSONObject()
         for ((k, v) in fields) body.put(k, v)
+        body.put("confirmed", true)
         val res = put("/api/agent/profile", ctx, body)
         return res.code in 200..299
     }
