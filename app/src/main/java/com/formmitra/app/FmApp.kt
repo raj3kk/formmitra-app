@@ -5,6 +5,7 @@ import android.util.Log
 import androidx.work.Configuration
 import androidx.work.WorkManager
 import com.formmitra.app.agent.FcmPush
+import com.formmitra.app.agent.FmRealtime
 import com.formmitra.app.agent.NotifCenter
 import com.formmitra.app.agent.PendingPromptStore
 import com.formmitra.app.agent.WorkingMode
@@ -120,6 +121,14 @@ class FmApp : Application(), Configuration.Provider {
             }
         } catch (t: Throwable) {
             Log.e("FmApp", "UserPrompt listeners failed (non-fatal)", t)
+        }
+        // v29 P8: realtime server↔app coordination — app open par start
+        // (foreground live updates; background me FCM + polling pehle jaise).
+        // Login nahi to chup-chaap skip (MainActivity.onResume retry karega).
+        try {
+            FmRealtime.start(this)
+        } catch (t: Throwable) {
+            Log.e("FmApp", "FmRealtime start failed (non-fatal)", t)
         }
         // J1: FCM init (best-effort). google-services.json me com.formmitra.app
         // client na ho to skip — polling fallback tab bhi zinda rehta hai.

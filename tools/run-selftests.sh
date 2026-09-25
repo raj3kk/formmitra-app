@@ -71,6 +71,27 @@ run_test_v29() {
 }
 run_test_v29
 
+# v29 P8: realtime pure logic — WsFrame/PhoenixMsg/MiniJson/RealtimeChannel/
+# RealtimeCrypto (RealtimeSocket.kt ke pure objects; runtime par sirf ye
+# chhute hain — android/org.json stubs load nahi hote).
+run_test_v29_realtime() {
+  local name="selftest_v29_realtime"
+  echo "== $name =="
+  "$KOTLINC" -J-Xmx1g -cp "$ANDR_JAR" \
+    "$SRC/agent/RealtimeSocket.kt" \
+    "$APP/tools/selftest/SelfTestV29Realtime.kt" \
+    -d "$OUT/$name" >"$OUT/$name.log" 2>&1
+  if [ $? -ne 0 ]; then echo "COMPILE FAILED:"; tail -20 "$OUT/$name.log"; TOTAL_FAIL=$((TOTAL_FAIL+1)); return; fi
+  java -cp "$OUT/$name:$STDLIB" SelfTestV29RealtimeKt 2>&1 | tee "$OUT/$name.out" | grep -E "^(PASS|FAIL)" | tail -3
+  local fails passes
+  fails=$(grep -cE "^(FAIL|Exception in thread)" "$OUT/$name.out" || true)
+  passes=$(grep -cE "^PASS" "$OUT/$name.out" || true)
+  echo "-> $name PASS: $passes FAIL: $fails"
+  TOTAL_FAIL=$((TOTAL_FAIL+fails))
+  TOTAL_PASS=$((TOTAL_PASS+passes))
+}
+run_test_v29_realtime
+
 echo "==============================="
 echo "TOTAL PASS: $TOTAL_PASS"
 echo "TOTAL FAILURES: $TOTAL_FAIL"

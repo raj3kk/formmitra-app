@@ -306,6 +306,26 @@ class MainActivity : Activity() {
         // K1: notification tap ka deep link — seedha sahi screen par.
         handleNotifDeepLink(intent)
 
+        // v29 P8: realtime — task_status aaye to History UI turant refresh
+        // (socket thread par aata hai, isliye main thread par lao).
+        // Polling fallback chheda NAHI — ye sirf fast-path hai.
+        try {
+            com.formmitra.app.agent.FmRealtime.onTaskEvent = { _, _ ->
+                runOnUiThread {
+                    try {
+                        if (::historyView.isInitialized &&
+                            historyView.visibility == View.VISIBLE
+                        ) {
+                            historyView.onTabShown()
+                        }
+                    } catch (_: Exception) { }
+                }
+            }
+            com.formmitra.app.agent.FmRealtime.start(this)
+        } catch (t: Throwable) {
+            android.util.Log.e("MainActivity", "FmRealtime start failed (non-fatal)", t)
+        }
+
         // FmApp.onCreate me WorkManager pehle hi init ho chuka hai (v15 fix).
         // Belt-and-braces: scheduler kabhi launch crash na banaye.
         try {
@@ -395,6 +415,11 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        // v29 P8: login WebView me hota hai — onResume par realtime (re)try
+        // (login nahi to chup-chaap skip; start() idempotent hai).
+        try {
+            com.formmitra.app.agent.FmRealtime.start(this)
+        } catch (_: Exception) { }
         // App-wide prompt poller: user kisi bhi tab me ho, agent ka sawal
         // (OTP/input/choice/payment) popup me aayega.
         promptHandler.post(promptPollRunnable)
@@ -686,6 +711,11 @@ class MainActivity : Activity() {
     private fun doLogout() {
         try {
             CookieManager.getInstance().removeAllCookies(null)
+        } catch (_: Exception) { }
+        // v29 P8: logout par realtime socket band (doosre user ka channel
+        // kabhi subscribe nahi hona chahiye).
+        try {
+            com.formmitra.app.agent.FmRealtime.stop()
         } catch (_: Exception) { }
         try {
             if (::profileView.isInitialized) profileView.onLoggedOut()
