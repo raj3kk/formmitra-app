@@ -1,6 +1,8 @@
+import com.formmitra.app.agent.CardJson
 import com.formmitra.app.agent.CardSaveVerifier
 import com.formmitra.app.agent.TagRegistry
 import com.formmitra.app.agent.VoiceGenderHint
+import org.json.JSONObject
 
 // Self-test: v29 P2/P3/P4 pure logic.
 //  - P4: TagRegistry exact 25-key server taxonomy (order + labels + aliases)
@@ -129,6 +131,50 @@ fun main() {
     // unknown
     check("unknown voice 0", VoiceGenderHint.hintOf("some-random-voice") == 0)
     check("empty voice 0", VoiceGenderHint.hintOf("") == 0)
+
+    // ============ v30: CardJson.detailsOf + storedValuesFrom (ROOT FIX #1)
+    // Realistic server shape: GET /api/cards/[id] → {card:{details:{...}}}
+    fun serverCardJson(): JSONObject {
+        val det = JSONObject()
+            .put("aadhar_no", JSONObject().put("value", "123456789012").put("tag", "Aadhar No."))
+            .put("full_name", JSONObject().put("value", "Ravi Kumar").put("tag", "Full Name"))
+        val card = JSONObject()
+            .put("id", "c1")
+            .put("name", "Test Card")
+            .put("formmitra_id", "FM-0001")
+            .put("details", det)
+        return JSONObject().put("card", card)
+    }
+    val nested = serverCardJson()
+    val dNested = CardJson.detailsOf(nested)
+    check("detailsOf nested → aadhar_no value", dNested?.optJSONObject("aadhar_no")?.optString("value") == "123456789012")
+    check("detailsOf nested → full_name value", dNested?.optJSONObject("full_name")?.optString("value") == "Ravi Kumar")
+    check("detailsOf nested → tag", dNested?.optJSONObject("aadhar_no")?.optString("tag") == "Aadhar No.")
+    // top-level fallback shape (legacy/mock)
+    val topLevel = JSONObject().put("details", JSONObject().put("phone", JSONObject().put("value", "9999999999").put("tag", "Phone")))
+    check("detailsOf fallback top-level", CardJson.detailsOf(topLevel)?.optJSONObject("phone")?.optString("value") == "9999999999")
+    // missing card → null (crash nahi)
+    check("detailsOf null input", CardJson.detailsOf(null) == null)
+    check("detailsOf empty", CardJson.detailsOf(JSONObject()) == null)
+    check("detailsOf card without details", CardJson.detailsOf(JSONObject().put("card", JSONObject().put("id", "c1"))) == null)
+    // v29 ka bug yahin tha: top-level padhne se nested shape khaali milti thi
+    check("detailsOf old-bug-shape returns null", JSONObject().put("card", JSONObject()).optJSONObject("details") == null)
+    // storedValuesFrom — nested server shape par values milein
+    val stored = CardSaveVerifier.storedValuesFrom(nested)
+    check("storedValuesFrom nested aadhar_no", stored["aadhar_no"] == "123456789012")
+    check("storedValuesFrom nested full_name", stored["full_name"] == "Ravi Kumar")
+    check("storedValuesFrom nested 2 keys", stored.size == 2)
+    check("storedValuesFrom top-level fallback", CardSaveVerifier.storedValuesFrom(topLevel)["phone"] == "9999999999")
+    check("storedValuesFrom null → empty", CardSaveVerifier.storedValuesFrom(null).isEmpty())
+    check("storedValuesFrom missing card → empty", CardSaveVerifier.storedValuesFrom(JSONObject()).isEmpty())
+    // end-to-end: verify-after-write nested re-read par PASS (v29 ka false Mismatch)
+    check(
+        "verify nested re-read matches",
+        CardSaveVerifier.verifyValues(
+            mapOf("aadhar_no" to "123456789012", "full_name" to "Ravi Kumar"),
+            CardSaveVerifier.storedValuesFrom(nested)
+        )
+    )
 
     println("----")
     if (failures == 0) println("ALL V29 TESTS PASSED")

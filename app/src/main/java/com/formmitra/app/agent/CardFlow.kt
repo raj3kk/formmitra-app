@@ -265,7 +265,10 @@ object CardFlow {
             catch (_: Exception) { AgentApi.ApiResult(-1, null) }
             val prefill = LinkedHashMap<String, String>()
             if (res.code in 200..299) {
-                val det = res.json?.optJSONObject("details")
+                // v30 ROOT FIX: cardDetail NESTED {card:{details}} bhejta
+                // hai — top-level optJSONObject("details") hamesha null
+                // deta tha → prefill hamesha khaali. CardJson.detailsOf se.
+                val det = CardJson.detailsOf(res.json)
                 if (det != null) {
                     val keys = det.keys()
                     while (keys.hasNext()) {

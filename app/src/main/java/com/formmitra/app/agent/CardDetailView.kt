@@ -276,7 +276,11 @@ class CardDetailView(
                     detailsCount.text = "Load nahi hui"
                     return@post
                 }
-                renderDetails(det.json?.optJSONObject("details"))
+                // v30 ROOT FIX: cardDetail NESTED {card:{details}} bhejta hai —
+                // top-level optJSONObject("details") hamesha null deta tha →
+                // CardDetailView hamesha khaali render hota tha. Ab
+                // CardJson.detailsOf (card wrapper → top-level fallback).
+                renderDetails(CardJson.detailsOf(det.json))
                 renderDocs(docs)
             }
         }, "fm-carddetail-load").start()

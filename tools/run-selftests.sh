@@ -2,6 +2,16 @@
 # FormMitra v28 app selftests — pure-Kotlin unit tests (no Android).
 # Usage: bash tools/run-selftests.sh
 set -u
+# v30: kotlinc/java ke liye JDK chahiye — PATH me java na mile to
+# phone-agent wala JDK-17 fallback (warna "java: command not found" se
+# saare suite COMPILE FAILED ho jate hain — false red).
+if ! command -v java >/dev/null 2>&1; then
+  JDK17="$HOME/workspace/phone-agent/tools/jdk-17"
+  if [ -x "$JDK17/bin/java" ]; then
+    export JAVA_HOME="$JDK17"
+    export PATH="$JDK17/bin:$PATH"
+  fi
+fi
 APP=~/workspace/formmitra-app/app-android
 SRC=$APP/app/src/main/java/com/formmitra/app
 KOTLINC=~/workspace/phone-agent/tools/kotlinc/bin/kotlinc
@@ -56,12 +66,17 @@ run_test_v29() {
   echo "== $name =="
   "$KOTLINC" -J-Xmx1g -cp "$ANDR_JAR" \
     "$SRC/agent/TagRegistry.kt" \
+    "$SRC/agent/CardJson.kt" \
     "$SRC/agent/CardSaveVerifier.kt" \
     "$SRC/agent/VoiceOutput.kt" \
     "$APP/tools/selftest/SelfTestV29.kt" \
     -d "$OUT/$name" >"$OUT/$name.log" 2>&1
   if [ $? -ne 0 ]; then echo "COMPILE FAILED:"; tail -20 "$OUT/$name.log"; TOTAL_FAIL=$((TOTAL_FAIL+1)); return; fi
-  java -cp "$OUT/$name:$STDLIB" SelfTestV29Kt 2>&1 | tee "$OUT/$name.out" | grep -E "^(PASS|FAIL)" | tail -3
+  # v30: detailsOf/storedValuesFrom tests org.json ko runtime par chhoote
+  # hain. android.jar ke org.json classes "Stub!" hain (runtime par
+  # crash) — isliye REAL org.json reference jar pehle, android.jar baad me.
+  ORGJSON=$APP/tools/lib/json-20231013.jar
+  java -cp "$OUT/$name:$ORGJSON:$STDLIB:$ANDR_JAR" SelfTestV29Kt 2>&1 | tee "$OUT/$name.out" | grep -E "^(PASS|FAIL)" | tail -3
   local fails passes
   fails=$(grep -cE "^(FAIL|Exception in thread)" "$OUT/$name.out" || true)
   passes=$(grep -cE "^PASS" "$OUT/$name.out" || true)

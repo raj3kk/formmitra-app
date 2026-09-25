@@ -62,11 +62,16 @@ object CardSaveVerifier {
 
     /**
      * GET cardDetail JSON → key → value map (re-read ke liye).
+     *
+     * v30 ROOT FIX: server hamesha NESTED {card:{details:{...}}} bhejta
+     * hai — yahan pehle top-level optJSONObject("details") padha jata
+     * tha (hamesha null) → verify hamesha "Mismatch". Ab CardJson.detailsOf
+     * (card wrapper → top-level fallback) se parse hota hai.
      */
     fun storedValuesFrom(cardJson: JSONObject?): Map<String, String> {
         val out = LinkedHashMap<String, String>()
         try {
-            val det = cardJson?.optJSONObject("details") ?: return out
+            val det = CardJson.detailsOf(cardJson) ?: return out
             val it = det.keys()
             while (it.hasNext()) {
                 val k = it.next()
