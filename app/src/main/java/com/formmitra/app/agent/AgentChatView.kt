@@ -289,33 +289,72 @@ class AgentChatView(
         scroll.addView(messageList)
         addView(scroll)
 
-        // Input row: [📎] [text] [🎤] [🔊] [➤]
-        // v20 Task 1 BULLETPROOF: explicit MATCH_PARENT x WRAP_CONTENT +
-        // minimumHeight — ye row kabhi collapse nahi hogi, hamesha dikhegi.
+        // v27 (RC2): 2-row input area.
+        // ROOT CAUSE: plain Button ka platform default minWidth=88dp hota hai —
+        // 4 chaude buttons Row B me EditText ko dabaa dete the (360dp screen
+        // par EditText ~0dp). Isliye type-box kabhi dikha hi nahi, aur live
+        // voice transcription (jo input me likhta hai) bhi invisible thi.
+        // Ab har button par minimumWidth=0 + compact text/padding — EditText
+        // ko 360dp screen par ~190dp milta hai.
         // Manifest me windowSoftInputMode="adjustResize" hai, isliye keyboard
-        // khulne par window shrink hogi aur ye row keyboard ke upar rahegi.
+        // khulne par window shrink hogi aur ye area keyboard ke upar rahega.
+        val inputArea = LinearLayout(context).apply {
+            orientation = VERTICAL
+            setPadding(pad, dp(4), pad, pad)
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            )
+        }
+        // ---- Row A (slim): [Upload] [🔊 Awaaz ON/OFF] ----
+        val toolRow = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(4))
+        }
+        val uploadBtn = Button(context).apply {
+            text = "Upload"
+            textSize = 13f
+            minimumWidth = 0
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            layoutParams = LayoutParams(
+                LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, 0, dp(8), 0) }
+            setOnClickListener { onAttachClick() }
+        }
+        toolRow.addView(uploadBtn)
+        // 🔊 speaker toggle — agent ke jawab bol ke sunao (Row A me shift)
+        val speakBtn = Button(context).apply {
+            fun label(on: Boolean) = if (on) "🔊 Awaaz ON" else "🔇 Awaaz OFF"
+            text = label(VoiceOutput.isEnabled(context))
+            textSize = 13f
+            minimumWidth = 0
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            layoutParams = LayoutParams(
+                LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT
+            )
+            setOnClickListener {
+                val on = !VoiceOutput.isEnabled(context)
+                VoiceOutput.setEnabled(context, on)
+                text = label(on)
+                if (on) VoiceOutput.speak(context, "Awaaz chalu hai")
+            }
+        }
+        toolRow.addView(speakBtn)
+        inputArea.addView(toolRow)
+        // ---- Row B: [text weight=1] [🎤] [Bhejo ➤] ----
         val inputRow = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(pad, dp(6), pad, pad)
             layoutParams = LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
             )
             minimumHeight = dp(56)
         }
-        val attachBtn = Button(context).apply {
-            text = "📎"
-            textSize = 18f
-            layoutParams = LayoutParams(
-                LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 0, dp(4), 0) }
-            setOnClickListener { onAttachClick() }
-        }
-        inputRow.addView(attachBtn)
         input = EditText(context).apply {
             hint = "Yahan likho…"
             textSize = 15f
             imeOptions = EditorInfo.IME_ACTION_SEND
+            minimumHeight = dp(48)
             layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
             background = inputBg()
             setPadding(dp(14), dp(10), dp(14), dp(10))
@@ -350,40 +389,30 @@ class AgentChatView(
         micBtn = Button(context).apply {
             text = "🎤"
             textSize = 18f
+            minimumWidth = 0
+            setPadding(dp(10), dp(6), dp(10), dp(6))
             layoutParams = LayoutParams(
                 LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT
             ).apply { setMargins(dp(4), 0, dp(4), 0) }
             setOnClickListener { onMicClick() }
         }
         inputRow.addView(micBtn)
-        // 🔊 speaker toggle — agent ke jawab bol ke sunao
-        val speakBtn = Button(context).apply {
-            text = if (VoiceOutput.isEnabled(context)) "🔊" else "🔇"
-            textSize = 18f
-            layoutParams = LayoutParams(
-                LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(dp(4), 0, dp(4), 0) }
-            setOnClickListener {
-                val on = !VoiceOutput.isEnabled(context)
-                VoiceOutput.setEnabled(context, on)
-                text = if (on) "🔊" else "🔇"
-                if (on) VoiceOutput.speak(context, "Awaaz chalu hai")
-            }
-        }
-        inputRow.addView(speakBtn)
         sendBtn = Button(context).apply {
             text = "Bhejo ➤"
-            textSize = 18f
+            textSize = 15f
+            minimumWidth = 0
+            setPadding(dp(12), dp(6), dp(12), dp(6))
             layoutParams = LayoutParams(
                 LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(dp(8), 0, 0, 0) }
+            )
             setOnClickListener { sendMessage(input.text.toString()) }
         }
         inputRow.addView(sendBtn)
-        addView(inputRow)
+        inputArea.addView(inputRow)
+        addView(inputArea)
 
         // v20 Task 2: button press feedback (tasteful, halka scale)
-        UiKit.pressFeedback(attachBtn)
+        UiKit.pressFeedback(uploadBtn)
         UiKit.pressFeedback(micBtn)
         UiKit.pressFeedback(speakBtn)
         UiKit.pressFeedback(sendBtn)
@@ -810,7 +839,7 @@ class AgentChatView(
                 sendBtn.isEnabled = true
                 hideTyping()
                 addErrorBubble(
-                    "⏳ Server se jawab nahi aaya (timeout).",
+                    "⏳ Jawab aane me der ho rahi hai.",
                     "🔁 Dobara bhejo"
                 ) { lastFailedText?.let { doSend(it) } }
             }
@@ -984,7 +1013,7 @@ class AgentChatView(
                         }
                     }
                     else -> addErrorBubble(
-                        "⚠️ Server se baat nahi ho payi — message nahi gaya.",
+                        "⚠️ Baat nahi ho payi — message nahi gaya.",
                         "🔁 Dobara bhejo"
                     ) { lastFailedText?.let { doSend(it) } }
                 }
@@ -1252,9 +1281,8 @@ class AgentChatView(
                         code == 401 -> "Pehle Profile tab me login karo 🔑"
                         offline && com.formmitra.app.engine.Standalone.isConfigured(context) ->
                             startStandaloneTask(title, url)
-                        code == -1 -> "Internet nahi hai 📡 — server bhi nahi mil raha. " +
-                            "Standalone ab server-managed hai."
-                        else -> "Task ban nahi paya — server se baat nahi ho payi. Dobara try karo."
+                        code == -1 -> "Internet nahi hai 📡 — offline kaam tayyar nahi hai."
+                        else -> "Kaam shuru nahi ho paya — dobara try karo."
                     }
                 } else {
                     val runCode = AgentApi.runNow(context, taskId)
@@ -1304,7 +1332,7 @@ class AgentChatView(
                     )
                 )
             com.formmitra.app.engine.FormRunService.startWithTask(context, task)
-            "Server nahi mil raha — standalone mode me shuru kiya ✅\n" +
+            "Internet nahi hai — phone me hi shuru kiya ✅\n" +
                 "Progress notification me dikhega."
         } catch (e: Exception) {
             "Standalone task shuru nahi ho paya — dobara try karo."
@@ -1599,7 +1627,7 @@ class AgentChatView(
                 when (code) {
                     -1 -> "Internet nahi hai 📡"
                     401 -> "Pehle Profile tab me login karo 🔑"
-                    else -> "Task ban nahi paya — server se baat nahi ho payi. Dobara try karo."
+                    else -> "Kaam shuru nahi ho paya — dobara try karo."
                 }
             } else {
                 val runCode = AgentApi.runNow(context, taskId)

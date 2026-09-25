@@ -32,7 +32,7 @@ object UserText {
             "network" in l || "connection" in l || "socket" in l ->
                 "Internet me dikkat hai — connection theek hote hi try karo."
             "code 4" in l || "code 5" in l || "http " in l ->
-                "Server se baat nahi ho payi — thodi der me dobara try karo."
+                "Baat nahi ho payi — thodi der me dobara try karo."
             "exception" in l || "nullpointer" in l ->
                 "Andaruni dikkat aayi — dobara try karo."
             s.length > 160 -> s.take(157) + "…"

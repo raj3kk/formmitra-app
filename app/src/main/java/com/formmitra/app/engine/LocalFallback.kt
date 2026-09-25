@@ -117,7 +117,7 @@ object LocalFallback {
         if (profile.isEmpty()) {
             return FormEngine.RunResult(
                 "needs_user",
-                "Offline mode: server nahi mil raha aur vault profile khaali hai — " +
+                "Offline mode: internet nahi hai aur details khaali hain — " +
                     "profile me details save karke phir try karein",
                 stepsLog
             )

@@ -63,7 +63,7 @@ class FmMessagingService : FirebaseMessagingService() {
                             applicationContext, NotifCenter.Cat.STATUS,
                             title.ifEmpty { "FormMitra" },
                             body.ifEmpty {
-                                "Server se update aaya — Working Mode OFF hai, " +
+                                "Naya update aaya — Working Mode OFF hai, " +
                                     "automation start nahi hua."
                             },
                             deepTab = "/profile"
@@ -144,7 +144,7 @@ class FmMessagingService : FirebaseMessagingService() {
                 "status" -> NotifCenter.notify(
                     applicationContext, NotifCenter.Cat.STATUS,
                     title.ifEmpty { "FormMitra" },
-                    body.ifEmpty { "Server se update aaya hai." },
+                    body.ifEmpty { "Naya update aaya hai." },
                     deepTab = deepTab,
                     deepRunId = runId
                 )

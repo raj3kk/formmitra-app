@@ -77,46 +77,46 @@ class ProfileView(
         orientation = VERTICAL
         setBackgroundColor(Color.parseColor("#FAFBFC"))
         content.orientation = VERTICAL
-        val pad = dp(14)
-        content.setPadding(pad, dp(8), pad, pad * 2)
+        val pad = dp(11)
+        content.setPadding(pad, dp(6), pad, pad)
 
         // ============ (1) 🪪 FormMitra Cards ============
         content.addView(sectionTitle("🪪 FormMitra Cards (फॉर्ममित्र कार्ड)"))
         content.addView(cardsCount.apply {
-            textSize = 12f
+            textSize = 10f
             setTextColor(Color.parseColor("#80868B"))
-            setPadding(0, 0, 0, dp(4))
+            setPadding(0, 0, 0, dp(3))
         })
         val cardBtnRow = LinearLayout(context).apply {
             orientation = HORIZONTAL
         }
         val newCardBtn = Button(context).apply {
             text = "➕ Naya Card (नया कार्ड)"
-            textSize = 14f
+            textSize = 12f
             setOnClickListener { onNewCardClicked() }
         }
         UiKit.pressFeedback(newCardBtn)
         cardBtnRow.addView(newCardBtn.apply {
             layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
-                .apply { setMargins(0, 0, dp(6), 0) }
+                .apply { setMargins(0, 0, dp(4), 0) }
         })
         val refreshBtn = Button(context).apply {
             text = "🔄"
-            textSize = 14f
+            textSize = 12f
             setOnClickListener { loadCards() }
         }
         UiKit.pressFeedback(refreshBtn)
         cardBtnRow.addView(refreshBtn.apply {
             layoutParams = LayoutParams(
                 LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(dp(6), 0, 0, 0) }
+            ).apply { setMargins(dp(4), 0, 0, 0) }
         })
         content.addView(cardBtnRow)
         cardsList.orientation = VERTICAL
         content.addView(cardsList.apply {
             layoutParams = LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, dp(6), 0, 0) }
+            ).apply { setMargins(0, dp(4), 0, 0) }
         })
 
         // ============ (2) 👤 Profile Detail (read-only) ============
@@ -124,43 +124,43 @@ class ProfileView(
         content.addView(TextView(context).apply {
             text = "Ye sirf registration ki pehchan hai — kisi kaam me use NAHI hoti. " +
                 "Kaam ke liye hamesha 🪪 Card ka data use hota hai."
-            textSize = 12f
+            textSize = 10f
             setTextColor(Color.parseColor("#80868B"))
-            setPadding(0, 0, 0, dp(4))
+            setPadding(0, 0, 0, dp(3))
         })
         profileText.apply {
-            textSize = 14f
+            textSize = 12f
             setTextColor(Color.parseColor("#202124"))
             background = with(UiKit) { context.cardBg() }
-            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setPadding(dp(9), dp(8), dp(9), dp(8))
         }
         content.addView(profileText)
 
         // ============ (3) 🔊 Talking Voice ============
         content.addView(sectionTitle("🔊 Talking Voice (बोलने वाली आवाज़)"))
         content.addView(TextView(context).apply {
-            text = "Agent kis awaaz me bole — server jaisa (English/Hindi × Male/Female)."
-            textSize = 12f
+            text = "Agent kis awaaz me bole (English/Hindi × Male/Female)."
+            textSize = 10f
             setTextColor(Color.parseColor("#80868B"))
-            setPadding(0, 0, 0, dp(4))
+            setPadding(0, 0, 0, dp(3))
         })
         voiceLabel.apply {
-            textSize = 14f
+            textSize = 12f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#202124"))
-            setPadding(0, 0, 0, dp(4))
+            setPadding(0, 0, 0, dp(3))
         }
         content.addView(voiceLabel)
         val voiceBtn = Button(context).apply {
             text = "🎙️ Awaaz chuno (आवाज़ चुनें)"
-            textSize = 14f
+            textSize = 12f
             setOnClickListener { showVoicePicker() }
         }
         UiKit.pressFeedback(voiceBtn)
         content.addView(voiceBtn)
         val voiceTestBtn = Button(context).apply {
             text = "🔊 Suno — awaaz parkho (परखें)"
-            textSize = 13f
+            textSize = 11f
             setOnClickListener {
                 VoiceOutput.init(context)
                 VoiceOutput.speak(
@@ -175,7 +175,7 @@ class ProfileView(
         content.addView(voiceTestBtn.apply {
             layoutParams = LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, dp(6), 0, 0) }
+            ).apply { setMargins(0, dp(4), 0, 0) }
         })
         refreshVoiceLabel()
 
@@ -186,11 +186,11 @@ class ProfileView(
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             background = with(UiKit) { context.cardBg() }
-            setPadding(dp(12), dp(8), dp(12), dp(8))
+            setPadding(dp(9), dp(6), dp(9), dp(6))
         }
         wmRow.addView(TextView(context).apply {
             text = "🤖 Working Mode (कार्य मोड)\nBackground automation ON/OFF"
-            textSize = 13f
+            textSize = 11f
             setTextColor(Color.parseColor("#202124"))
             layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
         })
@@ -207,18 +207,18 @@ class ProfileView(
         content.addView(wmRow.apply {
             layoutParams = LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 0, 0, dp(6)) }
+            ).apply { setMargins(0, 0, 0, dp(4)) }
         })
         // Agent voice master toggle
         val voiceRow = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             background = with(UiKit) { context.cardBg() }
-            setPadding(dp(12), dp(8), dp(12), dp(8))
+            setPadding(dp(9), dp(6), dp(9), dp(6))
         }
         voiceRow.addView(TextView(context).apply {
             text = "🔊 Agent ki awaaz (एजेंट की आवाज़)"
-            textSize = 13f
+            textSize = 11f
             setTextColor(Color.parseColor("#202124"))
             layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
         })
@@ -233,12 +233,12 @@ class ProfileView(
         content.addView(voiceRow.apply {
             layoutParams = LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 0, 0, dp(6)) }
+            ).apply { setMargins(0, 0, 0, dp(4)) }
         })
         // Notifications
         val notifBtn = Button(context).apply {
             text = "🔔 Notifications (सूचनाएं)"
-            textSize = 14f
+            textSize = 12f
             setOnClickListener { showNotifSettings() }
         }
         UiKit.pressFeedback(notifBtn)
@@ -246,7 +246,7 @@ class ProfileView(
         // Inbox
         inboxBtn = Button(context).apply {
             text = "📥 Notification Inbox (इनबॉक्स)"
-            textSize = 14f
+            textSize = 12f
             setOnClickListener {
                 NotifInboxView.show(context) { refreshInboxBtn() }
             }
@@ -255,34 +255,34 @@ class ProfileView(
         content.addView(inboxBtn.apply {
             layoutParams = LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, dp(6), 0, 0) }
+            ).apply { setMargins(0, dp(4), 0, 0) }
         })
         // Saved logins (automation)
         content.addView(TextView(context).apply {
             text = "🔑 Saved Logins (सहेजे लॉगिन) — automation ke liye"
-            textSize = 14f
+            textSize = 12f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#202124"))
-            setPadding(0, dp(10), 0, dp(4))
+            setPadding(0, dp(8), 0, dp(3))
         })
         loginsList.orientation = VERTICAL
         content.addView(loginsList)
         // Admin (owner only)
         adminBtn = Button(context).apply {
             text = "🔐 Admin"
-            textSize = 14f
+            textSize = 12f
             visibility = View.GONE
             setOnClickListener { onOpenAdmin() }
         }
         content.addView(adminBtn.apply {
             layoutParams = LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, dp(8), 0, 0) }
+            ).apply { setMargins(0, dp(6), 0, 0) }
         })
         // Logout
         val logoutBtn = Button(context).apply {
             text = "🚪 Logout (लॉगआउट)"
-            textSize = 14f
+            textSize = 12f
             setTextColor(Color.parseColor("#C5221F"))
             setOnClickListener { confirmLogout() }
         }
@@ -290,7 +290,7 @@ class ProfileView(
         content.addView(logoutBtn.apply {
             layoutParams = LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, dp(8), 0, 0) }
+            ).apply { setMargins(0, dp(6), 0, 0) }
         })
 
         mainScroll.addView(
@@ -387,9 +387,9 @@ class ProfileView(
         if (n == 0) {
             cardsList.addView(TextView(context).apply {
                 text = "🪪 Abhi koi card nahi hai.\nKaam shuru karne se pehle card banana zaroori hai."
-                textSize = 13f
+                textSize = 11f
                 setTextColor(Color.parseColor("#80868B"))
-                setPadding(0, dp(4), 0, dp(4))
+                setPadding(0, dp(3), 0, dp(3))
             })
             return
         }
@@ -405,38 +405,38 @@ class ProfileView(
                 orientation = HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 background = with(UiKit) { context.cardBg() }
-                setPadding(dp(12), dp(10), dp(12), dp(10))
+                setPadding(dp(9), dp(8), dp(9), dp(8))
                 isClickable = true
                 isFocusable = true
                 addView(TextView(context).apply {
                     text = "🪪"
-                    textSize = 26f
-                    setPadding(0, 0, dp(8), 0)
+                    textSize = 20f
+                    setPadding(0, 0, dp(6), 0)
                 })
                 addView(LinearLayout(context).apply {
                     orientation = VERTICAL
                     layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
                     addView(TextView(context).apply {
                         text = name + (if (isSel) "  ✅ (chuna hua)" else "")
-                        textSize = 15f
+                        textSize = 13f
                         setTypeface(null, Typeface.BOLD)
                         setTextColor(Color.parseColor("#202124"))
                     })
                     addView(TextView(context).apply {
                         text = "$fid • $dk details • $dc docs"
-                        textSize = 12f
+                        textSize = 10f
                         setTextColor(Color.parseColor("#80868B"))
                     })
                 })
                 addView(TextView(context).apply {
                     text = "🔒"
-                    textSize = 18f
+                    textSize = 15f
                 })
                 setOnClickListener { openCard(c) }
                 UiKit.pressFeedback(this)
                 layoutParams = LayoutParams(
                     LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
-                ).apply { setMargins(0, 0, 0, dp(6)) }
+                ).apply { setMargins(0, 0, 0, dp(4)) }
             })
         }
     }
@@ -620,17 +620,17 @@ class ProfileView(
         }
         val layout = LinearLayout(act).apply {
             orientation = VERTICAL
-            setPadding(dp(24), dp(8), dp(24), dp(8))
+            setPadding(dp(18), dp(6), dp(18), dp(6))
         }
         for ((cat, label) in cats) {
             val row = LinearLayout(act).apply {
                 orientation = HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(6), 0, dp(6))
+                setPadding(0, dp(4), 0, dp(4))
             }
             row.addView(TextView(act).apply {
                 text = label
-                textSize = 14f
+                textSize = 12f
                 setTextColor(Color.parseColor("#202124"))
                 layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
             })
@@ -668,7 +668,7 @@ class ProfileView(
         if (domains.isEmpty()) {
             loginsList.addView(TextView(context).apply {
                 text = "Koi saved login nahi (सहेजे लॉगिन नहीं)"
-                textSize = 12f
+                textSize = 10f
                 setTextColor(Color.parseColor("#80868B"))
             })
             return
@@ -678,21 +678,21 @@ class ProfileView(
                 orientation = HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 background = with(UiKit) { context.cardBg() }
-                setPadding(dp(12), dp(8), dp(12), dp(8))
+                setPadding(dp(9), dp(6), dp(9), dp(6))
                 addView(TextView(context).apply {
                     text = "🔑 $d"
-                    textSize = 13f
+                    textSize = 11f
                     setTextColor(Color.parseColor("#202124"))
                     layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
                 })
                 addView(Button(context).apply {
                     text = "🗑️"
-                    textSize = 13f
+                    textSize = 11f
                     setOnClickListener { confirmDeleteLogin(d) }
                 })
                 layoutParams = LayoutParams(
                     LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
-                ).apply { setMargins(0, 0, 0, dp(6)) }
+                ).apply { setMargins(0, 0, 0, dp(4)) }
             })
         }
     }
@@ -725,7 +725,7 @@ class ProfileView(
         val act = context as? Activity ?: return
         AlertDialog.Builder(act)
             .setTitle("🚪 Logout? (लॉगआउट?)")
-            .setMessage("Website se logout ho jayega. Cards server par surakshit rahenge.")
+            .setMessage("Website se logout ho jayega. Cards surakshit rahenge.")
             .setPositiveButton("🚪 Haan, logout") { d, _ ->
                 d.dismiss()
                 onLogout()
@@ -739,9 +739,9 @@ class ProfileView(
     private fun sectionTitle(t: String): TextView =
         TextView(context).apply {
             text = t
-            textSize = 17f
+            textSize = 14f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#1A73E8"))
-            setPadding(0, dp(12), 0, dp(6))
+            setPadding(0, dp(9), 0, dp(4))
         }
 }

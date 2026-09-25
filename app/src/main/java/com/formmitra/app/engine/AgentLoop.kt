@@ -439,7 +439,7 @@ object AgentLoop {
                     if (noteError(i, "act", "server se step nahi mila (code=${res.code})")) {
                         return finish(
                             "needs_user",
-                            "Server se jawab nahi mil raha — phas gaya hoon, aap dekh lein"
+                            "Jawab nahi mil raha — atak gaya hoon, aap dekh lein"
                         )
                     }
                     continue
@@ -506,7 +506,7 @@ object AgentLoop {
                     "vetoed" -> return finish(
                         "vetoed",
                         ((stepMap["blocked_reason"] as? String)?.ifEmpty { null }
-                            ?: "Server ne roka — payment/safety")
+                            ?: "Rok diya gaya — payment/safety")
                     )
                 }
 

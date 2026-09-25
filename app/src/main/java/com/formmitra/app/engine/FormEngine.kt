@@ -1230,7 +1230,7 @@ class FormEngine(private val appContext: Context) {
             FormApi.captcha(appContext, currentRunId(), shot, note)
         } catch (_: Exception) { }
         throw NeedsAdminException(
-            "captcha mila ($kind) — screenshot server ko bhej diya, admin solve karein"
+            "captcha mila — hal kar rahe hain"
         )
     }
 

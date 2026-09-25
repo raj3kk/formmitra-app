@@ -223,9 +223,18 @@ object AgentApi {
             .put("steps", steps)
         if (category.isNotEmpty()) body.put("category", category)
         val res = post("/api/app/form-tasks", ctx, body)
-        val id = res.json?.let {
-            val a = it.optString("id", "")
-            if (a.isNotEmpty()) a else it.optString("task_id", "").ifEmpty { null }
+        // v27 RC1 FIX: server `{ task: { id } }` (nested) bhejta hai —
+        // top-level `id`/`task_id` kabhi nahi hota tha, isliye task server
+        // par banne ke baad bhi app ko id null milta tha ("ban nahi paya").
+        // Pehle nested, phir top-level fallback.
+        val id = res.json?.let { j ->
+            val nested = j.optJSONObject("task")?.optString("id", "").orEmpty()
+            when {
+                nested.isNotEmpty() -> nested
+                j.optString("id", "").isNotEmpty() -> j.optString("id")
+                j.optString("task_id", "").isNotEmpty() -> j.optString("task_id")
+                else -> null
+            }
         }
         return res.code to id
     }
