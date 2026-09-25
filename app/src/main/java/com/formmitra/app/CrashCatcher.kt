@@ -63,6 +63,12 @@ object CrashCatcher {
                     }
                     appCtx.startActivity(i)
                 } catch (_: Exception) { }
+                // v28 P12: activity launch fail ho (background crash par
+                // Android 10+ block kar sakta hai) to SILENT DEATH na ho —
+                // notification me crash summary + tap par report screen.
+                try {
+                    postCrashNotification(appCtx, err)
+                } catch (_: Exception) { }
             }
             try {
                 prev?.uncaughtException(thread, err)
@@ -80,5 +86,52 @@ object CrashCatcher {
         try {
             File(ctx.filesDir, FILE).delete()
         } catch (_: Exception) { }
+    }
+
+    /**
+     * v28 P12: crash-screen activity na khul paye to notification fallback —
+     * user ko pata to chale ki crash hua + tap par report dikhe.
+     * Self-contained (NotifCenter par depend nahi — crash ke waqt kuch bhi
+     * toota ho sakta hai).
+     */
+    private fun postCrashNotification(appCtx: Context, err: Throwable) {
+        val nm = appCtx.getSystemService(
+            Context.NOTIFICATION_SERVICE
+        ) as android.app.NotificationManager
+        val chId = "fm_crash"
+        if (android.os.Build.VERSION.SDK_INT >= 26) {
+            nm.getNotificationChannel(chId) ?:
+                nm.createNotificationChannel(
+                    android.app.NotificationChannel(
+                        chId, "FormMitra crash report",
+                        android.app.NotificationManager.IMPORTANCE_HIGH
+                    )
+                )
+        }
+        val i = Intent(appCtx, CrashReportActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        }
+        val pi = android.app.PendingIntent.getActivity(
+            appCtx, 9911, i,
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or
+                android.app.PendingIntent.FLAG_IMMUTABLE
+        )
+        val summary = (err.toString().take(120) +
+            " — tap karke poori wajah dekho")
+        val nb = if (android.os.Build.VERSION.SDK_INT >= 26) {
+            android.app.Notification.Builder(appCtx, chId)
+        } else {
+            @Suppress("DEPRECATION")
+            android.app.Notification.Builder(appCtx)
+        }
+        nm.notify(
+            9911,
+            nb.setContentTitle("😟 FormMitra me dikkat aayi")
+                .setContentText(summary)
+                .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+                .build()
+        )
     }
 }

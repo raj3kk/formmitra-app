@@ -81,7 +81,9 @@ object AgentApi {
         timeoutMs: Int
     ): ApiResult = postWithTimeout(path, ctx, body, timeoutMs, null)
 
-    /** v24: cardToken diya to X-Card-Token header jayega. */
+    /** v24: cardToken diya to X-Card-Token header jayega.
+     * v28 P12: open() try ke ANDAR — URL/deviceId/cookie setup me koi
+     * exception aaye to ApiResult(-1) (koi uncaught nahi). */
     private fun postWithTimeout(
         path: String,
         ctx: Context,
@@ -89,23 +91,27 @@ object AgentApi {
         timeoutMs: Int,
         cardToken: String?
     ): ApiResult {
-        val conn = open(path, "POST", ctx, cardToken)
-        conn.connectTimeout = timeoutMs
-        conn.readTimeout = timeoutMs
         return try {
-            conn.doOutput = true
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
-            val json = try { if (text.isNotBlank()) JSONObject(text) else null }
-            catch (_: Exception) { null }
-            ApiResult(code, json)
+            val conn = open(path, "POST", ctx, cardToken)
+            conn.connectTimeout = timeoutMs
+            conn.readTimeout = timeoutMs
+            try {
+                conn.doOutput = true
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                val code = conn.responseCode
+                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+                val json = try { if (text.isNotBlank()) JSONObject(text) else null }
+                catch (_: Exception) { null }
+                ApiResult(code, json)
+            } catch (_: Exception) {
+                ApiResult(-1, null)
+            } finally {
+                try { conn.disconnect() } catch (_: Exception) { }
+            }
         } catch (_: Exception) {
             ApiResult(-1, null)
-        } finally {
-            conn.disconnect()
         }
     }
 
@@ -187,13 +193,16 @@ object AgentApi {
      * zamin_track, resume_create, job_find, scholarship). Server isi field
      * se category-wise sawaal puchhta hai. null = purana flow (unchanged).
      * v24: cardId/cardToken — card-bound chat (C14): body me card_id jata
-     * hai + X-Card-Token header, taaki server card ka data use kare. */
+     * hai + X-Card-Token header, taaki server card ka data use kare.
+     * v28: trackingType — track category me 8 track-types ka context
+     * (zameen/job/scholarship/...) server ko jata hai. */
     fun chat(
         ctx: Context,
         messages: List<Pair<String, String>>,
         category: String? = null,
         cardId: String? = null,
-        cardToken: String? = null
+        cardToken: String? = null,
+        trackingType: String? = null
     ): ApiResult {
         val arr = JSONArray()
         for ((role, content) in messages) {
@@ -202,6 +211,7 @@ object AgentApi {
         val body = JSONObject().put("messages", arr)
         if (!category.isNullOrEmpty()) body.put("category", category)
         if (!cardId.isNullOrEmpty()) body.put("card_id", cardId)
+        if (!trackingType.isNullOrEmpty()) body.put("tracking_type", trackingType)
         return postWithTimeout("/api/agent/chat", ctx, body, TIMEOUT_MS, cardToken)
     }
 
@@ -239,21 +249,92 @@ object AgentApi {
         return res.code to id
     }
 
-    /** PATCH /api/app/form-tasks/{id} {status:"queued"} — "Run now". */
-    fun runNow(ctx: Context, taskId: String): Int {
-        val conn = open("/api/app/form-tasks/$taskId", "PATCH", ctx)
-        return try {
-            conn.doOutput = true
-            conn.setRequestProperty("Content-Type", "application/json")
-            val body = JSONObject().put("status", "queued")
-            conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-            conn.responseCode
-        } catch (_: Exception) {
-            -1
-        } finally {
-            conn.disconnect()
-        }
+    /**
+     * v28 P7: GET /api/app/form-tasks?category=<key> — category ke purane
+     * kaam ("📜 Purane Kaam"). Tap → wahi kaam/context resume hota hai.
+     * category khaali ho to saare tasks.
+     */
+    fun listTasks(ctx: Context, category: String = ""): List<JSONObject> {
+        val path = if (category.isNotEmpty())
+            "/api/app/form-tasks?category=$category"
+        else "/api/app/form-tasks"
+        val res = try { get(path, ctx) } catch (_: Exception) { return emptyList() }
+        if (res.code !in 200..299) return emptyList()
+        val out = mutableListOf<JSONObject>()
+        try {
+            val arr = res.json?.optJSONArray("tasks") ?: JSONArray()
+            for (i in 0 until arr.length()) {
+                (arr.optJSONObject(i))?.let { out.add(it) }
+            }
+        } catch (_: Exception) { }
+        return out
     }
+
+    /**
+     * v28 P5: POST /api/app/trackings — unified tracking banao.
+     * {label, tracking_type, params} → (code, trackingId).
+     * Example: ("Zameen — Khata 569", "zameen",
+     *           {khata:"569", khesra:"1563", mauza:"Damgara"}).
+     */
+    fun createTracking(
+        ctx: Context,
+        label: String,
+        trackingType: String,
+        params: Map<String, String> = emptyMap()
+    ): Pair<Int, String?> {
+        val body = JSONObject()
+            .put("label", label)
+            .put("tracking_type", trackingType)
+        if (params.isNotEmpty()) {
+            val p = JSONObject()
+            for ((k, v) in params) p.put(k, v)
+            body.put("params", p)
+        }
+        val res = post("/api/app/trackings", ctx, body)
+        val id = res.json?.let { j ->
+            val nested = j.optJSONObject("tracking")?.optString("id", "").orEmpty()
+            when {
+                nested.isNotEmpty() -> nested
+                j.optString("id", "").isNotEmpty() -> j.optString("id")
+                j.optString("tracking_id", "").isNotEmpty() -> j.optString("tracking_id")
+                else -> null
+            }
+        }
+        return res.code to id
+    }
+
+    /** v28 P5: GET /api/app/trackings — meri saari trackings (active + cancelled). */
+    fun listTrackings(ctx: Context): List<JSONObject> {
+        val res = try { get("/api/app/trackings", ctx) }
+        catch (_: Exception) { return emptyList() }
+        if (res.code !in 200..299) return emptyList()
+        val out = mutableListOf<JSONObject>()
+        try {
+            val arr = res.json?.optJSONArray("trackings") ?: JSONArray()
+            for (i in 0 until arr.length()) {
+                (arr.optJSONObject(i))?.let { out.add(it) }
+            }
+        } catch (_: Exception) { }
+        return out
+    }
+
+    /** v28 P5: PATCH /api/app/trackings/[id] {status:"cancelled"} — tracking band karo. */
+    fun cancelTracking(ctx: Context, trackingId: String): Int =
+        try {
+            patch(
+                "/api/app/trackings/$trackingId", ctx,
+                JSONObject().put("status", "cancelled")
+            ).code
+        } catch (_: Exception) { -1 }
+
+    /** PATCH /api/app/form-tasks/{id} {status:"queued"} — "Run now". */
+    fun runNow(ctx: Context, taskId: String): Int =
+        try {
+            patch(
+                "/api/app/form-tasks/$taskId", ctx,
+                JSONObject().put("status", "queued")
+            ).code
+        } catch (_: Exception) { -1 }
 
     // ---------------- Phase 2: run reporting + vault + proof ----------------
     //
@@ -265,22 +346,27 @@ object AgentApi {
     //  GET   /api/agent/runs   → {runs: [...]}
     //  GET   /api/agent/profile → {profile: {...} | null}
 
+    /** v28 P12: open() try ke ANDAR — koi uncaught nahi. */
     private fun patch(path: String, ctx: Context, body: JSONObject): ApiResult {
-        val conn = open(path, "PATCH", ctx)
         return try {
-            conn.doOutput = true
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
-            val json = try { if (text.isNotBlank()) JSONObject(text) else null }
-            catch (_: Exception) { null }
-            ApiResult(code, json)
+            val conn = open(path, "PATCH", ctx)
+            try {
+                conn.doOutput = true
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                val code = conn.responseCode
+                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+                val json = try { if (text.isNotBlank()) JSONObject(text) else null }
+                catch (_: Exception) { null }
+                ApiResult(code, json)
+            } catch (_: Exception) {
+                ApiResult(-1, null)
+            } finally {
+                try { conn.disconnect() } catch (_: Exception) { }
+            }
         } catch (_: Exception) {
             ApiResult(-1, null)
-        } finally {
-            conn.disconnect()
         }
     }
 
@@ -336,19 +422,24 @@ object AgentApi {
         }
     }
 
+    /** v28 P12: open() try ke ANDAR — koi uncaught nahi. */
     private fun get(path: String, ctx: Context): ApiResult {
-        val conn = open(path, "GET", ctx)
         return try {
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
-            val json = try { if (text.isNotBlank()) JSONObject(text) else null }
-            catch (_: Exception) { null }
-            ApiResult(code, json)
+            val conn = open(path, "GET", ctx)
+            try {
+                val code = conn.responseCode
+                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+                val json = try { if (text.isNotBlank()) JSONObject(text) else null }
+                catch (_: Exception) { null }
+                ApiResult(code, json)
+            } catch (_: Exception) {
+                ApiResult(-1, null)
+            } finally {
+                try { conn.disconnect() } catch (_: Exception) { }
+            }
         } catch (_: Exception) {
             ApiResult(-1, null)
-        } finally {
-            conn.disconnect()
         }
     }
 

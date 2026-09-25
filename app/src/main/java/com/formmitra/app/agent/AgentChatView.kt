@@ -65,6 +65,9 @@ class AgentChatView(
 
     // v20 Task 5: work-wise category context (chat body me `category` jayega)
     private var activeCategory: String? = null
+    /** v28 P3: track category me 8 track-types ka context (chat body me
+     *  `tracking_type` jayega; chip me bhi dikhega). */
+    private var activeTrackingType: String? = null
     /** Category flow me plan aate hi start khud ho (koi Proceed tap nahi). */
     private var autoPlanArmed = false
     private lateinit var categoryChip: TextView
@@ -201,9 +204,32 @@ class AgentChatView(
         header.addView(Button(context).apply {
             text = "📋 Details"
             textSize = 13f
+            minimumWidth = 0
             setOnClickListener { showDetailsCard() }
         })
         addView(header)
+
+        // v28 P6/P7: category picker + purane kaam row (Agent tab ke andar).
+        val catRow = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(pad, dp(2), pad, dp(2))
+        }
+        catRow.addView(Button(context).apply {
+            text = "📂 Kaam (काम) chuno"
+            textSize = 12f
+            minimumWidth = 0
+            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener { showCategoryPicker() }
+        })
+        catRow.addView(Button(context).apply {
+            text = "📜 Purane Kaam (पुराने काम)"
+            textSize = 12f
+            minimumWidth = 0
+            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener { showPastWork() }
+        })
+        addView(catRow)
 
         // v20 Task 5: active category chip — ✕ dabao to category context hate
         categoryChip = TextView(context).apply {
@@ -419,13 +445,50 @@ class AgentChatView(
 
         // Greeting (v19): product ab tracking assistant hai — form-filling
         // direction user ne cancel kar di thi, isliye copy badli.
+        // v28 P14: restart par pichli category yaad rahe — uski history
+        // wapas lao (greeting sirf tab jab koi category kabhi chuni hi nahi).
         post {
-            addAssistantBubble(
-                "Namaste! 🙏 Main aapka tracking assistant hun — " +
-                    "zameen tracking, sarkari jobs, scholarships ya " +
-                    "resume me help chahiye to batao."
-            )
+            val lastCat = try {
+                draftPrefs().getString("last_category", null)
+            } catch (_: Exception) { null }
+            if (lastCat != null && WorkCategories.of(lastCat) != null) {
+                restoreLastCategory(lastCat)
+            } else {
+                addAssistantBubble(
+                    "Namaste! 🙏 Main aapka tracking assistant hun — " +
+                        "zameen tracking, sarkari jobs, scholarships ya " +
+                        "resume me help chahiye to batao."
+                )
+            }
         }
+    }
+
+    /**
+     * v28 P14: app restart par pichli active category wapas — history
+     * screen par, chip dikhe, koi naya intro message NAHI (woh pehle
+     * bheja ja chuka hai).
+     */
+    private fun restoreLastCategory(catKey: String) {
+        try {
+            activeCategory = catKey
+            activeTrackingType = null
+            val label = WorkCategories.labelOf(catKey)
+            post {
+                categoryChip.text = "🔖 $label  ✕"
+                categoryChip.visibility = View.VISIBLE
+            }
+            loadChatHistory(catKey)
+        } catch (_: Exception) { }
+    }
+
+    /** v28 P14: active category yaad rakho (restart-proof). */
+    private fun rememberCategory(catKey: String?) {
+        try {
+            val e = draftPrefs().edit()
+            if (catKey == null) e.remove("last_category")
+            else e.putString("last_category", catKey)
+            e.apply()
+        } catch (_: Exception) { }
     }
 
     // ---------- bubbles ----------
@@ -703,16 +766,24 @@ class AgentChatView(
      * detail-request loop (K4) se maang lega.
      */
     private fun onStartPlanClicked(plan: JSONObject, link: String, startBtn: Button?) {
-        startBtn?.isEnabled = false
-        startBtn?.text = "⏳ Task ban raha hai…"
-        // Seedha task banao — koi Proceed confirmation nahi.
-        // Details server ke vault profile + chat history se aati hain;
-        // galat hui to run ke beech detail-request loop (K4) maang lega.
-        beginEnqueue(plan, link, startBtn)
+        // v28 P12: tap par koi crash nahi — kuch gadbad ho to toast.
+        try {
+            startBtn?.isEnabled = false
+            startBtn?.text = "⏳ Task ban raha hai…"
+            // Seedha task banao — koi Proceed confirmation nahi.
+            // Details server ke vault profile + chat history se aati hain;
+            // galat hui to run ke beech detail-request loop (K4) maang lega.
+            beginEnqueue(plan, link, startBtn)
+        } catch (t: Throwable) {
+            android.util.Log.e("FmStart", "onStartPlanClicked failed", t)
+            toast("⚠️ Shuru nahi ho paya — dobara try karo")
+            post { startBtn?.text = "▶ Shuru karo"; startBtn?.isEnabled = true }
+        }
     }
 
     private fun beginEnqueue(plan: JSONObject, link: String, startBtn: Button?) {
         startBtn?.text = "⏳ Task ban raha hai…"
+        try {
         enqueueTask(
             title = plan.optString("title", "Form"),
             url = link,
@@ -720,6 +791,11 @@ class AgentChatView(
             category = activeCategory.orEmpty(),
             onDone = { post { startBtn?.text = "▶ Shuru karo"; startBtn?.isEnabled = true } }
         )
+        } catch (t: Throwable) {
+            android.util.Log.e("FmStart", "beginEnqueue failed", t)
+            toast("⚠️ Shuru nahi ho paya — dobara try karo")
+            post { startBtn?.text = "▶ Shuru karo"; startBtn?.isEnabled = true }
+        }
     }
 
     // ---------- flow ----------
@@ -794,6 +870,17 @@ class AgentChatView(
                 }
             }
         }
+        // v28 P11: agent auto-detect → auto-save. KNOWN extraction ke BAAD
+        // unknown labeled details (aadhar/PAN/voter/ration/...) dhoondo —
+        // label + nontrivial value DONO hon tabhi (conservative) → tag ke
+        // saath card me auto-save + confirmation bubble.
+        // v28 P12: detector kabhi send flow ko tod na paye.
+        try {
+            val extras = ExtraDetailDetector.extractExtra(text)
+            if (extras.isNotEmpty()) {
+                autoSaveExtraDetails(extras)
+            }
+        } catch (_: Exception) { }
         doSend(text)
     }
 
@@ -829,6 +916,7 @@ class AgentChatView(
         sendBtn.isEnabled = false
         addUserBubble(t)
         history.add("user" to t)
+        saveChatHistory() // v28 P6: per-category chat history persist
         showTyping()
         // Watchdog: 75s me jawab na aaye to stuck state todo + retry do
         val token = ++sendToken
@@ -848,9 +936,10 @@ class AgentChatView(
             val res = try {
                 // v20 Task 5: active category ho to body me `category` bhejo
                 // v24: active card ho to body me `card_id` + X-Card-Token
+                // v28: track me `tracking_type` (8 types ka context) bhi jayega
                 AgentApi.chat(
                     context, history.toList(), activeCategory,
-                    activeCardId, activeCardToken
+                    activeCardId, activeCardToken, activeTrackingType
                 )
             } catch (_: Exception) {
                 AgentApi.ApiResult(-1, null)
@@ -889,6 +978,7 @@ class AgentChatView(
                         if (reply.isNotEmpty()) {
                             addAssistantBubble(reply)
                             history.add("assistant" to reply)
+                            saveChatHistory() // v28 P6
                             VoiceOutput.speak(context, reply)
                         }
                         val plan = json?.optJSONObject("plan")
@@ -1022,10 +1112,18 @@ class AgentChatView(
     }
 
     // ---------- v20 Task 5: category context ----------
+    // ---------- v28 P6/P7/P8: category system ----------
 
     /**
      * Home ke work-category card se: category context set karo + intro
      * message bhejo (koi verify gate nahi — seedha bhejta hai).
+     *
+     * v28 (P8): Home se naya kaam start = HAMESHA fresh session.
+     *  - newSession=true → is category ki purani chat (memory + screen +
+     *    saved `chat_history_<category>`) SAAPH; nayi shuruaat.
+     *  - Purane kaam ka continuation SIRF Agent tab → 📜 Purane Kaam se (P7).
+     * trackingType: track category me 8 track-types ka context (P3) — null
+     * matlab aam track chat (server generic track prompt dega).
      */
     fun startCategoryChat(
         category: String,
@@ -1033,20 +1131,41 @@ class AgentChatView(
         prefill: Map<String, String>,
         cardId: String,
         cardName: String,
-        cardToken: String
+        cardToken: String,
+        trackingType: String? = null,
+        newSession: Boolean = false
     ) {
+        // v28 P12: Agent tab creation par koi crash nahi — fail-soft toast.
+        try {
         activeCategory = category
+        rememberCategory(category) // v28 P14
+        activeTrackingType = trackingType
         setActiveCard(cardId, cardName, cardToken)
+        if (newSession) {
+            // P8: purani chat saaf — bacha hua message/context kuch nahi.
+            history.clear()
+            try {
+                draftPrefs().edit().remove(histKey(category)).apply()
+            } catch (_: Exception) { }
+            post { messageList.removeAllViews() }
+        }
         // B: card details session me rakho — agent dobara na maange.
         // Ye intro message ke saath server ko bhi jati hain (history me).
         if (prefill.isNotEmpty()) sessionDetails.putAll(prefill)
         // A: is category message ke jawab me plan aaye to auto-start flow.
         autoPlanArmed = true
+        val chipText = if (trackingType != null)
+            "🔖 $label › ${WorkCategories.trackLabelOf(trackingType)}  ✕"
+        else "🔖 $label  ✕"
         post {
-            categoryChip.text = "🔖 $label  ✕"
+            categoryChip.text = chipText
             categoryChip.visibility = View.VISIBLE
         }
         val sb = StringBuilder("🔖 $label — is kaam me meri madad karo.")
+        if (trackingType != null) {
+            sb.append("\n🔍 Track type: ")
+                .append(WorkCategories.trackLabelOf(trackingType))
+        }
         sb.append("\n🪪 Card: $cardName (is card ki details use karo)")
         if (prefill.isNotEmpty()) {
             sb.append("\nCard se mili details:")
@@ -1057,13 +1176,449 @@ class AgentChatView(
         // v24 #1: three-way coordination — stage tracking shuru.
         trackRunStage(label, cardName)
         sendMessage(sb.toString())
+        } catch (t: Throwable) {
+            android.util.Log.e("FmCat", "startCategoryChat failed", t)
+            toast("⚠️ Kaam khulne me dikkat aayi — dobara try karo")
+        }
     }
 
     /** Chip ka ✕ — category context hatao, aam chat par wapas. */
     fun clearCategory() {
+        saveChatHistory()
         activeCategory = null
+        rememberCategory(null) // v28 P14
+        activeTrackingType = null
         post { categoryChip.visibility = View.GONE }
         toast("Category hatayi — ab aam chat")
+    }
+
+    // ---------- v28 P6: per-category chat history (local) ----------
+
+    /** local history key: chat_history_<category> */
+    private fun histKey(cat: String) = "chat_history_$cat"
+
+    /** Is category ki history prefs me save karo (max 200 messages). */
+    private fun saveChatHistory() {
+        val cat = activeCategory ?: return
+        try {
+            val arr = JSONArray()
+            for ((role, content) in history.takeLast(200)) {
+                arr.put(JSONObject().put("role", role).put("content", content))
+            }
+            draftPrefs().edit().putString(histKey(cat), arr.toString()).apply()
+        } catch (_: Exception) { }
+    }
+
+    /** Saved history wapas lao + screen par render karo. */
+    private fun loadChatHistory(cat: String) {
+        history.clear()
+        post { messageList.removeAllViews() }
+        try {
+            val raw = draftPrefs().getString(histKey(cat), null) ?: return
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val role = o.optString("role", "")
+                val content = o.optString("content", "")
+                if (content.isEmpty()) continue
+                history.add(role to content)
+                post {
+                    if (role == "user") addUserBubble(content)
+                    else addAssistantBubble(content)
+                }
+            }
+        } catch (_: Exception) { }
+    }
+
+    /** Dialog rows ke liye shared row builder. */
+    private fun dialogRow(
+        act: Activity, icon: String, title: String, desc: String,
+        onTap: () -> Unit
+    ): View {
+        return LinearLayout(act).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = with(UiKit) { act.tintCard("#FFFFFF", "#DADCE0") }
+            addView(TextView(act).apply {
+                text = icon
+                textSize = 22f
+                setPadding(0, 0, dp(10), 0)
+            })
+            addView(LinearLayout(act).apply {
+                orientation = VERTICAL
+                addView(TextView(act).apply {
+                    text = title
+                    textSize = 14f
+                    setTypeface(null, Typeface.BOLD)
+                    setTextColor(Color.parseColor("#202124"))
+                })
+                addView(TextView(act).apply {
+                    text = desc
+                    textSize = 11f
+                    setTextColor(Color.parseColor("#5F6368"))
+                })
+            })
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { onTap() }
+            UiKit.pressFeedback(this)
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+            lp.setMargins(0, dp(4), 0, dp(4))
+            layoutParams = lp
+        }
+    }
+
+    /**
+     * P6: Agent tab me generic category picker — WorkCategories.ALL se
+     * generated (nayi category yahan add karte hi sab jagah aa jayegi).
+     * Category badlo → uski alag chat history khulti hai.
+     */
+    fun showCategoryPicker() {
+        val act = context as? Activity ?: return
+        val dlg = AlertDialog.Builder(act).create()
+        val box = LinearLayout(act).apply {
+            orientation = VERTICAL
+            setPadding(dp(20), dp(16), dp(20), dp(16))
+        }
+        box.addView(TextView(act).apply {
+            text = "📂 Kaam (काम) chuno —"
+            textSize = 16f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#202124"))
+            setPadding(0, 0, 0, dp(10))
+        })
+        for (cat in WorkCategories.ALL) {
+            box.addView(dialogRow(act, cat.icon, cat.label, cat.desc) {
+                dlg.dismiss()
+                switchCategory(cat.key, cat.label)
+            })
+        }
+        box.addView(Button(act).apply {
+            text = "← Peeche (वापस)"
+            minimumWidth = 0
+            setOnClickListener { dlg.dismiss() }
+        })
+        dlg.setView(box)
+        dlg.show()
+    }
+
+    /** Track category picker se chuna → 8 track-types me se type chuno. */
+    private fun showPickerTrackTypes(act: Activity, onPick: (String?) -> Unit) {
+        val dlg = AlertDialog.Builder(act).create()
+        val box = LinearLayout(act).apply {
+            orientation = VERTICAL
+            setPadding(dp(20), dp(16), dp(20), dp(16))
+        }
+        box.addView(TextView(act).apply {
+            text = "🔍 Track (ट्रैकिंग) — kaunsa type?"
+            textSize = 16f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#202124"))
+            setPadding(0, 0, 0, dp(10))
+        })
+        for (tt in WorkCategories.TRACK_TYPES) {
+            box.addView(dialogRow(act, tt.icon, tt.label, tt.hint) {
+                dlg.dismiss()
+                onPick(tt.key)
+            })
+        }
+        box.addView(dialogRow(act, "💬", "Aam Tracking (आम ट्रैकिंग)",
+            "Koi khaas type nahi — aise hi baat karo") {
+            dlg.dismiss()
+            onPick(null)
+        })
+        box.addView(Button(act).apply {
+            text = "← Peeche (वापस)"
+            minimumWidth = 0
+            setOnClickListener {
+                dlg.dismiss()
+                onPick(null) // type nahi chuna → aam track chat
+            }
+        })
+        dlg.setView(box)
+        dlg.show()
+    }
+
+    /** P6: category switch — purani category ki history save, nayi ki load. */
+    private fun switchCategory(catKey: String, catLabel: String) {
+        saveChatHistory()
+        activeCategory = catKey
+        rememberCategory(catKey) // v28 P14
+        activeTrackingType = null
+        autoPlanArmed = false
+        if (catKey == "track") {
+            val act = context as? Activity ?: return
+            showPickerTrackTypes(act) { picked ->
+                activeTrackingType = picked
+                finishCategorySwitch(catKey, catLabel)
+            }
+        } else {
+            finishCategorySwitch(catKey, catLabel)
+        }
+    }
+
+    private fun finishCategorySwitch(catKey: String, catLabel: String) {
+        val chipText = if (activeTrackingType != null)
+            "🔖 $catLabel › ${WorkCategories.trackLabelOf(activeTrackingType)}  ✕"
+        else "🔖 $catLabel  ✕"
+        post {
+            categoryChip.text = chipText
+            categoryChip.visibility = View.VISIBLE
+        }
+        loadChatHistory(catKey)
+        val n = history.size
+        toast(
+            if (n > 0) "$catLabel — pichli baat-cheet wapas ($n)"
+            else "$catLabel — nayi baat-cheet shuru karo"
+        )
+    }
+
+    // ---------- v28 P7: 📜 Purane Kaam (category-filtered work history) ----------
+
+    /**
+     * Agent tab ke andar category ke purane kaam. Tap → wahi kaam/context
+     * resume (server form-tasks se category filter karke laata hai).
+     * Track category me trackings bhi (tap: status puchho; long-press: band karo).
+     */
+    fun showPastWork() {
+        val cat = activeCategory
+        val act = context as? Activity ?: return
+        if (cat == null) {
+            AlertDialog.Builder(act)
+                .setTitle("📜 Purane Kaam (पुराने काम)")
+                .setMessage(
+                    "Pehle upar 📂 se koi Kaam (काम) chuno — " +
+                        "phir uske purane kaam yahan dikhenge."
+                )
+                .setPositiveButton("Theek hai", null)
+                .show()
+            return
+        }
+        toast("Purane kaam la raha hun…")
+        Thread({
+            val tasks = try {
+                AgentApi.listTasks(context, cat)
+            } catch (_: Exception) { emptyList<JSONObject>() }
+            val trackings = if (cat == "track") {
+                try { AgentApi.listTrackings(context) }
+                catch (_: Exception) { emptyList<JSONObject>() }
+            } else emptyList<JSONObject>()
+            post { showPastWorkDialog(act, cat, tasks, trackings) }
+        }, "fm-past-work").start()
+    }
+
+    private fun showPastWorkDialog(
+        act: Activity, cat: String,
+        tasks: List<JSONObject>, trackings: List<JSONObject>
+    ) {
+        // v28 P12: dead activity par dialog = BadTokenException → fail-soft.
+        if (act.isFinishing || act.isDestroyed) return
+        try {
+        val dlg = AlertDialog.Builder(act).create()
+        val box = LinearLayout(act).apply {
+            orientation = VERTICAL
+            setPadding(dp(20), dp(16), dp(20), dp(16))
+        }
+        box.addView(TextView(act).apply {
+            text = "📜 Purane Kaam — ${WorkCategories.labelOf(cat)}"
+            textSize = 16f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#202124"))
+            setPadding(0, 0, 0, dp(10))
+        })
+        val list = LinearLayout(act).apply { orientation = VERTICAL }
+        val scroll = ScrollView(act).apply { addView(list) }
+        if (tasks.isEmpty() && trackings.isEmpty()) {
+            list.addView(TextView(act).apply {
+                text = "Abhi koi purana kaam nahi hai.\nNaya kaam Home → Kaam chuno se shuru karo."
+                textSize = 14f
+                setTextColor(Color.parseColor("#5F6368"))
+                setPadding(dp(4), dp(8), dp(4), dp(8))
+            })
+        }
+        for (t in tasks) {
+            val title = t.optString("name", "Kaam").ifEmpty { "Kaam" }
+            val status = t.optString("status", "").ifEmpty { "—" }
+            list.addView(dialogRow(
+                act, "📝", title,
+                "Status: $status — tap karke continue karo"
+            ) {
+                dlg.dismiss()
+                resumeTask(t)
+            })
+        }
+        if (trackings.isNotEmpty()) {
+            list.addView(TextView(act).apply {
+                text = "🔍 Meri Trackings"
+                textSize = 14f
+                setTypeface(null, Typeface.BOLD)
+                setTextColor(Color.parseColor("#202124"))
+                setPadding(0, dp(12), 0, dp(4))
+            })
+            for (tr in trackings) {
+                val label = tr.optString("label", "Tracking").ifEmpty { "Tracking" }
+                val tt = tr.optString("tracking_type", "")
+                val st = tr.optString("status", "")
+                val desc = buildString {
+                    if (tt.isNotEmpty()) append(WorkCategories.trackLabelOf(tt)).append(" • ")
+                    append(if (st == "active") "✅ Chal rahi hai" else "⏹ $st")
+                    append(" — tap: status puchho • lamba dabao: band karo")
+                }
+                val row = dialogRow(act, "🔍", label, desc) {
+                    dlg.dismiss()
+                    resumeTracking(tr)
+                }
+                row.setOnLongClickListener {
+                    confirmCancelTracking(act, tr) {
+                        dlg.dismiss()
+                        showPastWork()
+                    }
+                    true
+                }
+                list.addView(row)
+            }
+        }
+        box.addView(
+            scroll,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(320)
+            )
+        )
+        box.addView(Button(act).apply {
+            text = "← Band karo"
+            minimumWidth = 0
+            setOnClickListener { dlg.dismiss() }
+        })
+        dlg.setView(box)
+        dlg.show()
+        } catch (t: Throwable) {
+            android.util.Log.e("FmPast", "showPastWorkDialog failed", t)
+            toast("⚠️ Purane kaam khulne me dikkat — dobara try karo")
+        }
+    }
+
+    /** Task resume — wahi kaam/context agent ko wapas do. */
+    private fun resumeTask(t: JSONObject) {
+        val title = t.optString("name", "kaam").ifEmpty { "kaam" }
+        val status = t.optString("status", "")
+        val url = t.optString("target_url", t.optString("url", ""))
+        val sb = StringBuilder("📜 Purana kaam continue karo: \"$title\"")
+        if (status.isNotEmpty()) sb.append(" (status: $status)")
+        if (url.isNotEmpty()) sb.append("\nLink: $url")
+        sb.append(
+            "\nJahan ruka tha wahan se aage badhao — jo ho gaya wo dobara " +
+                "mat karo, jo detail chahiye maango."
+        )
+        sendMessage(sb.toString())
+    }
+
+    /** Tracking resume — taaza status puchho. */
+    private fun resumeTracking(tr: JSONObject) {
+        val label = tr.optString("label", "tracking").ifEmpty { "tracking" }
+        sendMessage(
+            "🔍 Is tracking ka taaza status batao: \"$label\". " +
+                "Agar koi naya update ho to detail me batao."
+        )
+    }
+
+    /** Tracking band karo — confirmation ke saath (har delete par confirm). */
+    private fun confirmCancelTracking(
+        act: Activity, tr: JSONObject, onDone: () -> Unit
+    ) {
+        // v28 P12: dead activity guard.
+        if (act.isFinishing || act.isDestroyed) return
+        val label = tr.optString("label", "tracking").ifEmpty { "tracking" }
+        val id = tr.optString("id", "")
+        try {
+        AlertDialog.Builder(act)
+            .setTitle("⏹ Tracking band karo?")
+            .setMessage(
+                "\"$label\"\n\nBand karne ke baad is par naye updates " +
+                    "aana band ho jayenge."
+            )
+            .setPositiveButton("Haan, band karo") { _, _ ->
+                toast("Band kar raha hun…")
+                Thread({
+                    val code = try {
+                        AgentApi.cancelTracking(context, id)
+                    } catch (_: Exception) { -1 }
+                    post {
+                        toast(
+                            if (code in 200..299) "⏹ Tracking band ho gayi"
+                            else "⚠️ Band nahi ho payi — baad me try karo"
+                        )
+                        onDone()
+                    }
+                }, "fm-cancel-tracking").start()
+            }
+            .setNegativeButton("Rehne do", null)
+            .show()
+        } catch (t: Throwable) {
+            android.util.Log.e("FmPast", "confirmCancelTracking failed", t)
+            toast("⚠️ Dobara try karo")
+        }
+    }
+
+    // ---------- v28 P11: agent auto-detect → auto-save ----------
+
+    /**
+     * Chat me nayi labeled detail (aadhar/PAN/voter/…) dikhi → tag ke
+     * saath card me AUTO-SAVE. Conservative: label + nontrivial value DONO
+     * hon tabhi (ExtraDetailDetector). Save par confirmation bubble.
+     * Card unlock na ho → pending + create-card offer (detail ghumti nahi).
+     */
+    private fun autoSaveExtraDetails(extras: Map<String, String>) {
+        val tag = activeCategory ?: "chat"
+        val cid = activeCardId
+        val tok = activeCardToken ?: cid?.let { CardStore.token(it) }
+        if (cid != null && !tok.isNullOrEmpty()) {
+            Thread({
+                val details = JSONObject()
+                for ((label, v) in extras) {
+                    details.put(
+                        label,
+                        JSONObject().put("value", v).put("tag", tag)
+                    )
+                }
+                val r = try {
+                    AgentApi.patchCard(context, cid, tok, details)
+                } catch (_: Exception) { AgentApi.ApiResult(-1, null) }
+                post {
+                    if (r.code in 200..299) {
+                        val msg = "✅ Card me save ho gaya: " +
+                            extras.keys.joinToString(", ")
+                        addAssistantBubble(msg)
+                        history.add("assistant" to msg)
+                        saveChatHistory()
+                    } else {
+                        CardStore.pendingAddAll(context, extras, tag)
+                        toast(
+                            "⚠️ Save me dikkat — detail surakshit hai, " +
+                                "baad me try karo"
+                        )
+                    }
+                }
+            }, "fm-extra-save").start()
+        } else {
+            CardStore.pendingAddAll(context, extras, tag)
+            (context as? Activity)?.let { act ->
+                post {
+                    CardFlow.offerCreateCardForDetails(
+                        act, CardStore.pendingCount(context),
+                        onAgentCreate = { prefill ->
+                            onAgentCreateRequest?.invoke(prefill)
+                        },
+                        onCreated = { _, id, name, token ->
+                            setActiveCard(id, name, token)
+                        }
+                    )
+                }
+            }
+        }
     }
 
     // ---------- verify dialog ----------
@@ -1304,7 +1859,18 @@ class AgentChatView(
                 addAssistantBubble(msg)
                 onDone()
             }
-        } finally {
+            // v28 P12: try/finally me CATCH nahi tha — andar koi bhi
+            // exception = uncaught = app crash. Ab pakdo + user ko batao.
+            } catch (t: Throwable) {
+                android.util.Log.e("FmEnqueue", "enqueueTask failed", t)
+                post {
+                    addErrorBubble(
+                        "⚠️ Kaam shuru karte waqt dikkat aayi — dobara try karo.",
+                        "🔁 Dobara try karo"
+                    ) { enqueueTask(title, url, category, onDone) }
+                    onDone()
+                }
+            } finally {
             enqueueInFlight.remove(flightKey)
         }
         }.start()
@@ -1610,6 +2176,7 @@ class AgentChatView(
         }
         retryBtn.isEnabled = false
         Thread {
+            try {
             var msg: String
             val verdict = runPrecheck(bannerUrl, bannerGoal)
             if (verdict != null && !verdict.feasible) {
@@ -1645,6 +2212,17 @@ class AgentChatView(
                 addAssistantBubble(msg)
                 retryBtn.isEnabled = true
                 hideBanner()
+            }
+            // v28 P12: uncaught = crash — pakdo + user ko batao.
+            } catch (t: Throwable) {
+                android.util.Log.e("FmRetry", "retryTask failed", t)
+                post {
+                    addErrorBubble(
+                        "⚠️ Dobara chalate waqt dikkat aayi.",
+                        "🔁 Dobara try karo"
+                    ) { retryTask() }
+                    retryBtn.isEnabled = true
+                }
             }
         }.start()
     }

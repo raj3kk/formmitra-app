@@ -42,25 +42,29 @@ object WorkingMode {
         apply(ctx)
     }
 
-    /** Workers + network wake + persistent notification ko toggle ke hisaab se chalao/band karo. */
+    /** Workers + network wake ko toggle ke hisaab se chalao/band karo.
+     * v28 P13: Working Mode toggle ab AUTOMATION INTENSITY control karta
+     * hai (WhopClip-style base presence alag hai):
+     * - ON  → workers + NetWake + full background automation.
+     * - OFF → koi worker/execution nahi, par base presence (persistent
+     *   notification) + saare promised notifications (N3 live status,
+     *   N4 pending nudge, N5 stuck alert, polling fallback) chalte rehte
+     *   hain — isliye WorkingModeService.stop() yahan NAHI hota.
+     * Presence FmApp.onCreate (har app-open) par start hoti hai. */
     fun apply(ctx: Context) {
         val appCtx = ctx.applicationContext
         try {
+            // v28 P13: presence hamesha (toggle se independent).
+            WorkingModeService.start(appCtx)
             if (isEnabled(appCtx)) {
                 Scheduler.scheduleFormTasks(appCtx)
                 Scheduler.scheduleDigest(appCtx)
                 NetWake.register(appCtx)
-                // v24 N1: persistent notification — user ke kill karne
-                // tak rahe (koi foreground service pehle start nahi hoti
-                // thi — N0 root cause).
-                WorkingModeService.start(appCtx)
                 Log.i("WorkingMode", "ON — background automation active")
             } else {
                 Scheduler.cancelAll(appCtx)
                 NetWake.unregister(appCtx)
-                // v24 N1: OFF par notification hatao.
-                WorkingModeService.stop(appCtx)
-                Log.i("WorkingMode", "OFF — background automation band")
+                Log.i("WorkingMode", "OFF — automation band, presence + notifications on")
             }
         } catch (t: Throwable) {
             Log.e("WorkingMode", "apply failed (non-fatal)", t)

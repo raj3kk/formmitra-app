@@ -13,19 +13,28 @@ import android.util.Log
 import com.formmitra.app.MainActivity
 
 /**
- * WorkingModeService — v24 N1: Working Mode ON par persistent
- * foreground notification ("user ke kill karne tak rahe").
+ * WorkingModeService — v24 N1 + v28 P13: WhopClip-style ALWAYS-ON
+ * foreground presence + persistent notification ("user ke kill karne tak
+ * rahe").
  *
- * N0 VERIFY ka root cause: WorkingMode ON par workers schedule hote the,
- * par koi foreground service kabhi start hi nahi hoti thi — isliye user
- * ko "notification bhi nahi aaya". Ye service us gap ko bharti hai.
+ * v28 P13 semantics (badlaav):
+ * - Service APP KHULNE PAR HI start hoti hai (FmApp.onCreate +
+ *   WorkingMode.apply) — Working Mode toggle se INDEPENDENT.
+ * - Working Mode toggle ab sirf AUTOMATION INTENSITY control karta hai
+ *   (workers on/off); presence + saare promised notifications (N3 live
+ *   status, N4 pending nudge, N5 stuck alert) OFF par bhi chalte hain.
+ * - stop() ab sirf explicit user-kill path ke liye hai (toggle OFF par
+ *   call NAHI hota).
  *
- * - ON → startForegroundService (UI se toggle = foreground, allowed).
- *   Notification ongoing (swipe se nahi hategi); Working Mode OFF par
- *   stopService + cancel → notification hat jati hai.
+ * N0 VERIFY ka root cause (v24): WorkingMode ON par workers schedule hote
+ * the, par koi foreground service kabhi start hi nahi hoti thi — isliye
+ * user ko "notification bhi nahi aaya". Ye service us gap ko bharti hai.
+ *
+ * - startForegroundService (UI se = foreground, allowed). Notification
+ *   ongoing (swipe se nahi hategi).
  * - BootReceiver (background) se start par Android 12+ FGS start throw
  *   kar sakta hai → fallback: wahi notification bina FGS ke (ongoing).
- *   User ke app kholte hi FmApp → WorkingMode.apply → service take-over.
+ *   User ke app kholte hi FmApp → service take-over.
  * - N3: FormRunService progress par updateLiveStatus() — persistent
  *   notification me LIVE dikhta hai kya chal raha hai + "working,
  *   don't close (बंद मत करो)". Kaam khatam → clearLiveStatus() wapas
@@ -46,7 +55,7 @@ class WorkingModeService : Service() {
         @Volatile private var liveTitle: String? = null
         @Volatile private var liveText: String? = null
 
-        /** WorkingMode ON — persistent notification lagao. */
+        /** v28 P13: presence start — app-open/boot par (toggle-independent). */
         fun start(ctx: Context) {
             try {
                 val appCtx = ctx.applicationContext
@@ -65,7 +74,10 @@ class WorkingModeService : Service() {
             }
         }
 
-        /** WorkingMode OFF — service band + notification hatao. */
+        /**
+         * v28 P13: sirf explicit user-kill path ke liye rakha hai.
+         * Working Mode OFF par AB CALL NAHI HOTA (presence bani rehti hai).
+         */
         fun stop(ctx: Context) {
             liveTitle = null
             liveText = null
@@ -148,16 +160,16 @@ class WorkingModeService : Service() {
         }
 
         /**
-         * N1 text (user-specified, bilingual D17):
+         * v28 P13: user ka EXACT text, verbatim (kabhi paraphrase nahi):
          * "Welcome on FormMitra — kahin jaane ki zaroorat nahi, apna kaam
-         * ghar baithe karein, 💯 surakshit".
+         * ghar baithe karein, 💯 surakshit"
          * ("background me chal raha hai" wali wording NAHI.)
          */
         private fun build(ctx: Context, title: String?, text: String?): Notification {
             ensureChannel(ctx)
-            val t = title ?: "Welcome on FormMitra (फॉर्ममित्र में आपका स्वागत है)"
-            val b = text ?: "Kahin jaane ki zaroorat nahi — apna kaam ghar " +
-                "baithe karein, 💯 surakshit (सुरक्षित)"
+            val t = title ?: "Welcome on FormMitra"
+            val b = text ?: "kahin jaane ki zaroorat nahi, apna kaam " +
+                "ghar baithe karein, 💯 surakshit"
             val nb = if (Build.VERSION.SDK_INT >= 26) {
                 Notification.Builder(ctx, CHANNEL_ID)
             } else {
@@ -166,7 +178,12 @@ class WorkingModeService : Service() {
             }
             return nb.setContentTitle(t)
                 .setContentText(b)
-                .setStyle(Notification.BigTextStyle().bigText(b))
+                .setStyle(
+                    Notification.BigTextStyle().bigText(
+                        "Welcome on FormMitra — kahin jaane ki zaroorat nahi, " +
+                            "apna kaam ghar baithe karein, 💯 surakshit"
+                    )
+                )
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .setContentIntent(tapIntent(ctx))
                 .setOngoing(true)

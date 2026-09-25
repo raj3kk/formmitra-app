@@ -55,9 +55,21 @@ class CardDetailView(
     private val scroll = ScrollView(context)
     private val content = LinearLayout(context)
     private val detailsList = LinearLayout(context)
+    private val customList = LinearLayout(context)
     private val docsList = LinearLayout(context)
     private val detailsCount = TextView(context)
     private var detailsData = JSONObject()
+
+    /** v28 P9/P10: form state — staged edits, Save par ek PATCH. */
+    private val knownKeys: List<String> =
+        DetailExtractor.orderedKeys() + listOf("khata", "khesra", "mauza")
+    private val fieldEdits = LinkedHashMap<String, EditText>()
+    private val customEdits = LinkedHashMap<String, EditText>()
+    private val knownOriginal = LinkedHashMap<String, String>()
+    private val knownTags = LinkedHashMap<String, String>()
+    private val customOriginal = LinkedHashMap<String, String>()
+    private val customTags = LinkedHashMap<String, String>()
+    private val customDeleted = mutableSetOf<String>()
 
     /** Upload hone wali file ka pending tag (picker → tag dialog → upload). */
     private var pendingUploadUri: Uri? = null
@@ -119,7 +131,8 @@ class CardDetailView(
         })
         content.addView(btnRow)
 
-        // ---- 📝 Details section ----
+        // ---- 📝 Details section (v28 P9: EK simple form — saare known
+        // fields, bhare ya khaali, ek-ek EditText; neeche EK Save button) ----
         content.addView(sectionTitle("📝 Details (विवरण)"))
         content.addView(detailsCount.apply {
             textSize = 12f
@@ -128,16 +141,41 @@ class CardDetailView(
         })
         detailsList.orientation = VERTICAL
         content.addView(detailsList)
-        val addDetailBtn = Button(context).apply {
-            text = "➕ Detail jodo (विवरण जोड़ें)"
+
+        // ---- 🏷️ Extra Details (v28 P10: custom Tag + Value rows) ----
+        content.addView(sectionTitle("🏷️ Extra Details (अतिरिक्त विवरण)"))
+        content.addView(TextView(context).apply {
+            text = "Apni marzi ke tag — jaise Aadhar number, PAN. Chat me di hui nayi details yahan khud save hoti hain."
+            textSize = 12f
+            setTextColor(Color.parseColor("#80868B"))
+            setPadding(0, 0, 0, dp(4))
+        })
+        customList.orientation = VERTICAL
+        content.addView(customList)
+        val addMoreBtn = Button(context).apply {
+            text = "＋ Add more (और जोड़ें)"
             textSize = 14f
-            setOnClickListener { showAddDetailDialog() }
+            setOnClickListener { showAddCustomDialog() }
         }
-        UiKit.pressFeedback(addDetailBtn)
-        content.addView(addDetailBtn.apply {
+        UiKit.pressFeedback(addMoreBtn)
+        content.addView(addMoreBtn.apply {
             layoutParams = LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
             ).apply { setMargins(0, dp(6), 0, 0) }
+        })
+
+        // ---- 💾 EK Save button (v28 P9) — saare badlav ek PATCH me ----
+        val saveBtn = Button(context).apply {
+            text = "💾 Save (सहेजें)"
+            textSize = 15f
+            setTypeface(null, Typeface.BOLD)
+            setOnClickListener { saveAllDetails() }
+        }
+        UiKit.pressFeedback(saveBtn)
+        content.addView(saveBtn.apply {
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(10), 0, 0) }
         })
 
         // ---- 📁 Document Vault (Add button UPAR — C11) ----
@@ -197,107 +235,164 @@ class CardDetailView(
         }, "fm-carddetail-load").start()
     }
 
-    // ============ Details ============
+    // ============ Details (v28 P9/P10: ek simple form + custom rows) ============
 
+    private fun storedValue(key: String): String {
+        val o = detailsData.optJSONObject(key)
+        return o?.optString("value", "") ?: detailsData.optString(key, "")
+    }
+
+    private fun storedTag(key: String): String {
+        val o = detailsData.optJSONObject(key)
+        return o?.optString("tag", "").orEmpty()
+    }
+
+    /**
+     * P9: EK scrollable simple form — saare KNOWN fields (bhare ya khaali),
+     * har field ka EditText. P10: uske neeche custom Tag+Value rows
+     * (unknown keys — chat se auto-save hue ya "＋ Add more" se jude).
+     * Badlav staged rehte hain — 💾 Save par EK PATCH jata hai.
+     */
     private fun renderDetails(det: JSONObject?) {
         detailsList.removeAllViews()
+        customList.removeAllViews()
+        fieldEdits.clear()
+        customEdits.clear()
+        knownOriginal.clear()
+        knownTags.clear()
+        customOriginal.clear()
+        customTags.clear()
+        customDeleted.clear()
         detailsData = det ?: JSONObject()
-        val keys = mutableListOf<String>()
-        val it = detailsData.keys()
-        while (it.hasNext()) keys.add(it.next())
-        detailsCount.text = if (keys.isEmpty())
-            "Koi detail nahi — neeche se jodo. Kaam ke dauraan di hui details yahan tag ke saath save hongi."
-        else "${keys.size} details — tap karke edit karo"
-        if (keys.isEmpty()) {
-            detailsList.addView(TextView(context).apply {
-                text = "📝 Abhi khaali hai"
-                textSize = 13f
-                setTextColor(Color.parseColor("#80868B"))
-                setPadding(0, dp(4), 0, dp(4))
-            })
-            return
+
+        // Known fields — sab, khaali ho to bhi.
+        var filled = 0
+        for (k in knownKeys) {
+            val v = storedValue(k).let { if (it == "null") "" else it }
+            val tag = storedTag(k)
+            knownOriginal[k] = v
+            knownTags[k] = tag
+            if (v.isNotEmpty()) filled++
+            detailsList.addView(knownFieldRow(k, v, tag))
         }
-        for (k in keys.sorted()) {
-            val o = detailsData.optJSONObject(k)
-            val v = o?.optString("value", "") ?: detailsData.optString(k, "")
-            val tag = o?.optString("tag", "").orEmpty()
-            if (v.isEmpty() || v == "null") continue
-            detailsList.addView(detailRow(k, v, tag))
+        detailsCount.text =
+            "$filled/${knownKeys.size} fields bhare hue — badlo, phir neeche 💾 Save dabao"
+
+        // Custom rows — unknown keys (P10/P11).
+        val knownSet = knownKeys.toSet()
+        val customKeys = mutableListOf<String>()
+        val it = detailsData.keys()
+        while (it.hasNext()) {
+            val k = it.next()
+            if (k !in knownSet && storedValue(k).let { v -> v.isNotEmpty() && v != "null" }) {
+                customKeys.add(k)
+            }
+        }
+        for (k in customKeys.sorted()) {
+            val v = storedValue(k)
+            customOriginal[k] = v
+            customTags[k] = storedTag(k)
+            customList.addView(customRow(k, v))
+        }
+        if (customKeys.isEmpty()) {
+            customList.addView(TextView(context).apply {
+                text = "Koi extra detail nahi — \"＋ Add more\" se jodo."
+                textSize = 12f
+                setTextColor(Color.parseColor("#80868B"))
+                setPadding(0, dp(2), 0, dp(2))
+            })
         }
     }
 
-    private fun detailRow(key: String, value: String, tag: String): LinearLayout {
+    /** P9: known field ki ek form row — label + EditText (khaali ho to bhi). */
+    private fun knownFieldRow(key: String, value: String, tag: String): LinearLayout {
         return LinearLayout(context).apply {
+            orientation = VERTICAL
+            setPadding(dp(4), dp(6), dp(4), dp(6))
+            addView(TextView(context).apply {
+                text = DetailExtractor.label(key) +
+                    (if (tag.isNotEmpty()) "  🏷️ $tag" else "")
+                textSize = 12f
+                setTextColor(Color.parseColor("#80868B"))
+            })
+            addView(EditText(context).apply {
+                setText(value)
+                hint = DetailExtractor.label(key)
+                textSize = 15f
+                setTextColor(Color.parseColor("#202124"))
+                setPadding(dp(8), dp(8), dp(8), dp(8))
+                fieldEdits[key] = this
+            })
+        }
+    }
+
+    /** P10: custom Tag+Value row — label, value EditText, per-row delete. */
+    private fun customRow(label: String, value: String): LinearLayout {
+        val row = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             background = cardBg()
             setPadding(dp(10), dp(8), dp(10), dp(8))
-            isClickable = true
-            isFocusable = true
-            addView(LinearLayout(context).apply {
-                orientation = VERTICAL
-                layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
-                addView(TextView(context).apply {
-                    text = DetailExtractor.label(key) +
-                        (if (tag.isNotEmpty()) "  🏷️ $tag" else "")
-                    textSize = 12f
-                    setTextColor(Color.parseColor("#80868B"))
-                })
-                addView(TextView(context).apply {
-                    text = value
-                    textSize = 15f
-                    setTextColor(Color.parseColor("#202124"))
-                })
-            })
-            addView(Button(context).apply {
-                text = "✏️"
-                textSize = 14f
-                setOnClickListener { showEditDetailDialog(key, value, tag) }
-            })
-            addView(Button(context).apply {
-                text = "🗑️"
-                textSize = 14f
-                setOnClickListener { confirmDeleteDetail(key) }
-            })
-            setOnClickListener { showEditDetailDialog(key, value, tag) }
-            UiKit.pressFeedback(this)
-            layoutParams = LayoutParams(
-                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 0, 0, dp(6)) }
         }
+        val mid = LinearLayout(context).apply {
+            orientation = VERTICAL
+            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+            addView(TextView(context).apply {
+                text = "🏷️ $label"
+                textSize = 12f
+                setTypeface(null, Typeface.BOLD)
+                setTextColor(Color.parseColor("#5F6368"))
+            })
+            addView(EditText(context).apply {
+                setText(value)
+                textSize = 15f
+                setTextColor(Color.parseColor("#202124"))
+                customEdits[label] = this
+            })
+        }
+        row.addView(mid)
+        row.addView(Button(context).apply {
+            text = "🗑️"
+            textSize = 14f
+            minimumWidth = 0
+            setOnClickListener { confirmDeleteCustom(label, row) }
+        })
+        row.layoutParams = LayoutParams(
+            LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(0, 0, 0, dp(6)) }
+        return row
     }
 
-    /** #3: Details editable + Save — card ke andar (PATCH /api/cards/[id]). */
-    private fun showEditDetailDialog(key: String, value: String, tag: String) {
+    /** P10: "＋ Add more" — Tag (label) + Value dialog. */
+    private fun showAddCustomDialog() {
         val act = context as? Activity ?: return
         val layout = LinearLayout(act).apply {
             orientation = VERTICAL
             setPadding(dp(24), dp(8), dp(24), dp(8))
         }
         layout.addView(TextView(act).apply {
-            text = "${DetailExtractor.label(key)} (मूल्य)"
+            text = "Tag (टैग) — jaise: Aadhar number"
             textSize = 13f
             setTextColor(Color.parseColor("#80868B"))
-        })
-        val valEt = EditText(act).apply {
-            setText(value)
-            textSize = 16f
-            setTextColor(Color.parseColor("#202124"))
-        }
-        layout.addView(valEt)
-        layout.addView(TextView(act).apply {
-            text = "Tag (टैग) — jaise: zamin, job, scholarship"
-            textSize = 13f
-            setTextColor(Color.parseColor("#80868B"))
-            setPadding(0, dp(8), 0, 0)
         })
         val tagEt = EditText(act).apply {
-            setText(tag)
-            hint = "tag (optional)"
+            hint = "Tag likho"
             textSize = 16f
             setTextColor(Color.parseColor("#202124"))
         }
         layout.addView(tagEt)
+        layout.addView(TextView(act).apply {
+            text = "Value (मूल्य)"
+            textSize = 13f
+            setTextColor(Color.parseColor("#80868B"))
+            setPadding(0, dp(8), 0, 0)
+        })
+        val valEt = EditText(act).apply {
+            hint = "Value likho"
+            textSize = 16f
+            setTextColor(Color.parseColor("#202124"))
+        }
+        layout.addView(valEt)
         val errTv = TextView(act).apply {
             textSize = 12f
             setTextColor(Color.parseColor("#C5221F"))
@@ -305,39 +400,118 @@ class CardDetailView(
         }
         layout.addView(errTv)
         val dlg = AlertDialog.Builder(act)
-            .setTitle("✏️ Edit (संपादित करें) — ${DetailExtractor.label(key)}")
+            .setTitle("＋ Add more (और जोड़ें)")
             .setView(ScrollView(act).apply { addView(layout) })
-            .setPositiveButton("💾 Save (सहेजें)", null)
-            .setNegativeButton("❌ Radd karo (रद्द करें)", null)
+            .setPositiveButton("Jodo (जोड़ें)", null)
+            .setNegativeButton("Radd karo", null)
             .create()
         dlg.setOnShowListener {
             dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val nv = valEt.text.toString().trim()
-                val nt = tagEt.text.toString().trim()
-                // #2: validate — galat ho to toko + samjhao, dialog khula rahe
-                val err = CardFlow.validateField(key, nv)
-                if (err != null && nv.isNotEmpty()) {
-                    errTv.text = "❌ $err"
-                    errTv.visibility = View.VISIBLE
-                    return@setOnClickListener
+                val tag = tagEt.text.toString().trim()
+                val v = valEt.text.toString().trim()
+                when {
+                    tag.isEmpty() -> {
+                        errTv.text = "❌ Tag khaali hai"
+                        errTv.visibility = View.VISIBLE
+                    }
+                    v.isEmpty() -> {
+                        errTv.text = "❌ Value khaali hai"
+                        errTv.visibility = View.VISIBLE
+                    }
+                    customEdits.containsKey(tag) || knownKeys.contains(tag) -> {
+                        errTv.text = "❌ Ye tag pehle se hai"
+                        errTv.visibility = View.VISIBLE
+                    }
+                    else -> {
+                        dlg.dismiss()
+                        // Pehle se "khaali" wala placeholder hatao.
+                        if (customEdits.isEmpty() && customOriginal.isEmpty()) {
+                            customList.removeAllViews()
+                        }
+                        customList.addView(customRow(tag, v))
+                        toast("✓ Judega — neeche 💾 Save dabao")
+                    }
                 }
-                if (nv.isEmpty()) {
-                    errTv.text = "❌ Khaali hai — kuch likho ya 🗑️ se hatao"
-                    errTv.visibility = View.VISIBLE
-                    return@setOnClickListener
-                }
-                dlg.dismiss()
-                patchOneField(key, nv, nt)
             }
         }
         dlg.show()
     }
 
-    private fun patchOneField(key: String, value: String, tag: String) {
+    /** P10: per-row confirmed delete (har delete par confirmation popup). */
+    private fun confirmDeleteCustom(label: String, row: View) {
+        val act = context as? Activity ?: return
+        AlertDialog.Builder(act)
+            .setTitle("🗑️ Extra detail hatao?")
+            .setMessage(
+                "\"$label\" is card se hat jayega.\n" +
+                    "Ye wapas nahi aayega!"
+            )
+            .setPositiveButton("🗑️ Hatao (हटाएं)") { d, _ ->
+                d.dismiss()
+                customList.removeView(row)
+                customEdits.remove(label)
+                // Server par maujood tha → Save par null jayega (delete).
+                if (customOriginal.containsKey(label)) {
+                    customDeleted.add(label)
+                }
+                toast("✓ Hatega — neeche 💾 Save dabao")
+            }
+            .setNegativeButton("Rakho (रखें)", null)
+            .show()
+    }
+
+    /**
+     * P9: EK Save button — saare staged badlav ek PATCH me.
+     *  - known field badla → {value, tag}; khaali kiya (pehle bhara tha) → null.
+     *  - custom badla/naya → {value, tag}; delete confirm hua → null.
+     *  - validate fail → ruko, error dikhao (galat save nahi).
+     */
+    private fun saveAllDetails() {
+        val details = JSONObject()
+        // Known fields
+        for ((k, et) in fieldEdits) {
+            val nv = et.text.toString().trim()
+            val ov = knownOriginal[k].orEmpty()
+            if (nv == ov) continue
+            if (nv.isNotEmpty()) {
+                val err = CardFlow.validateField(k, nv)
+                if (err != null) {
+                    toast("❌ ${DetailExtractor.label(k)}: $err")
+                    et.requestFocus()
+                    return
+                }
+                details.put(
+                    k,
+                    JSONObject().put("value", nv).put("tag", knownTags[k].orEmpty())
+                )
+            } else if (ov.isNotEmpty()) {
+                details.put(k, JSONObject.NULL)
+            }
+        }
+        // Custom rows
+        for ((label, et) in customEdits) {
+            if (label in customDeleted) continue
+            val nv = et.text.toString().trim()
+            val ov = customOriginal[label]
+            if (ov != null && nv == ov) continue
+            if (nv.isEmpty()) {
+                if (ov != null) details.put(label, JSONObject.NULL)
+                continue
+            }
+            details.put(
+                label,
+                JSONObject().put("value", nv).put("tag", customTags[label].orEmpty())
+            )
+        }
+        for (label in customDeleted) {
+            details.put(label, JSONObject.NULL)
+        }
+        if (details.length() == 0) {
+            toast("Koi badlav nahi")
+            return
+        }
         toast("Save ho raha hai…")
         Thread({
-            val details = JSONObject()
-                .put(key, JSONObject().put("value", value).put("tag", tag))
             val res = try { AgentApi.patchCard(context, cardId, cardToken, details) }
             catch (_: Exception) { AgentApi.ApiResult(-1, null) }
             post {
@@ -351,135 +525,7 @@ class CardDetailView(
                     toast("⚠️ Save nahi hua — dobara try karo")
                 }
             }
-        }, "fm-card-patch").start()
-    }
-
-    private fun showAddDetailDialog() {
-        val act = context as? Activity ?: return
-        val keys = DetailExtractor.orderedKeys() + listOf("khata", "khesra", "mauza")
-        // pehle se maujood keys hatao
-        val avail = keys.filter { k ->
-            try { !detailsData.has(k) } catch (_: Exception) { true }
-        }
-        if (avail.isEmpty()) {
-            toast("Sab fields pehle se hain — maujooda ko tap karke edit karo")
-            return
-        }
-        val availLabels = avail.map { DetailExtractor.label(it) }.toTypedArray()
-        var checked = 0
-        val dlg = AlertDialog.Builder(act)
-            .setTitle("➕ Detail jodo (विवरण जोड़ें)")
-            .setSingleChoiceItems(availLabels, 0) { _, w -> checked = w }
-            .setPositiveButton("💾 Save (सहेजें)", null)
-            .setNegativeButton("Radd karo", null)
-            .create()
-        dlg.setOnShowListener {
-            // Pehle field chuno, phir value/tag alag dialog me.
-            dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                dlg.dismiss()
-                val key = avail[checked]
-                askValueAndTag(act, key) { v, t -> patchOneField(key, v, t) }
-            }
-        }
-        dlg.show()
-    }
-
-    private fun askValueAndTag(
-        act: Activity,
-        key: String,
-        onSave: (value: String, tag: String) -> Unit
-    ) {
-        val layout = LinearLayout(act).apply {
-            orientation = VERTICAL
-            setPadding(dp(24), dp(8), dp(24), dp(8))
-        }
-        layout.addView(TextView(act).apply {
-            text = DetailExtractor.label(key)
-            textSize = 14f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.parseColor("#202124"))
-        })
-        val valEt = EditText(act).apply {
-            hint = "Value likho"
-            textSize = 16f
-            setTextColor(Color.parseColor("#202124"))
-        }
-        layout.addView(valEt)
-        val tagEt = EditText(act).apply {
-            hint = "tag (optional) — jaise zamin, job"
-            textSize = 16f
-            setTextColor(Color.parseColor("#202124"))
-        }
-        layout.addView(tagEt)
-        val errTv = TextView(act).apply {
-            textSize = 12f
-            setTextColor(Color.parseColor("#C5221F"))
-            visibility = View.GONE
-        }
-        layout.addView(errTv)
-        val d2 = AlertDialog.Builder(act)
-            .setTitle("Value likho")
-            .setView(layout)
-            .setPositiveButton("💾 Save (सहेजें)", null)
-            .setNegativeButton("Wapas", null)
-            .create()
-        d2.setOnShowListener {
-            d2.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val v = valEt.text.toString().trim()
-                val t = tagEt.text.toString().trim()
-                val err = CardFlow.validateField(key, v)
-                if (err != null && v.isNotEmpty()) {
-                    errTv.text = "❌ $err"
-                    errTv.visibility = View.VISIBLE
-                    return@setOnClickListener
-                }
-                if (v.isEmpty()) {
-                    errTv.text = "❌ Value khaali hai"
-                    errTv.visibility = View.VISIBLE
-                    return@setOnClickListener
-                }
-                d2.dismiss()
-                onSave(v, t)
-            }
-        }
-        d2.show()
-    }
-
-    /** D18: har delete par pehle confirmation popup. */
-    private fun confirmDeleteDetail(key: String) {
-        val act = context as? Activity ?: return
-        AlertDialog.Builder(act)
-            .setTitle("🗑️ Detail hatao? (हटाएं?)")
-            .setMessage(
-                "\"${DetailExtractor.label(key)}\" is card se hat jayega.\n" +
-                    "Agent aage se is detail ko form me nahi bharega."
-            )
-            .setPositiveButton("🗑️ Hatao (हटाएं)") { d, _ ->
-                d.dismiss()
-                deleteDetail(key)
-            }
-            .setNegativeButton("Rakho (रखें)", null)
-            .show()
-    }
-
-    private fun deleteDetail(key: String) {
-        // Contract me field-delete ka alag endpoint nahi — PATCH me null
-        // bhejkar hatane ki koshish; server merge me null ko delete mane.
-        // (Server worker se confirm karna hai — conformance note.)
-        toast("Hata raha hun…")
-        Thread({
-            val details = JSONObject().put(key, JSONObject.NULL)
-            val res = try { AgentApi.patchCard(context, cardId, cardToken, details) }
-            catch (_: Exception) { AgentApi.ApiResult(-1, null) }
-            post {
-                if (res.code in 200..299) {
-                    toast("✓ Hata diya")
-                    load()
-                } else {
-                    toast("⚠️ Hataya nahi gaya — dobara try karo")
-                }
-            }
-        }, "fm-card-deldetail").start()
+        }, "fm-card-saveall").start()
     }
 
     private fun confirmDeleteCard() {

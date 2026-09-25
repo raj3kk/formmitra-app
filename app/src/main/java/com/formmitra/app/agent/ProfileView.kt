@@ -189,7 +189,7 @@ class ProfileView(
             setPadding(dp(9), dp(6), dp(9), dp(6))
         }
         wmRow.addView(TextView(context).apply {
-            text = "🤖 Working Mode (कार्य मोड)\nBackground automation ON/OFF"
+            text = "🤖 Working Mode (कार्य मोड)\nON: tez background automation • OFF: sirf notification"
             textSize = 11f
             setTextColor(Color.parseColor("#202124"))
             layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)

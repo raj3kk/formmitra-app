@@ -43,6 +43,15 @@ class FmApp : Application(), Configuration.Provider {
         } catch (t: Throwable) {
             Log.e("FmApp", "WorkManager init failed (workers baad me retry karenge)", t)
         }
+        // v28 P13: WhopClip-style always-on presence — APP KHULNE PAR HI
+        // foreground service start (Working Mode toggle se independent).
+        // WorkingMode.apply() bhi ise start karta hai, par yahan explicit
+        // taaki presence kabhi toggle-logic par depend na kare.
+        try {
+            com.formmitra.app.agent.WorkingModeService.start(this)
+        } catch (t: Throwable) {
+            Log.e("FmApp", "presence start failed (non-fatal)", t)
+        }
         // G1: app khulne par Working Mode apply (reboot ke baad bhi yaad rehta hai).
         // ON ho to workers + NetWake lagte hain; OFF ho to kuch schedule nahi hota.
         try {

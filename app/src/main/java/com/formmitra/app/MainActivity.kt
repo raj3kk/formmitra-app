@@ -190,8 +190,12 @@ class MainActivity : Activity() {
             this,
             // v24 B8/C14: category card → card-first flow complete hone par
             // card bind + category chat start (prefill card se).
-            onStartCategory = { category, label, prefill, cardId, cardName, cardToken ->
-                startCategoryWork(category, label, prefill, cardId, cardName, cardToken)
+            // v28: track card par trackingType bhi thread hota hai.
+            onStartCategory = { category, label, prefill, cardId, cardName, cardToken, trackingType ->
+                startCategoryWork(
+                    category, label, prefill, cardId, cardName, cardToken,
+                    trackingType
+                )
             },
             onShowMirror = { showMirror() },
             onOpenProfile = { selectTab("/profile") },
@@ -545,12 +549,25 @@ class MainActivity : Activity() {
         prefill: Map<String, String>,
         cardId: String,
         cardName: String,
-        cardToken: String
+        cardToken: String,
+        trackingType: String? = null
     ) {
+        // v28 P12: tab-switch/chat-creation par koi crash nahi.
+        try {
         if (!agentVisible) selectTab("/agent")
+        // v28 P8: Home se har kaam naya session me shuru hota hai —
+        // nayiSession = true. Purana kaam Agent tab → 📜 Purane kaam se resume.
         agentChatView.startCategoryChat(
-            category, label, prefill, cardId, cardName, cardToken
+            category, label, prefill, cardId, cardName, cardToken,
+            trackingType, true
         )
+        } catch (t: Throwable) {
+            android.util.Log.e("FmMain", "startCategoryWork failed", t)
+            android.widget.Toast.makeText(
+                this, "⚠️ Kaam khulne me dikkat aayi — dobara try karo",
+                android.widget.Toast.LENGTH_SHORT
+            ).show()
+        }
     }
 
     /**

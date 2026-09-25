@@ -65,6 +65,8 @@ object CardFlow {
             val res = try { AgentApi.cards(act) }
             catch (_: Exception) { AgentApi.ApiResult(-1, null) }
             act.runOnUiThread {
+                // v28 P12: UI block me koi crash nahi — fail-soft toast.
+                try {
                 when {
                     res.code == 401 -> {
                         toast(act, "🔑 Pehle login karo — tabhi Card banega")
@@ -125,6 +127,10 @@ object CardFlow {
                             )
                         }
                     }
+                }
+                } catch (t: Throwable) {
+                    android.util.Log.e("FmCardFlow", "startForCategory UI failed", t)
+                    toast(act, "⚠️ Card khulne me dikkat aayi — dobara try karo")
                 }
             }
         }, "fm-cardflow-list").start()
