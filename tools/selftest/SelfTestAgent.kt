@@ -1,11 +1,13 @@
 import com.formmitra.app.engine.AgentActions
+import com.formmitra.app.engine.AiUsage
 import com.formmitra.app.engine.StepParser
 import com.formmitra.app.engine.agentStepSig
 import com.formmitra.app.engine.agentStepToSpec
 import com.formmitra.app.engine.validateAgentStep
+import com.formmitra.app.agent.LearnLogic
 
 // Self-test: AgentLoopLogic (pure Kotlin, no Android).
-// Compile: kotlinc FormStepLogic.kt AgentLoopLogic.kt SelfTestAgent.kt -d out && java -cp out SelfTestAgentKt
+// Compile: kotlinc FormStepLogic.kt AgentLoopLogic.kt AiUsage.kt LearnLogic.kt SelfTestAgent.kt -d out && java -cp out SelfTestAgentKt
 
 var failures = 0
 
@@ -155,6 +157,80 @@ fun main() {
     check("captcha_solve spec mapping", StepParser.parse(csspec).type == "captcha_solve")
     val cdspec = agentStepToSpec(mapOf("action" to "captcha_detect"))
     check("captcha_detect spec mapping", StepParser.parse(cdspec).type == "captcha_detect")
+
+    // ---- v24-refine: AiUsage (quota discipline — har AI call ka reason) ----
+    AiUsage.reset()
+    check("aiusage zero", AiUsage.totalAiCalls() == 0 && AiUsage.totalPatternHits() == 0)
+    AiUsage.logAct(AiUsage.R_NEW_STEP)
+    AiUsage.logAct(AiUsage.R_NEW_STEP)
+    AiUsage.logAct(AiUsage.R_REPLAN_FAIL)
+    AiUsage.logVerify(AiUsage.R_FINAL_SUBMIT)
+    AiUsage.logPrecheck(AiUsage.R_NEW_TASK)
+    AiUsage.logPatternHit(AiUsage.P_CHOICE)
+    AiUsage.logPatternHit(AiUsage.P_DETAIL)
+    check("aiusage act count", AiUsage.getActCalls() == 3)
+    check("aiusage verify count", AiUsage.getVerifyCalls() == 1)
+    check("aiusage precheck count", AiUsage.getPrecheckCalls() == 1)
+    check("aiusage reason new_step", AiUsage.getReasonCount(AiUsage.R_NEW_STEP) == 2)
+    check("aiusage reason replan", AiUsage.getReasonCount(AiUsage.R_REPLAN_FAIL) == 1)
+    check("aiusage pattern total", AiUsage.totalPatternHits() == 2)
+    check("aiusage pattern kind", AiUsage.getPatternHits(AiUsage.P_CHOICE) == 1)
+    val summ = AiUsage.summary()
+    check(
+        "aiusage summary",
+        summ.contains("AI calls: 5") && summ.contains("new_step×2") &&
+            summ.contains("pattern-hits: 2")
+    )
+    AiUsage.reset()
+    check("aiusage reset", AiUsage.totalAiCalls() == 0 && AiUsage.totalPatternHits() == 0)
+
+    // ---- v24-refine: LearnLogic (seekho-ek-baar → khud-karo) ----
+    check(
+        "fieldmap key shape",
+        LearnLogic.fieldMapKey("Example.com", "Label", " Phone Number ") ==
+            "example.com|label:Phone Number"
+    )
+    check(
+        "drift null when no pattern",
+        LearnLogic.fieldMapDriftNote(null, "999", "999") == null
+    )
+    check(
+        "drift null when consistent",
+        LearnLogic.fieldMapDriftNote("phone", "9812345678", "9812345678") == null
+    )
+    check(
+        "drift null when empty value",
+        LearnLogic.fieldMapDriftNote("phone", "", "9812345678") == null
+    )
+    val driftNote = LearnLogic.fieldMapDriftNote("phone", "123", "9812345678")
+    check(
+        "drift note on mismatch",
+        driftNote != null && driftNote.contains("mapping_note") && driftNote.contains("phone")
+    )
+    check(
+        "attribute source found",
+        LearnLogic.attributeSource(
+            "9812345678",
+            mapOf("phone" to "9812345678", "name" to "Ravi")
+        ) == "phone"
+    )
+    check(
+        "attribute source unknown",
+        LearnLogic.attributeSource("xyz", mapOf("phone" to "9812345678")) == null
+    )
+    check(
+        "attribute source empty",
+        LearnLogic.attributeSource("", mapOf("phone" to "")) == null
+    )
+    check(
+        "precheck key normalized",
+        LearnLogic.precheckCacheKey("HTTPS://X.com/Apply ", "Track Zamin") ==
+            "https://x.com/apply|track zamin"
+    )
+    val nowMs = 1_700_000_000_000L
+    check("cache fresh", LearnLogic.isCacheFresh(nowMs - 1000, nowMs))
+    check("cache stale 25h", !LearnLogic.isCacheFresh(nowMs - 25 * 60 * 60 * 1000L, nowMs))
+    check("cache zero", !LearnLogic.isCacheFresh(0, nowMs))
 
     if (failures > 0) {
         println("$failures FAILURES")

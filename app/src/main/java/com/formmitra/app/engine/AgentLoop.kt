@@ -5,7 +5,9 @@ import com.formmitra.app.agent.AgentApi
 import com.formmitra.app.agent.ChoiceMemory
 import com.formmitra.app.agent.DetailStore
 import com.formmitra.app.agent.DocumentAutoPick
+import com.formmitra.app.agent.FieldMapMemory
 import com.formmitra.app.agent.FlowAnnouncer
+import com.formmitra.app.agent.LearnLogic
 import com.formmitra.app.agent.NotifCenter
 import com.formmitra.app.agent.SiteCredentialStore
 import org.json.JSONArray
@@ -98,6 +100,11 @@ object AgentLoop {
         // Login/document prompt bhi ek run me ek hi baar (proactive triggers ke liye)
         var loginPrompted = false
         var docPrompted = false
+        // v24-refine (AI-training + quota): har act() call ka reason
+        // (nayi/stuck/complex) + stuck-diagnosis ka state.
+        var actReason = AiUsage.R_NEW_STEP
+        var stuckDiagnosed = false
+        var lastDiagnosis: List<String> = emptyList()
 
         // Local task: runId khaali ho to local-<timestamp> (standalone mode —
         // UI agent local task banate waqt khud bhi yehi format bhej sakta hai)
@@ -109,6 +116,10 @@ object AgentLoop {
         try {
             AgentResume.save(ctx, goal, startUrl, effectiveRunId, effectiveRunId, category)
         } catch (_: Exception) { }
+        // v24-refine (AI-training + quota discipline): run-scoped AI-usage
+        // hisaab reset.
+        AiUsage.reset()
+        // (site-memory block neeche hai — local funs ke baad)
         // Server-side run record (best-effort — fail ho to bina reporting chalao)
         var agentRunId: String? = null
         try { agentRunId = RunReporter.createRun(ctx, goal, startUrl, effectiveRunId) } catch (_: Exception) { }
@@ -141,6 +152,11 @@ object AgentLoop {
         }
 
         fun finish(status: String, summary: String): FormEngine.RunResult {
+            // v24-refine (quota discipline): run ke end par AI-usage ka
+            // saaf hisaab steps-log me — kitni AI calls (kyun-kyn) aur
+            // kitni pattern-hits (kitni calls bachi).
+            try { logStep(stepsTaken, "ai_usage", true, AiUsage.summary()) }
+            catch (_: Exception) { }
             // G2: needs_user / failed / needs_admin par resume state RAKHO —
             // WakeWorker ya user-jawab par usi step se continue hoga.
             // Sirf true terminal (done/cancelled/vetoed) par clear.
@@ -174,8 +190,40 @@ object AgentLoop {
                 consecErrors = 0
             }
             logStep(i, action, false, msg)
+            // v24-refine: agla act() dobara-plan reason ke saath logged hoga.
+            actReason = AiUsage.R_REPLAN_FAIL
             return stuckCount >= AgentActions.STUCK_MAX
         }
+
+        // v24-refine (AI-training): site-memory — server ki seekhi hui
+        // yaadein, run shuru me EK call (per-step nahi). Fail-heavy site →
+        // brain ko history[0] me chetavni (contract change nahi — history
+        // act() body me pehle se jati hai; ye wahi "site memory" mechanism
+        // hai jo user ne manga tha).
+        try {
+            val mems = AgentApi.siteMemory(ctx)
+            if (mems != null) {
+                val host = SiteCredentialStore.domainOf(startUrl)
+                for (i in 0 until mems.length()) {
+                    val m = mems.optJSONObject(i) ?: continue
+                    if (!m.optString("host").equals(host, true)) continue
+                    val gt = m.optString("goal_type")
+                    if (category.isNotEmpty() && gt.isNotEmpty() && !gt.equals(category, true)) continue
+                    val sc = m.optInt("success_count")
+                    val fc = m.optInt("fail_count")
+                    if (fc > sc && fc >= 2) {
+                        val le = m.optString("last_error").take(200)
+                        history.add(
+                            JSONObject().put("action", "site_memory")
+                                .put("result", "warn")
+                                .put("detail", "Is site par pichli baar $fc baar fail hua ($sc baar safal). Aakhri dikkat: $le. Extra dhyan do.")
+                        )
+                        logStep(0, "site_memory", true, "fail-heavy site: fail=$fc success=$sc")
+                    }
+                    break
+                }
+            }
+        } catch (_: Exception) { }
 
         // Pre-run: goal/start-URL me payment keyword = form-fee expected hai.
         // Yahan ROKO MAT — loop aage badhega; asli payment page aane par
@@ -318,6 +366,9 @@ object AgentLoop {
                 // forceStandalone (offline task): server ko chhodo, seedha user ki
                 // Groq key se StandaloneBrain. Server unreachable fallback neeche
                 // (per-step) waise bhi hai; ye poore run ka standalone mode hai.
+                // v24-refine (quota discipline): har AI call ka reason logged —
+                // debugging me pata chale call KYUN hua (nayi/stuck/complex).
+                AiUsage.logAct(actReason)
                 var res: AgentApi.ApiResult = if (forceStandalone && Standalone.isConfigured(ctx)) {
                     try { onStandaloneMode() } catch (_: Exception) { }
                     logStep(i, "act", false, "standalone mode → StandaloneBrain (Groq direct)")
@@ -499,71 +550,140 @@ object AgentLoop {
                         }
                     }
                     if (stuckCount >= AgentActions.STUCK_MAX) {
-                        return finish(
-                            "needs_user",
-                            "Ek hi jagah ghoom raha hoon — phas gaya, aap dekh lein"
-                        )
+                        var msg = "Ek hi jagah ghoom raha hoon — phas gaya, aap dekh lein"
+                        // v24-refine: operator ne jo dekha, agent ko sahi
+                        // shabdon me — AI diagnosis bhi user tak.
+                        if (lastDiagnosis.isNotEmpty()) {
+                            msg += " (AI ki raay: ${lastDiagnosis.first().take(150)})"
+                        }
+                        return finish("needs_user", msg)
                     }
+                    // v24-refine (AI-training): ataki situation → AI
+                    // escalation — /api/agent/verify se diagnosis (EK call
+                    // per stuck episode, har step par nahi — quota discipline).
+                    if (!stuckDiagnosed) {
+                        stuckDiagnosed = true
+                        val dshot = try { engine.capturePngBase64() }
+                        catch (_: Exception) { "" }
+                        lastDiagnosis = AiTrainer.diagnoseStuck(
+                            ctx, goal, dshot,
+                            "ek hi action 3 baar ho chuka hai ($sig)"
+                        )
+                        if (lastDiagnosis.isNotEmpty()) {
+                            val d = lastDiagnosis.joinToString(" | ").take(300)
+                            pushHistory(
+                                "ai_diagnosis",
+                                mapOf("action" to "ai_diagnosis"),
+                                "stuck-help", d
+                            )
+                            logStep(i, "ai_diagnosis", true, d.take(200))
+                            FlowAnnouncer.say(
+                                ctx,
+                                "Ruk gaya tha — AI se nayi raay li, dobara koshish karta hun"
+                            )
+                        } else {
+                            logStep(i, "ai_diagnosis", false, "diagnosis nahi mili — seedha replan")
+                        }
+                    }
+                    actReason = AiUsage.R_STUCK_RETRY
                     continue
                 }
 
+                // (g2) v24-refine (AI-training): execute se PEHLE local
+                // sanity — AI ka diya target page par abhi zinda hai?
+                // (koi AI call nahi — quota bachat.) Stale → blind execute
+                // NAHI; wajah history me → agli act() dobara plan karegi.
+                val sanityErr = AiTrainer.preExecuteSanity(action, stepMap, engine)
+                if (sanityErr != null) {
+                    pushHistory(action, stepMap, "stale_target", sanityErr.take(300))
+                    logStep(i, action, false, sanityErr.take(200))
+                    recentSigs.add(sig)
+                    if (recentSigs.size > AgentActions.STUCK_REPEATS) recentSigs.removeAt(0)
+                    actReason = AiUsage.R_REPLAN_STALE
+                    continue
+                }
+
+                // (g3) v24-refine (AI-training): field-mapping check — seekha
+                // hua pattern (domain|selector → source) match ho aur value
+                // consistent ho → local OK (AI call nahi). Drift dikhe →
+                // brain ko mapping-note (history) → AI khud correct karega.
+                if (action == "fill") {
+                    try {
+                        @Suppress("UNCHECKED_CAST")
+                        val fsel = stepMap["selector"] as? Map<String, Any?>
+                        val fmode = ((fsel?.get("mode") as? String)?.ifEmpty { "css" }) ?: "css"
+                        val fval = (fsel?.get("value") as? String).orEmpty()
+                        val curVal = (stepMap["value"] as? String).orEmpty()
+                        if (fval.isNotEmpty() && curVal.isNotEmpty()) {
+                            val host = SiteCredentialStore.domainOf(currentUrl)
+                            val learnedSrc = FieldMapMemory.get(
+                                ctx, FieldMapMemory.key(host, fmode, fval)
+                            )
+                            if (learnedSrc != null) {
+                                val srcVal = userProvided.optString(learnedSrc, "").ifEmpty {
+                                    try { DetailStore.findValue(ctx, learnedSrc) }
+                                    catch (_: Exception) { "" }
+                                }
+                                val note = AiTrainer.mappingNote(learnedSrc, curVal, srcVal)
+                                if (note != null) {
+                                    pushHistory(action, stepMap, "mapping_note", note.take(300))
+                                    logStep(i, "fieldmap", true, "mapping drift — brain ko bataya")
+                                } else {
+                                    AiUsage.logPatternHit(AiUsage.P_FIELDMAP)
+                                }
+                            }
+                        }
+                    } catch (_: Exception) { }
+                }
+
                 // (h) execute (veto + timeout runAgentStep ke andar)
-                // (g2) v24 C15: FINAL SUBMIT se pehle AI image-verification.
+                // (g2) v24 C15 + AI-training: FINAL SUBMIT se pehle AI
+                // image-verification (complex judgment → AI call, reason logged).
                 // Submit intent: server ka explicit "verify_submit" action, ya
                 // click/press jisme strong final-submit hint ho (SubmitIntent).
-                // FAIL CLOSED: reject ya error → submit NAHI hoga.
-                // 404 = /api/agent/verify server par abhi deploy nahi →
-                // soft proceed + log (purana behavior, warning ke saath).
+                // FAIL CLOSED: har non-explicit-approval par submit NAHI —
+                // 404, malformed, HTTP error, network error sab par.
+                // Request contract: {image_base64, checklist[]} →
+                // Response: {ok, issues[]}.
                 if (AgentActions.SubmitIntent.shouldVerify(stepMap)) {
                     val vshot = try { engine.capturePngBase64() }
                     catch (_: Exception) { "" }
-                    val note =
-                        "Final submit check — action=$action goal=${goal.take(120)}"
+                    AiUsage.logVerify(AiUsage.R_FINAL_SUBMIT)
+                    val checklist = listOf(
+                        "form ke saare zaroori fields bhare hue dikh rahe hain, koi khaali nahi",
+                        "koi laal error ya warning message nahi dikh raha",
+                        "yeh '${goal.take(100)}' ka final submit hai — sab taiyaar hai"
+                    )
                     val vres = try {
-                        AgentApi.verifySubmit(
-                            ctx, agentRunId ?: effectiveRunId,
-                            downscaleShot(vshot), note
-                        )
+                        AgentApi.verifySubmit(ctx, downscaleShot(vshot), checklist)
                     } catch (_: Exception) { AgentApi.ApiResult(-1, null) }
-                    val vok = when {
-                        vres.code == 404 -> {
-                            logStep(
-                                i, "verify_submit", true,
-                                "verify endpoint 404 (server par abhi nahi) — soft proceed"
-                            )
-                            pushHistory(
-                                action, stepMap, "ok",
-                                "verify 404 → soft proceed (server deploy pending)"
-                            )
-                            true
-                        }
-                        vres.code == -1 -> {
-                            logStep(
-                                i, "verify_submit", false,
-                                "verify network fail — FAIL CLOSED, submit nahi kiya"
-                            )
-                            pushHistory(
-                                action, stepMap, "error",
-                                "verify network fail — submit nahi kiya"
-                            )
-                            false
+                    val vnote: String
+                    val vok: Boolean
+                    when {
+                        vres.code !in 200..299 -> {
+                            // FAIL CLOSED: 404 (endpoint nahi), 400/5xx,
+                            // network fail — har non-approval par submit NAHI.
+                            vnote = "verify nahi ho payi (code=${vres.code}) — " +
+                                "FAIL CLOSED, submit nahi kiya"
+                            vok = false
                         }
                         else -> {
                             val ok = vres.json?.optBoolean("ok", false) == true
-                            val verdict = vres.json?.optString("verdict", "").orEmpty()
-                            val reason = vres.json?.optString("reason", "")
-                                .orEmpty().take(200)
-                            logStep(
-                                i, "verify_submit", ok,
-                                "verdict=$verdict reason=$reason"
-                            )
-                            pushHistory(
-                                action, stepMap, if (ok) "ok" else "rejected",
-                                "verdict=$verdict $reason"
-                            )
-                            ok
+                            val issues = try {
+                                val arr = vres.json?.optJSONArray("issues")
+                                (0 until (arr?.length() ?: 0))
+                                    .mapNotNull {
+                                        arr?.optString(it, "")?.trim()
+                                            ?.takeIf { s -> s.isNotEmpty() }
+                                    }.take(5).joinToString(" | ").take(300)
+                            } catch (_: Exception) { "" }
+                            vnote = if (ok) "AI: sab theek"
+                            else "AI issues: ${issues.ifEmpty { "ok=false, wajah nahi mili" }}"
+                            vok = ok
                         }
                     }
+                    logStep(i, "verify_submit", vok, vnote.take(200))
+                    pushHistory(action, stepMap, if (vok) "ok" else "rejected", vnote.take(300))
                     if (!vok) {
                         return finish(
                             "needs_user",
@@ -580,7 +700,15 @@ object AgentLoop {
                         val msg = "fill verify fail: expected='${
                             detail.optString("expected", "").take(40)
                         }' actual='${detail.optString("value", "").take(40)}'"
-                        pushHistory(action, stepMap, "error", msg)
+                        // v24-refine (AI-training): mapping problem ho sakta
+                        // hai — brain ko DOBARA MAP karne ko kaho; wahi
+                        // selector blind mat dohrao (stuck-check pakdega).
+                        pushHistory(
+                            action, stepMap, "mapping_mismatch",
+                            "$msg — card-field → page-field mapping galat lag " +
+                                "rahi hai; selector/field dobara map karo, " +
+                                "wahi selector blind mat dohrao"
+                        )
                         if (noteError(i, action, msg)) {
                             return finish(
                                 "needs_user",
@@ -591,9 +719,48 @@ object AgentLoop {
                     }
                     consecErrors = 0
                     stepsTaken++
+                    // v24-refine: safal step → agla act() nayi situation;
+                    // stuck-episode khatm (naya diagnosis episode shuru hoga).
+                    actReason = AiUsage.R_NEW_STEP
+                    stuckDiagnosed = false
+                    lastDiagnosis = emptyList()
                     val dStr = detail.toString().take(300)
                     logStep(i, action, true, dStr)
                     pushHistory(action, stepMap, "ok", dStr)
+                    // v24-refine (AI-training): fill VERIFIED → seekho:
+                    // (domain|selector) → source key. Agli baar wahi
+                    // situation me pattern match → consistency local
+                    // (AI call nahi); drift par brain ko mapping-note
+                    // (history) → AI khud correct karega. VALUE kabhi
+                    // save nahi — sirf source KEY.
+                    if (action == "fill") {
+                        try {
+                            val filledVal = (stepMap["value"] as? String).orEmpty()
+                            @Suppress("UNCHECKED_CAST")
+                            val sel = stepMap["selector"] as? Map<String, Any?>
+                            val smode = ((sel?.get("mode") as? String)?.ifEmpty { "css" }) ?: "css"
+                            val sval = (sel?.get("value") as? String).orEmpty()
+                            if (filledVal.isNotEmpty() && sval.isNotEmpty()) {
+                                val sources = LinkedHashMap<String, String>()
+                                val uk = userProvided.keys()
+                                while (uk.hasNext()) {
+                                    val k = uk.next()
+                                    sources[k] = userProvided.optString(k, "")
+                                }
+                                try { sources.putAll(DetailStore.loadAll(ctx)) } catch (_: Exception) { }
+                                val src = LearnLogic.attributeSource(filledVal, sources)
+                                if (src != null) {
+                                    val host = SiteCredentialStore.domainOf(currentUrl)
+                                    FieldMapMemory.save(
+                                        ctx,
+                                        FieldMapMemory.key(host, smode, sval),
+                                        src
+                                    )
+                                    logStep(i, "fieldmap", true, "seekha: field → '$src'")
+                                }
+                            }
+                        } catch (_: Exception) { }
+                    }
                     // G2: har successful step par progress persist — kill/reboot
                     // par WakeWorker usi step se resume karega.
                     try {
@@ -904,6 +1071,8 @@ object AgentLoop {
                     .put("result", "ok")
                     .put("detail", "saved credentials se auto-login (domain=$domain, value hidden)")
             )
+            // v24-refine: learned pattern match → ZERO AI call yahan.
+            AiUsage.logPatternHit(AiUsage.P_LOGIN)
             FlowAnnouncer.say(ctx, "Login apne aap ho raha hai — $domain")
         }
         return ok
@@ -930,6 +1099,8 @@ object AgentLoop {
                     .put("result", "ok")
                     .put("detail", "vault se apne aap chuna (name hidden, local-only)")
             )
+            // v24-refine: learned pattern match → ZERO AI call yahan.
+            AiUsage.logPatternHit(AiUsage.P_DOC)
             FlowAnnouncer.say(ctx, "Document apne aap attach ho raha hai.")
         }
         return ok
@@ -1000,6 +1171,8 @@ object AgentLoop {
                 JSONObject().put("action", "fill_input_auto").put("result", "ok")
                     .put("detail", "DetailStore se apne aap bhara (values hidden)")
             )
+            // v24-refine: learned pattern match → ZERO AI call yahan.
+            AiUsage.logPatternHit(AiUsage.P_DETAIL)
             FlowAnnouncer.say(ctx, "Details apne aap bhar di hain.")
             return true
         }
@@ -1029,6 +1202,8 @@ object AgentLoop {
                     .put("result", "ok (auto, remembered)")
                     .put("detail", remembered.take(200))
             )
+            // v24-refine: learned pattern match → ZERO AI call yahan.
+            AiUsage.logPatternHit(AiUsage.P_CHOICE)
             FlowAnnouncer.say(ctx, "Pichli baar wala option apne aap chun liya: $remembered")
             return true
         }

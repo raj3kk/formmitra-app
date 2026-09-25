@@ -667,7 +667,7 @@ class ProfileView(
         catch (_: Exception) { emptyList<String>() }
         if (domains.isEmpty()) {
             loginsList.addView(TextView(context).apply {
-                text = "Koi saved login nahi"
+                text = "Koi saved login nahi (सहेजे लॉगिन नहीं)"
                 textSize = 12f
                 setTextColor(Color.parseColor("#80868B"))
             })

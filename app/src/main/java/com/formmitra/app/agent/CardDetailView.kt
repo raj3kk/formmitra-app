@@ -533,7 +533,7 @@ class CardDetailView(
         val arr = res.json?.optJSONArray("documents")
         if (arr == null || arr.length() == 0) {
             docsList.addView(TextView(context).apply {
-                text = "Koi document nahi — upar Add Document se jodo."
+                text = "Koi document nahi — upar Add Document (दस्तावेज़ जोड़ें) se jodo."
                 textSize = 13f
                 setTextColor(Color.parseColor("#80868B"))
                 setPadding(0, dp(4), 0, dp(4))

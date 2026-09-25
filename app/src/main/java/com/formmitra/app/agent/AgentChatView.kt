@@ -23,6 +23,7 @@ import android.view.inputmethod.EditorInfo
 import com.formmitra.app.engine.Standalone
 import com.formmitra.app.engine.UserPrompt
 import com.formmitra.app.engine.PrecheckLogic
+import com.formmitra.app.engine.AiUsage
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -74,6 +75,14 @@ class AgentChatView(
     private var activeCardName: String? = null
     private var activeCardToken: String? = null
 
+    /**
+     * v24-refine (AI-trained conversational agent): card-create Q&A mode —
+     * server ek-ek karke poochhta hai; app-side turant validation
+     * (tok-sudhar) isi mode me hoti hai. Card ban jaye → setActiveCard
+     * me clear.
+     */
+    private var cardCreateMode = false
+
     /** "Through Agent" card-create chuna → MainActivity chat kholta hai. */
     var onAgentCreateRequest: ((prefill: Map<String, String>) -> Unit)? = null
 
@@ -82,6 +91,7 @@ class AgentChatView(
         activeCardId = cardId
         activeCardName = cardName
         activeCardToken = cardToken
+        cardCreateMode = false
         try {
             AgentApi.setAutomationCard(cardId, cardToken)
         } catch (_: Exception) { }
@@ -104,6 +114,7 @@ class AgentChatView(
     fun startAgentCardCreate(prefill: Map<String, String>) {
         autoPlanArmed = false
         activeCategory = null
+        cardCreateMode = true
         post {
             try { categoryChip.visibility = View.GONE } catch (_: Exception) { }
             addAssistantBubble(
@@ -703,9 +714,46 @@ class AgentChatView(
         val text = raw.trim()
         if (text.isEmpty() || waiting) return
         val candidates = DetailExtractor.extract(text)
-        val fresh = candidates.filterKeys { !sessionDetails.containsKey(it) }
+        // v24-refine (AI-trained agent): sudhar chipke — purana value galat
+        // tha (validate fail) ya naya value sahi hai → update karo. Nahi to
+        // card draft me galat value hi chipki rehti ("correction-stick").
+        val fresh = LinkedHashMap<String, String>()
+        for ((k, v) in candidates) {
+            val old = sessionDetails[k]
+            if (old == null) {
+                fresh[k] = v
+            } else if (old != v &&
+                (CardValidation.validateField(k, old) != null ||
+                    CardValidation.validateField(k, v) == null)
+            ) {
+                fresh[k] = v
+            }
+        }
         if (fresh.isNotEmpty()) {
             sessionDetails.putAll(fresh)
+            // v24-refine (AI-trained agent): card-create Q&A mode me turant
+            // tok-sudhar — LOCAL validation, koi AI call nahi (quota bachat).
+            // Ye sirf turant madad hai; message server ko bhi jayega (server
+            // source of truth — wo bhi validate karega).
+            if (cardCreateMode) {
+                for ((k, v) in fresh) {
+                    val err = CardValidation.validateField(k, v)
+                    if (err != null) {
+                        val label = DetailExtractor.label(k)
+                        val tokMsg = "⚠️ $label theek nahi lag raha: $err\n\n" +
+                            "Sahi karke dobara bhejo — main yahin hun 😊"
+                        post {
+                            addAssistantBubble(tokMsg)
+                            try {
+                                VoiceOutput.speak(
+                                    context,
+                                    "$label theek nahi lag raha. $err"
+                                )
+                            } catch (_: Exception) { }
+                        }
+                    }
+                }
+            }
             // v24 #4: user ne details di par koi active/selected card nahi —
             // details PendingDetails me SAFE (prefs, app kill par bhi), phir
             // create-card par redirect offer. Koi detail beech me ghumti nahi.
@@ -1278,7 +1326,16 @@ class AgentChatView(
      * null = check nahi ho paya (network/401 — proceed anyway, purana flow).
      */
     private fun runPrecheck(url: String, goal: String): PrecheckLogic.Verdict? {
+        // v24-refine (quota discipline): pehle CACHE (24h) — repeat task par
+        // ZERO budget kharch. Order pakka: cache → local → (tabhi) server.
+        try {
+            PrecheckCache.get(context, url, goal)?.let { cached ->
+                AiUsage.logPatternHit(AiUsage.P_PRECHECK_CACHE)
+                return PrecheckLogic.parse(jsonToMap(cached))
+            }
+        } catch (_: Exception) { }
         return try {
+            AiUsage.logPrecheck(AiUsage.R_NEW_TASK)
             val res = AgentApi.precheck(context, url, goal)
             if (res.code == 401) {
                 post { addAssistantBubble("Precheck ke liye login chahiye 🔑 — bina check ke shuru kar raha hu.") }
@@ -1286,6 +1343,8 @@ class AgentChatView(
             } else if (res.code !in 200..299 || res.json == null) {
                 null
             } else {
+                try { PrecheckCache.put(context, url, goal, res.json!!) }
+                catch (_: Exception) { }
                 PrecheckLogic.parse(jsonToMap(res.json!!))
             }
         } catch (_: Exception) {

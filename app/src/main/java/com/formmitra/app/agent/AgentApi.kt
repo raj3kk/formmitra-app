@@ -585,17 +585,23 @@ object AgentApi {
      * 401 bina login. Server deploy na hua ho to 404 — caller fail-soft
      * rakhe (verify na ho to bhi automation na ruke, bas log).
      */
+    /**
+     * POST /api/agent/verify — AI image verification (v24 C15).
+     *
+     * SERVER CONTRACT (root fix — purana {run_id, screenshot_b64, note}
+     * shape server se match nahi karta tha; server 400 deta tha):
+     *   Body: {image_base64: string, checklist: string[]}
+     *   Response: {ok: boolean, issues: string[]} (issues = Hinglish lines)
+     */
     fun verifySubmit(
         ctx: Context,
-        runId: String,
         screenshotB64: String,
-        note: String
+        checklist: List<String>
     ): ApiResult = postWithTimeout(
         "/api/agent/verify", ctx,
         JSONObject()
-            .put("run_id", runId)
-            .put("screenshot_b64", screenshotB64)
-            .put("note", note.take(500)),
+            .put("image_base64", screenshotB64)
+            .put("checklist", JSONArray(checklist.take(20).map { it.take(200) })),
         60_000, automationCardToken
     )
 

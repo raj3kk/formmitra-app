@@ -589,6 +589,26 @@ class FormEngine(private val appContext: Context) {
         })()"""
     }
 
+    /**
+     * v24-refine (AI-training): AI ke diye selector ka target page par abhi
+     * zinda hai ya nahi — execute se pehle LOCAL sanity (koi AI call nahi,
+     * quota bachat). Wahi finderJs jo execute use karta hai (shadow DOM +
+     * iframe piercing) — jo execute dhoondh payega wahi alive manega,
+     * isliye false-block nahi hoga.
+     *
+     * Sirf in par bulao: fill/select/toggle/press/click/verify_submit.
+     * wait_for_x/upload/goto par NAHI (target baad me aa sakta hai /
+     * hidden input / selector nahi hota).
+     */
+    fun selectorAlive(mode: String, value: String): Boolean {
+        if (value.isBlank()) return false
+        return try {
+            evalJsSync("!!(${finderJs(mode, value)})", 8_000).trim() == "true"
+        } catch (_: Exception) {
+            true // check khud fail → block mat karo (fail-open on check error)
+        }
+    }
+
     // ---------------- navigation / primitives ----------------
 
     private fun navigate(url: String) {
