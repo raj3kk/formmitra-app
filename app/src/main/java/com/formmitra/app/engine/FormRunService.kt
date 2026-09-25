@@ -177,6 +177,32 @@ class FormRunService : Service() {
                 // G2 resume: WakeWorker synthetic task me start_step bhejta hai —
                 // AgentLoop usi step se continue karega (shuru se nahi).
                 val startStep = firstStep.optInt("start_step", 0).coerceAtLeast(0)
+                // v29 (P1-APP): step me aayi known details + asked keys —
+                // AgentLoop ke har act() call me jayengi (dobara sawaal nahi).
+                val knownDetails = LinkedHashMap<String, String>()
+                try {
+                    val kd = firstStep.optJSONObject("known_details")
+                        ?: task.optJSONObject("known_details")
+                    if (kd != null) {
+                        val keys = kd.keys()
+                        while (keys.hasNext()) {
+                            val k = keys.next()
+                            val v = kd.optString(k, "").trim()
+                            if (k.isNotEmpty() && v.isNotEmpty()) knownDetails[k] = v
+                        }
+                    }
+                } catch (_: Exception) { }
+                val askedAlready = ArrayList<String>()
+                try {
+                    val aa = firstStep.optJSONArray("asked_already")
+                        ?: task.optJSONArray("asked_already")
+                    if (aa != null) {
+                        for (i in 0 until aa.length()) {
+                            val k = aa.optString(i, "").trim()
+                            if (k.isNotEmpty()) askedAlready.add(k)
+                        }
+                    }
+                } catch (_: Exception) { }
                 AgentLoop.runAgentTask(
                     this, engine, goal, url, runId, 40,
                     onProgress = { aiStep ->
@@ -202,7 +228,9 @@ class FormRunService : Service() {
                     onStandaloneMode = { standaloneMode = true },
                     forceStandalone = standalone,
                     category = category,
-                    startStep = startStep
+                    startStep = startStep,
+                    knownDetails = knownDetails,
+                    askedAlready = askedAlready
                 )
             } else {
                 engine.runTask(task) { step1Based, _ ->

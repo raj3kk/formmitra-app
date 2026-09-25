@@ -73,11 +73,16 @@ object CardStore {
      * field → (value, tag). JSON: {field: {"v": value, "t": tag}}.
      * prefs me persist — app band/kill hone par bhi surakshit.
      */
+    /**
+     * v29 P4: pending me jaane wali har key yahin canonicalize hoti hai —
+     * legacy "address" → "address_line" vagera. Callers par bharosa nahi.
+     */
     fun pendingAdd(ctx: Context, field: String, value: String, tag: String) {
-        if (field.isEmpty() || value.isEmpty()) return
+        val canon = TagRegistry.normalizeTag(field)
+        if (canon.isEmpty() || value.isEmpty()) return
         try {
             val cur = pendingGetRaw(ctx)
-            cur.put(field, JSONObject().put("v", value).put("t", tag))
+            cur.put(canon, JSONObject().put("v", value).put("t", tag))
             saveRaw(ctx, cur)
         } catch (_: Exception) { }
     }
@@ -87,8 +92,9 @@ object CardStore {
         try {
             val cur = pendingGetRaw(ctx)
             for ((k, v) in fields) {
-                if (k.isNotEmpty() && v.isNotEmpty()) {
-                    cur.put(k, JSONObject().put("v", v).put("t", tag))
+                val canon = TagRegistry.normalizeTag(k)
+                if (canon.isNotEmpty() && v.isNotEmpty()) {
+                    cur.put(canon, JSONObject().put("v", v).put("t", tag))
                 }
             }
             saveRaw(ctx, cur)

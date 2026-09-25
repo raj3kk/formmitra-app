@@ -195,14 +195,21 @@ object AgentApi {
      * v24: cardId/cardToken — card-bound chat (C14): body me card_id jata
      * hai + X-Card-Token header, taaki server card ka data use kare.
      * v28: trackingType — track category me 8 track-types ka context
-     * (zameen/job/scholarship/...) server ko jata hai. */
+     * (zameen/job/scholarship/...) server ko jata hai.
+     * v29 (P1-APP): knownDetails — is work me user jo details de chuka
+     * (card + session merged, canonical keys) body me `known_details`
+     * JSONObject ke roop me; server dobara wahi sawaal NAHI poochhega.
+     * askedAlready — is work me pehle poochhe gaye keys (asked_for dedupe);
+     * server inhe repeat nahi karega. */
     fun chat(
         ctx: Context,
         messages: List<Pair<String, String>>,
         category: String? = null,
         cardId: String? = null,
         cardToken: String? = null,
-        trackingType: String? = null
+        trackingType: String? = null,
+        knownDetails: Map<String, String> = emptyMap(),
+        askedAlready: List<String> = emptyList()
     ): ApiResult {
         val arr = JSONArray()
         for ((role, content) in messages) {
@@ -212,13 +219,35 @@ object AgentApi {
         if (!category.isNullOrEmpty()) body.put("category", category)
         if (!cardId.isNullOrEmpty()) body.put("card_id", cardId)
         if (!trackingType.isNullOrEmpty()) body.put("tracking_type", trackingType)
+        // v29 P1: known details — server inhe "pehle se mili hui" maane.
+        if (knownDetails.isNotEmpty()) {
+            val kd = JSONObject()
+            for ((k, v) in knownDetails) {
+                if (k.isNotEmpty() && v.isNotEmpty()) kd.put(k, v)
+            }
+            if (kd.length() > 0) body.put("known_details", kd)
+        }
+        // v29 P1: pehle poochhe gaye keys — server dobara na poochhe.
+        if (askedAlready.isNotEmpty()) {
+            body.put("asked_already", JSONArray(askedAlready.filter { it.isNotEmpty() }))
+        }
         return postWithTimeout("/api/agent/chat", ctx, body, TIMEOUT_MS, cardToken)
     }
 
     /** POST /api/app/form-tasks — sirf goto step; returns (code, taskId).
      *  category: agent_run step + top-level me jata hai taaki AgentLoop ke
-     *  har /api/agent/act call me category pahunche (category-wise automation). */
-    fun createTask(ctx: Context, name: String, url: String, category: String = ""): Pair<Int, String?> {
+     *  har /api/agent/act call me category pahunche (category-wise automation).
+     *  v29 (P1): knownDetails/askedAlready — agent_run step + top-level me
+     *  jate hain taaki FormRunService → AgentLoop → har act() call me
+     *  known_details/asked_already pahunche (server dobara sawaal na poochhe). */
+    fun createTask(
+        ctx: Context,
+        name: String,
+        url: String,
+        category: String = "",
+        knownDetails: Map<String, String> = emptyMap(),
+        askedAlready: List<String> = emptyList()
+    ): Pair<Int, String?> {
         // AI agent mode: pehla step agent_run — AgentLoop har step khud
         // decide karta hai (Phase 2 brain). Fixed goto nahi.
         val firstStep = JSONObject()
@@ -226,12 +255,27 @@ object AgentApi {
             .put("goal", name)
             .put("url", url)
         if (category.isNotEmpty()) firstStep.put("category", category)
+        // v29 P1: known details + asked keys step me (FormRunService inhe
+        // padhkar AgentLoop ko dega).
+        if (knownDetails.isNotEmpty()) {
+            val kd = JSONObject()
+            for ((k, v) in knownDetails) {
+                if (k.isNotEmpty() && v.isNotEmpty()) kd.put(k, v)
+            }
+            if (kd.length() > 0) firstStep.put("known_details", kd)
+        }
+        if (askedAlready.isNotEmpty()) {
+            firstStep.put("asked_already", JSONArray(askedAlready.filter { it.isNotEmpty() }))
+        }
         val steps = JSONArray().put(firstStep)
         val body = JSONObject()
             .put("name", name)
             .put("target_url", url)
             .put("steps", steps)
         if (category.isNotEmpty()) body.put("category", category)
+        // v29 P1: top-level par bhi (server-side visibility ke liye).
+        firstStep.optJSONObject("known_details")?.let { body.put("known_details", it) }
+        firstStep.optJSONArray("asked_already")?.let { body.put("asked_already", it) }
         val res = post("/api/app/form-tasks", ctx, body)
         // v27 RC1 FIX: server `{ task: { id } }` (nested) bhejta hai —
         // top-level `id`/`task_id` kabhi nahi hota tha, isliye task server

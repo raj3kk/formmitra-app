@@ -6,9 +6,11 @@ APP=~/workspace/formmitra-app/app-android
 SRC=$APP/app/src/main/java/com/formmitra/app
 KOTLINC=~/workspace/phone-agent/tools/kotlinc/bin/kotlinc
 STDLIB=~/workspace/phone-agent/tools/kotlinc/lib/kotlin-stdlib.jar
+ANDR_JAR=~/workspace/build-tools/android-sdk/platforms/android-34/android.jar
 OUT=/tmp/fm-selftest
 rm -rf "$OUT"; mkdir -p "$OUT"
 TOTAL_FAIL=0
+TOTAL_PASS=0
 
 run_test() {
   local name="$1"; shift
@@ -17,10 +19,12 @@ run_test() {
   "$KOTLINC" -J-Xmx1g "$@" -d "$OUT/$name" >"$OUT/$name.log" 2>&1
   if [ $? -ne 0 ]; then echo "COMPILE FAILED:"; tail -20 "$OUT/$name.log"; TOTAL_FAIL=$((TOTAL_FAIL+1)); return; fi
   java -cp "$OUT/$name:$STDLIB" "$main" 2>&1 | tee "$OUT/$name.out" | grep -E "^(PASS|FAIL)" | tail -3
-  local fails
+  local fails passes
   fails=$(grep -cE "^(FAIL|Exception in thread)" "$OUT/$name.out" || true)
-  echo "-> $name failures: $fails"
+  passes=$(grep -cE "^PASS" "$OUT/$name.out" || true)
+  echo "-> $name PASS: $passes FAIL: $fails"
   TOTAL_FAIL=$((TOTAL_FAIL+fails))
+  TOTAL_PASS=$((TOTAL_PASS+passes))
 }
 
 run_test selftest SelfTestKt \
@@ -45,6 +49,29 @@ run_test selftest_pay SelfTestPayKt \
   "$SRC/engine/PrecheckLogic.kt" \
   "$APP/tools/selftest/SelfTestPay.kt"
 
+# v29: P2/P3/P4 pure logic — android.jar classpath par (org.json + android
+# stubs compile ke liye; runtime par sirf pure functions chalte hain).
+run_test_v29() {
+  local name="selftest_v29"
+  echo "== $name =="
+  "$KOTLINC" -J-Xmx1g -cp "$ANDR_JAR" \
+    "$SRC/agent/TagRegistry.kt" \
+    "$SRC/agent/CardSaveVerifier.kt" \
+    "$SRC/agent/VoiceOutput.kt" \
+    "$APP/tools/selftest/SelfTestV29.kt" \
+    -d "$OUT/$name" >"$OUT/$name.log" 2>&1
+  if [ $? -ne 0 ]; then echo "COMPILE FAILED:"; tail -20 "$OUT/$name.log"; TOTAL_FAIL=$((TOTAL_FAIL+1)); return; fi
+  java -cp "$OUT/$name:$STDLIB" SelfTestV29Kt 2>&1 | tee "$OUT/$name.out" | grep -E "^(PASS|FAIL)" | tail -3
+  local fails passes
+  fails=$(grep -cE "^(FAIL|Exception in thread)" "$OUT/$name.out" || true)
+  passes=$(grep -cE "^PASS" "$OUT/$name.out" || true)
+  echo "-> $name PASS: $passes FAIL: $fails"
+  TOTAL_FAIL=$((TOTAL_FAIL+fails))
+  TOTAL_PASS=$((TOTAL_PASS+passes))
+}
+run_test_v29
+
 echo "==============================="
+echo "TOTAL PASS: $TOTAL_PASS"
 echo "TOTAL FAILURES: $TOTAL_FAIL"
 [ "$TOTAL_FAIL" -eq 0 ] && echo "SELFTESTS-OK" || echo "SELFTESTS-FAILED"

@@ -164,11 +164,7 @@ class HistoryView(context: Context) : LinearLayout(context) {
                         return@post
                     } catch (_: Exception) { }
                 }
-                Toast.makeText(
-                    context,
-                    "⚠️ Detail pending hai — neeche entry par tap karo",
-                    Toast.LENGTH_LONG
-                ).show()
+                toast("⚠️ Detail pending hai — neeche entry par tap karo", long = true)
             }
         })
     }
@@ -466,6 +462,19 @@ class HistoryView(context: Context) : LinearLayout(context) {
     }
 
     /** In-memory pending ho to dialog seedha kholo, nahi to resume ka rasta batao. */
+    /**
+     * v29 zero-crash gate: toast kabhi crash na kare — context destroyed
+     * Activity ho to Toast.makeText throw karta hai (UI thread = crash).
+     */
+    private fun toast(msg: String, long: Boolean = false) {
+        try {
+            Toast.makeText(
+                context, msg,
+                if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT
+            ).show()
+        } catch (_: Exception) { }
+    }
+
     private fun openPromptDialog(p: PendingPromptStore.Entry) {
         val req = try { UserPrompt.pendingRequest() } catch (_: Exception) { null }
         val act = context as? Activity
@@ -498,7 +507,7 @@ class HistoryView(context: Context) : LinearLayout(context) {
         // L5: double-tap → double resume nahi
         val flightKey = "prompt:${p.runId}"
         if (!resumeInFlight.add(flightKey)) return
-        Toast.makeText(context, "Resume ho raha hai…", Toast.LENGTH_SHORT).show()
+        toast("Resume ho raha hai…")
         Thread({
             try {
                 val pending = try { AgentResume.checkPending(context) } catch (_: Exception) { null }
@@ -509,11 +518,10 @@ class HistoryView(context: Context) : LinearLayout(context) {
                     WorkingMode.setEnabled(context, true)
                     WakeWorker.enqueue(context)
                     post {
-                        Toast.makeText(
-                            context,
+                        toast(
                             "▶️ Usi step se resume ho raha hai — sawal phir aayega",
-                            Toast.LENGTH_LONG
-                        ).show()
+                            long = true
+                        )
                     }
                 } else {
                     // Local state nahi — server run ko re-queue karne ki koshish.
@@ -527,17 +535,16 @@ class HistoryView(context: Context) : LinearLayout(context) {
                     WorkingMode.setEnabled(context, true)
                     WakeWorker.enqueue(context)
                     post {
-                        Toast.makeText(
-                            context,
+                        toast(
                             if (ok) "▶️ Resume ho raha hai — agent wahi sawal poochhega"
                             else "▶️ Wake bhej diya — agent jald wahi sawal poochhega",
-                            Toast.LENGTH_LONG
-                        ).show()
+                            long = true
+                        )
                     }
                 }
             } catch (_: Exception) {
                 post {
-                    Toast.makeText(context, "⚠️ Resume me dikkat — dobara try karo", Toast.LENGTH_SHORT).show()
+                    toast("⚠️ Resume me dikkat — dobara try karo")
                 }
             } finally {
                 resumeInFlight.remove(flightKey)
@@ -674,7 +681,7 @@ class HistoryView(context: Context) : LinearLayout(context) {
             .setPositiveButton("Band karo", null)
         if (proof.isNotEmpty()) {
             b.setNeutralButton("📸 Proof dekho") { _, _ ->
-                Toast.makeText(context, "Proof: $proof", Toast.LENGTH_LONG).show()
+                toast("Proof: $proof", long = true)
             }
         }
         // K2: adhoore run par resume — naya task NAHI, usi run ka track.
@@ -707,7 +714,7 @@ class HistoryView(context: Context) : LinearLayout(context) {
                 // L5: double-tap → double resume nahi
                 val flightKey = "run:$runId:$taskId"
                 if (!resumeInFlight.add(flightKey)) return@setPositiveButton
-                Toast.makeText(context, "Resume ho raha hai…", Toast.LENGTH_SHORT).show()
+                toast("Resume ho raha hai…")
                 Thread({
                     try {
                         var ok = false
@@ -726,21 +733,17 @@ class HistoryView(context: Context) : LinearLayout(context) {
                         WakeWorker.enqueue(context)
                         resumeInFlight.remove(flightKey)
                         post {
-                            Toast.makeText(
-                                context,
+                            toast(
                                 if (ok) "▶️ Resume ho gaya — History me track karo"
                                 else "▶️ Wake bhej diya — jald resume hoga",
-                                Toast.LENGTH_LONG
-                            ).show()
+                                long = true
+                            )
                             load()
                         }
                     } catch (_: Exception) {
                         resumeInFlight.remove(flightKey)
                         post {
-                            Toast.makeText(
-                                context, "⚠️ Resume me dikkat — dobara try karo",
-                                Toast.LENGTH_SHORT
-                            ).show()
+                            toast("⚠️ Resume me dikkat — dobara try karo")
                         }
                     }
                 }, "fm-run-resume").start()

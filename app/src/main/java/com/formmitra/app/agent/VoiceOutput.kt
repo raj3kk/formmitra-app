@@ -141,8 +141,12 @@ object VoiceOutput {
 
     /**
      * Talking Voice apply: prefs (lang × gender) ke hisaab se tts.voices
-     * me best match. Gender ka pata voice ke naam se (e.g. "female"/"male"
-     * hint); quality/network voices ko prefer nahi — jo mile wahi.
+     * me best match. Gender ka pata voice ke naam se:
+     *   1. keyword hint (female/male/... — doosre engines ke liye),
+     *   2. Google TTS convention: <lang>-x-<l><g>-local (g = a/c/e female,
+     *      b/d male — jaise hi-in-x-hia-local female, hi-in-x-hib-local male).
+     * Koi gender confirm na ho to pitch nudge (male 0.85 / female 1.15);
+     * match par pitch 1.0 (pehle ka nudge reset).
      */
     private fun applyVoice(t: TextToSpeech) {
         val ctx = appCtx ?: return
@@ -150,6 +154,7 @@ object VoiceOutput {
         val wantFemale = voiceGender(ctx) != "male"
         val locale = if (lang == "en") Locale("en", "IN") else Locale("hi", "IN")
         var picked: Voice? = null
+        var genderConfirmed = false
         try {
             val voices = t.voices?.toList() ?: emptyList()
             // 1. same language + gender hint
@@ -157,6 +162,7 @@ object VoiceOutput {
                 v.locale.language == locale.language &&
                     genderMatches(v.name, wantFemale)
             }
+            genderConfirmed = picked != null
             // 2. same language (koi bhi gender)
             if (picked == null) {
                 picked = voices.firstOrNull { v ->
@@ -181,21 +187,46 @@ object VoiceOutput {
                     t.language = Locale.getDefault()
                 }
             }
+            // v29 P3: gender naam se confirm hua → pitch 1.0f (pehle ka
+            // nudge reset); nahi hua → pitch nudge (male 0.85 / female 1.15).
+            t.setPitch(if (genderConfirmed) 1.0f else if (wantFemale) 1.15f else 0.85f)
         } catch (_: Exception) {
             try { t.language = locale } catch (_: Exception) { }
         }
+        // v29 P3: picked voice ka naam log me (male/female audit).
+        try {
+            android.util.Log.d(
+                "VoiceOutput",
+                "picked=${picked?.name ?: "default-lang"} " +
+                    "lang=$lang want=${if (wantFemale) "female" else "male"} " +
+                    "genderConfirmed=$genderConfirmed"
+            )
+        } catch (_: Exception) { }
     }
 
+    /**
+     * v29 P3 ROOT CAUSE FIX: pehle genderMatches voice ke NAAM me "male"/
+     * "female" shabd dhoondta tha — Google TTS ke naam
+     * (hi-in-x-hia-local female, hi-in-x-hib-local male, en-in-x-ena-local
+     * female, en-in-x-enb-local male) me gender ka shabd HOTA HI NAHI →
+     * match fail → fallback pehli (female) voice. Ab:
+     *   1. keyword match (existing, doosre engines ke liye),
+     *   2. Google convention: naam pattern ke aakhri letter se
+     *      (a/c/e → female, b/d → male).
+     */
     private fun genderMatches(voiceName: String, wantFemale: Boolean): Boolean {
-        val n = voiceName.lowercase()
-        return if (wantFemale) {
-            n.contains("female") || n.contains("fem") ||
-                n.contains("f1") || n.contains("woman")
-        } else {
-            (n.contains("male") && !n.contains("female")) ||
-                n.contains("m1") || n.contains("man") || n.contains("masc")
-        }
+        val hint = voiceGenderHint(voiceName)
+        if (hint == 0) return false
+        return if (wantFemale) hint == 2 else hint == 1
     }
+
+    /**
+     * @return 1 = male, 2 = female, 0 = pata nahi.
+     * PURE logic (Android-free) — self-test me cover hota hai
+     * (VoiceGenderHint object neeche).
+     */
+    private fun voiceGenderHint(voiceName: String): Int =
+        VoiceGenderHint.hintOf(voiceName)
 
     // ---------- speak ----------
 
@@ -232,5 +263,46 @@ object VoiceOutput {
         tts = null
         ready = false
         initializing = false
+    }
+}
+
+/**
+ * VoiceGenderHint (v29 P3) — TTS voice naam se gender hint.
+ * PURE Kotlin (koi Android import nahi) → self-test me cover.
+ *
+ * 1. Keyword match (doosre engines ke liye):
+ *    female: "female"/"fem"/"f1"/"woman"; male: "male" (par "female"
+ *    ke andar nahi)/"m1"/"man"/"masc". ("woman" me "man" hai — isliye
+ *    female check PEHLE.)
+ * 2. Google TTS convention: naam pattern
+ *    `<lang>-x-<letters><g>-local` — aakhri letter g: a/c/e → female,
+ *    b/d → male. (hi-in-x-hia-local = female, hi-in-x-hib-local = male,
+ *    en-in-x-ena-local = female, en-in-x-enb-local = male.)
+ *
+ * @return 1 = male, 2 = female, 0 = pata nahi.
+ */
+object VoiceGenderHint {
+
+    fun hintOf(voiceName: String): Int {
+        val n = voiceName.lowercase()
+        // 1. keyword — female PEHLE ("woman" me "man" chipa hai).
+        if (n.contains("female") || n.contains("woman") ||
+            n.contains("fem") || n.contains("f1")
+        ) return 2
+        if ((n.contains("male") && !n.contains("female")) ||
+            n.contains("m1") || n.contains("man") || n.contains("masc")
+        ) return 1
+        // 2. Google convention: ...-x-<letters><g>-local
+        //    (g = a/c/e female, b/d male)
+        val m = Regex("^[a-z]{2,3}-[a-z]{2,3}-x-[a-z]*([a-e])-local$")
+            .find(n)
+        if (m != null) {
+            return when (m.groupValues[1]) {
+                "a", "c", "e" -> 2
+                "b", "d" -> 1
+                else -> 0
+            }
+        }
+        return 0
     }
 }

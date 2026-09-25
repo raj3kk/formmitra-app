@@ -376,7 +376,7 @@ object CardFlow {
         })
         val fieldKeys = listOf(
             "full_name", "phone", "dob", "gender",
-            "village", "post", "district", "state", "pincode", "address",
+            "village", "post", "district", "state", "pincode", "address_line",
             "qualification", "occupation", "category_caste", "email", "id_numbers"
         )
         val edits = LinkedHashMap<String, EditText>()
@@ -472,7 +472,7 @@ object CardFlow {
         "district" -> "Zila"
         "state" -> "Rajya"
         "pincode" -> "6-digit pincode"
-        "address" -> "Poora pata"
+        "address_line" -> "Poora pata"
         "qualification" -> "Padhai (10th/12th/Graduate…)"
         "occupation" -> "Kaam (kisan/mazdoor…)"
         "category_caste" -> "SC / ST / OBC / General"
@@ -591,26 +591,51 @@ object CardFlow {
         val pending = CardStore.pendingAll(act)
         if (pending.isEmpty()) return
         Thread({
-            val details = JSONObject()
-            for ((k, vt) in pending) {
-                details.put(k, JSONObject().put("value", vt.first).put("tag", vt.second))
-            }
-            val res = try { AgentApi.patchCard(act, cardId, token, details) }
-            catch (_: Exception) { AgentApi.ApiResult(-1, null) }
+            // v29 P2 (verify-after-write): PATCH ke baad re-read se confirm —
+            // tabhi pending clear (pehle 2xx par turant clear ho jata tha).
+            val toSave = LinkedHashMap<String, String>()
+            for ((k, vt) in pending) toSave[k] = vt.first
+            val res = CardSaveVerifier.saveAndVerify(
+                patch = { d ->
+                    try { AgentApi.patchCard(act, cardId, token, d).code }
+                    catch (_: Exception) { -1 }
+                },
+                reread = {
+                    try { AgentApi.cardDetail(act, cardId, token).json }
+                    catch (_: Exception) { null }
+                },
+                prebuilt = JSONObject().also { details ->
+                    for ((k, vt) in pending) {
+                        details.put(
+                            k,
+                            JSONObject().put("value", vt.first).put("tag", vt.second)
+                        )
+                    }
+                },
+                toVerify = toSave
+            )
             act.runOnUiThread {
-                if (res.code in 200..299) {
-                    CardStore.pendingClear(act)
-                    val tags = pending.values.map { it.second }.toSet()
-                        .filter { it.isNotEmpty() }.joinToString(", ")
-                    toast(
-                        act,
-                        "✓ ${pending.size} details card me save ho gayi" +
-                            (if (tags.isNotEmpty()) " (tag: $tags)" else "")
-                    )
-                } else {
-                    // Fail hua to pending REHTI HAI — khoyegi nahi, agli
-                    // baar phir try hogi.
-                    toast(act, "⚠️ Details abhi save nahi hui — surakshit hain, agli baar try hogi")
+                when (res) {
+                    is CardSaveVerifier.Result.Verified -> {
+                        CardStore.pendingClear(act)
+                        val tags = pending.values.map { it.second }.toSet()
+                            .filter { it.isNotEmpty() }.joinToString(", ")
+                        toast(
+                            act,
+                            "✓ ${pending.size} details card me save ho gayi" +
+                                (if (tags.isNotEmpty()) " (tag: $tags)" else "")
+                        )
+                    }
+                    else -> {
+                        // Fail/mismatch hua to pending REHTI HAI — khoyegi
+                        // nahi, agli baar phir try hogi.
+                        toast(
+                            act,
+                            "❌ Details save verify nahi hui — " +
+                                "${CardSaveVerifier.loudReason(res)} — " +
+                                "surakshit hain, agli baar try hogi"
+                        )
+                    }
                 }
             }
         }, "fm-pending-flush").start()

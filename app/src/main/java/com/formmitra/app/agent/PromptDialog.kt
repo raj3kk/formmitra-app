@@ -468,11 +468,9 @@ object PromptDialog {
                 setOnClickListener {
                     // Consent ready ho to turant launch
                     if (!SmsOtpConsent.launchConsent()) {
-                        Toast.makeText(
+                        toast(
                             activity,
-                            "OTP wala SMS aate hi yahan se le lunga — thoda ruko",
-                            Toast.LENGTH_SHORT
-                        ).show()
+                            "OTP wala SMS aate hi yahan se le lunga — thoda ruko")
                     }
                 }
             }
@@ -513,10 +511,7 @@ object PromptDialog {
                 SmsOtpConsent.onOtp = { otp ->
                     activity.runOnUiThread {
                         et?.setText(otp)
-                        Toast.makeText(
-                            activity, "✓ OTP SMS se bhar diya",
-                            Toast.LENGTH_SHORT
-                        ).show()
+                        toast(activity, "✓ OTP SMS se bhar diya")
                         // L1: user ne consent me OTP dekh liya hai — ab
                         // auto-submit (user ne kuch badla to nahi hoga).
                         VoiceOutput.speak(activity, "OTP mil gaya, bhej raha hoon.")
@@ -857,8 +852,14 @@ object PromptDialog {
         null
     }
 
+    /**
+     * v29 zero-crash gate: toast kabhi crash na kare (destroyed activity
+     * context par Toast.makeText throw karta hai).
+     */
     private fun toast(activity: Activity, msg: String) {
-        Toast.makeText(activity, msg, Toast.LENGTH_SHORT).show()
+        try {
+            Toast.makeText(activity, msg, Toast.LENGTH_SHORT).show()
+        } catch (_: Exception) { }
     }
 
     /** Ek baar suno → text wapas. Dialog ke mic ke liye. */

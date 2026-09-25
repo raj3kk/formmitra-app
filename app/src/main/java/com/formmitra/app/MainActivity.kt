@@ -454,6 +454,20 @@ class MainActivity : Activity() {
 
     private fun baseUrl(): String = BuildConfig.SITE_URL.trimEnd('/')
 
+    /**
+     * v29 zero-crash gate: toast kabhi crash na kare (destroyed activity
+     * context par Toast.makeText throw karta hai — UI thread = crash).
+     */
+    private fun toast(msg: String, long: Boolean = false) {
+        try {
+            android.widget.Toast.makeText(
+                this, msg,
+                if (long) android.widget.Toast.LENGTH_LONG
+                else android.widget.Toast.LENGTH_SHORT
+            ).show()
+        } catch (_: Exception) { }
+    }
+
     private fun selectTab(path: String) {
         val wasAgent = agentVisible
         homeVisible = false
@@ -503,11 +517,10 @@ class MainActivity : Activity() {
                     // v22: WebView nahi bana — Home par raho, user ko batao
                     homeView.visibility = View.VISIBLE
                     homeVisible = true
-                    Toast.makeText(
-                        this,
+                    toast(
                         "Is phone par WebView uplabdh nahi — ye tab nahi khul sakta",
-                        Toast.LENGTH_LONG
-                    ).show()
+                        long = true
+                    )
                 } else {
                     wv.visibility = View.VISIBLE
                     wv.loadUrl(appUrl(baseUrl() + path))
@@ -521,11 +534,10 @@ class MainActivity : Activity() {
                     // v22: WebView nahi bana — Home par raho
                     homeView.visibility = View.VISIBLE
                     homeVisible = true
-                    Toast.makeText(
-                        this,
+                    toast(
                         "Is phone par WebView uplabdh nahi — ye page nahi khul sakta",
-                        Toast.LENGTH_LONG
-                    ).show()
+                        long = true
+                    )
                 } else {
                     wv.visibility = View.VISIBLE
                     val full = appUrl(baseUrl() + path)
@@ -563,10 +575,7 @@ class MainActivity : Activity() {
         )
         } catch (t: Throwable) {
             android.util.Log.e("FmMain", "startCategoryWork failed", t)
-            android.widget.Toast.makeText(
-                this, "⚠️ Kaam khulne me dikkat aayi — dobara try karo",
-                android.widget.Toast.LENGTH_SHORT
-            ).show()
+            toast("⚠️ Kaam khulne me dikkat aayi — dobara try karo")
         }
     }
 
@@ -630,11 +639,10 @@ class MainActivity : Activity() {
                     if (cj == null) return@runOnUiThread
                     pendingCatKey = null
                     pendingCatLabel = null
-                    Toast.makeText(
-                        this,
+                    toast(
                         "✅ Naya card: $name — PIN dalo, phir aage badhenge",
-                        Toast.LENGTH_LONG
-                    ).show()
+                        long = true
+                    )
                     com.formmitra.app.agent.CardFlow.askPinAndUnlock(
                         this, cj,
                         onUnlocked = { prefill, cid, cname, token ->
@@ -653,11 +661,10 @@ class MainActivity : Activity() {
                             } else {
                                 // Chat se card bana tha — chat me bind karo.
                                 agentChatView.setActiveCard(cid, cname, token)
-                                Toast.makeText(
-                                    this,
+                                toast(
                                     "✅ Card tayyar — details save ho gayi",
-                                    Toast.LENGTH_LONG
-                                ).show()
+                                    long = true
+                                )
                             }
                         }
                     )
@@ -684,7 +691,7 @@ class MainActivity : Activity() {
             if (::profileView.isInitialized) profileView.onLoggedOut()
         } catch (_: Exception) { }
         selectTab("/")
-        Toast.makeText(this, "Logout ho gaya", Toast.LENGTH_SHORT).show()
+        toast("Logout ho gaya")
     }
 
     // ---------- v19 BUG 2: website URLs par ?app=1 ----------
@@ -757,11 +764,7 @@ class MainActivity : Activity() {
             // v22: WebView nahi bana — Home par raho
             homeView.visibility = View.VISIBLE
             homeVisible = true
-            Toast.makeText(
-                this,
-                "Is phone par WebView uplabdh nahi — ye link nahi khul sakta",
-                Toast.LENGTH_LONG
-            ).show()
+            toast("Is phone par WebView uplabdh nahi — ye link nahi khul sakta")
             return
         }
         wv.visibility = View.VISIBLE
@@ -795,11 +798,7 @@ class MainActivity : Activity() {
                 // v22: WebView nahi bana — Home par raho
                 homeView.visibility = View.VISIBLE
                 homeVisible = true
-                Toast.makeText(
-                    this,
-                    "Is phone par WebView uplabdh nahi — ye page nahi khul sakta",
-                    Toast.LENGTH_LONG
-                ).show()
+                toast("Is phone par WebView uplabdh nahi — ye page nahi khul sakta")
                 return
             }
             wv.visibility = View.VISIBLE

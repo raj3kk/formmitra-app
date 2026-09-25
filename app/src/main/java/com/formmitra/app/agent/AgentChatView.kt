@@ -108,6 +108,15 @@ class AgentChatView(
         autoPlanArmed = false
         activeCategory = null
         cardCreateMode = true
+        // v29 P1/P1c: naya kaam — asked-dedupe reset; prefill cache me
+        // (ye details user pehle de chuka — dobara na maangi jayen).
+        // sessionDetails bhi saaf (purane work ki memory leak NAHI) +
+        // prefs bhi.
+        askedKeys.clear()
+        sessionDetails.clear()
+        clearWorkMemory("card_create")
+        cardCachedDetails.clear()
+        cardCachedDetails.putAll(prefill)
         post {
             try { categoryChip.visibility = View.GONE } catch (_: Exception) { }
             addAssistantBubble(
@@ -142,6 +151,21 @@ class AgentChatView(
 
     // verify-before-save: is session me verify ho chuki details
     private val sessionDetails = LinkedHashMap<String, String>()
+
+    /**
+     * v29 (P1-APP): per-work asked-keys dedupe — server jis key ke liye
+     * poochh chuka (response ka `asked_for`), wo dobara nahi poochhega.
+     * Naye work par clear (startCategoryChat newSession / startAgentCardCreate).
+     * User jawab de → sendMessage me fresh extraction ke keys yahan se hatenge.
+     */
+    private val askedKeys = mutableSetOf<String>()
+
+    /**
+     * v29 (P1-APP): card se cached details (startCategoryChat ka prefill).
+     * Har chat/act request me `known = cardCachedDetails + sessionDetails`
+     * banta hai → server ko `known_details` ke roop me jata hai.
+     */
+    private val cardCachedDetails = LinkedHashMap<String, String>()
 
     // needs_user banner
     private lateinit var bannerBox: LinearLayout
@@ -478,6 +502,25 @@ class AgentChatView(
                 categoryChip.visibility = View.VISIBLE
             }
             loadChatHistory(catKey)
+            // v29 P1c (no-loss): rotation/kill/reopen par is work ki memory
+            // wapas — user ko details dobara nahi deni padengi.
+            restoreWorkMemory(catKey)
+            // Card bhi wapas bind karo (selected card prefs me rehta hai).
+            val selId = CardStore.selectedCardId(context)
+            val selTok = selId?.let { CardStore.token(it) }
+            if (selId != null && selTok != null) {
+                setActiveCard(selId, null, selTok)
+                Thread({
+                    try {
+                        val det = AgentApi.cardDetail(context, selId, selTok).json
+                        val vals = CardSaveVerifier.storedValuesFrom(det)
+                        post {
+                            cardCachedDetails.clear()
+                            cardCachedDetails.putAll(vals)
+                        }
+                    } catch (_: Exception) { }
+                }, "fm-restore-card").start()
+            }
         } catch (_: Exception) { }
     }
 
@@ -789,6 +832,11 @@ class AgentChatView(
             url = link,
             // A: category task me jayegi → AgentLoop ke har act() me
             category = activeCategory.orEmpty(),
+            // v29 P1: known details + asked keys task me → FormRunService →
+            // AgentLoop ke har act() call me (server dobara sawaal na poochhe)
+            knownDetails = LinkedHashMap<String, String>(cardCachedDetails)
+                .also { it.putAll(sessionDetails) },
+            askedAlready = askedKeys.toList(),
             onDone = { post { startBtn?.text = "▶ Shuru karo"; startBtn?.isEnabled = true } }
         )
         } catch (t: Throwable) {
@@ -826,6 +874,12 @@ class AgentChatView(
         }
         if (fresh.isNotEmpty()) {
             sessionDetails.putAll(fresh)
+            // v29 P1: user ne in keys ka jawab de diya → askedKeys se hatao
+            // (server inhe dobara nahi poochhega).
+            if (askedKeys.isNotEmpty()) askedKeys.removeAll(fresh.keys)
+            // v29 P1c: jawab aate hi TURANT memory me — koi delay/queue nahi;
+            // rotation/kill par bhi bacha rahe.
+            persistWorkMemory()
             // v24-refine (AI-trained agent): card-create Q&A mode me turant
             // tok-sudhar — LOCAL validation, koi AI call nahi (quota bachat).
             // Ye sirf turant madad hai; message server ko bhi jayega (server
@@ -868,6 +922,13 @@ class AgentChatView(
                         )
                     }
                 }
+            } else {
+                // v29 P1.5 ROOT FIX: turant card me save — server ke
+                // draft_profile echo ka wait NAHI. Pehle details sirf
+                // session me rehti thin; server echo na aaye to card me
+                // kabhi save hi nahi hoti thin ("show hota hai, save hua
+                // show nahi hota").
+                saveFreshToCard(fresh)
             }
         }
         // v28 P11: agent auto-detect → auto-save. KNOWN extraction ke BAAD
@@ -882,6 +943,74 @@ class AgentChatView(
             }
         } catch (_: Exception) { }
         doSend(text)
+    }
+
+    /**
+     * v29 (P1.5 ROOT FIX): user ne nayi details di → TURANT active card me
+     * PATCH (server echo ka wait nahi). Jo value card me pehle se wahi hai
+     * use dobara nahi bhejte (noise nahi).
+     *
+     * v29 P2 (verify-after-write): PATCH ke baad storage se WAPAS padhkar
+     * confirm hota hai (CardSaveVerifier) — tabhi "✓ save ho gaya".
+     * Mismatch ho to LOUD error + pending me surakshit (khoyegi nahi) —
+     * silent fail bilkul nahi.
+     */
+    private fun saveFreshToCard(fresh: Map<String, String>) {
+        try {
+            val cid = activeCardId ?: return
+            val tok = activeCardToken ?: CardStore.token(cid) ?: return
+            val tag = activeCategory ?: "chat"
+            // Sirf nayi/badli values — card me pehle se wahi ho to skip.
+            val toSave = LinkedHashMap<String, String>()
+            for ((k, v) in fresh) {
+                val ck = TagRegistry.normalizeTag(k)
+                if (ck.isNotEmpty() && v.isNotEmpty() && cardCachedDetails[ck] != v) {
+                    toSave[ck] = v
+                }
+            }
+            if (toSave.isEmpty()) return
+            val snapshot = LinkedHashMap(toSave)
+            Thread({
+                // v29 P2: verify-after-write.
+                val res = CardSaveVerifier.saveAndVerify(
+                    patch = { details ->
+                        try {
+                            AgentApi.patchCard(context, cid, tok, details).code
+                        } catch (_: Exception) { -1 }
+                    },
+                    reread = {
+                        try {
+                            AgentApi.cardDetail(context, cid, tok).json
+                        } catch (_: Exception) { null }
+                    },
+                    toSave = snapshot,
+                    tag = tag
+                )
+                post {
+                    when (res) {
+                        is CardSaveVerifier.Result.Verified -> {
+                            // Cache sync — dobara wahi PATCH na jaye.
+                            cardCachedDetails.putAll(snapshot)
+                            persistWorkMemory()
+                            val names =
+                                snapshot.keys.map { TagRegistry.labelOf(it) }
+                            toast("✓ Card me save ho gaya: ${names.joinToString(", ")}")
+                        }
+                        else -> {
+                            // Fail/mismatch → pending me surakshit + LOUD error.
+                            CardStore.pendingAddAll(context, snapshot, tag)
+                            toast(
+                                "❌ Card me SAVE NAHI HUA — " +
+                                    "${CardSaveVerifier.loudReason(res)}. " +
+                                    "Details surakshit hain, baad me phir try hogi."
+                            )
+                        }
+                    }
+                }
+            }, "fm-fresh-save").start()
+        } catch (t: Throwable) {
+            android.util.Log.e("FmFresh", "saveFreshToCard failed", t)
+        }
     }
 
     /**
@@ -909,15 +1038,26 @@ class AgentChatView(
     private fun doSend(text: String) {
         val t = text.trim()
         if (t.isEmpty() || waiting) return
-        waiting = true
-        lastFailedText = t
-        input.text.clear()
-        clearDraft()
-        sendBtn.isEnabled = false
-        addUserBubble(t)
-        history.add("user" to t)
-        saveChatHistory() // v28 P6: per-category chat history persist
-        showTyping()
+        // v29 zero-crash gate: neeche ka sync UI section agar kahin throw
+        // kare to `waiting` hamesha ke liye true na reh jaye (send button
+        // dead). Isliye try/catch + reset.
+        try {
+            waiting = true
+            lastFailedText = t
+            input.text.clear()
+            clearDraft()
+            sendBtn.isEnabled = false
+            addUserBubble(t)
+            history.add("user" to t)
+            saveChatHistory() // v28 P6: per-category chat history persist
+            showTyping()
+        } catch (e: Exception) {
+            waiting = false
+            try { sendBtn.isEnabled = true } catch (_: Exception) { }
+            toast("⚠️ Bhejne me dikkat — dobara try karo")
+            android.util.Log.e("FmSend", "doSend sync section failed", e)
+            return
+        }
         // Watchdog: 75s me jawab na aaye to stuck state todo + retry do
         val token = ++sendToken
         sendWatchdog.removeCallbacksAndMessages(null)
@@ -937,9 +1077,16 @@ class AgentChatView(
                 // v20 Task 5: active category ho to body me `category` bhejo
                 // v24: active card ho to body me `card_id` + X-Card-Token
                 // v28: track me `tracking_type` (8 types ka context) bhi jayega
+                // v29 P1: `known_details` (card cache + session merged —
+                // server dobara wahi sawaal na poochhe) + `asked_already`
+                // (is work me pehle poochhe gaye keys).
+                val known = LinkedHashMap<String, String>(cardCachedDetails)
+                known.putAll(sessionDetails)
                 AgentApi.chat(
                     context, history.toList(), activeCategory,
-                    activeCardId, activeCardToken, activeTrackingType
+                    activeCardId, activeCardToken, activeTrackingType,
+                    knownDetails = known,
+                    askedAlready = askedKeys.toList()
                 )
             } catch (_: Exception) {
                 AgentApi.ApiResult(-1, null)
@@ -1005,6 +1152,23 @@ class AgentChatView(
                                 )
                             }
                         }
+                        // v29 P1: server ne in keys ke liye poocha → askedKeys
+                        // me jodo (agla request inhe `asked_already` me
+                        // bhejega — server dobara nahi poochhega).
+                        try {
+                            val askedArr = json?.optJSONArray("asked_for")
+                            if (askedArr != null) {
+                                for (i in 0 until askedArr.length()) {
+                                    val k = askedArr.optString(i, "").trim()
+                                    if (k.isNotEmpty()) {
+                                        askedKeys.add(TagRegistry.normalizeTag(k))
+                                    }
+                                }
+                                // v29 P1c: asked-keys bhi turant persist —
+                                // rotation par dedupe state na khoye.
+                                persistWorkMemory()
+                            }
+                        } catch (_: Exception) { }
                         if (reply.isEmpty() && plan == null) {
                             addErrorBubble(
                                 "🤖 Jawab khaali aaya.",
@@ -1033,47 +1197,77 @@ class AgentChatView(
                                 val k = extraKeys.next()
                                 if (!draftMap.containsKey(k)) {
                                     val v = draftObj.optString(k, "").trim()
-                                    if (v.isNotEmpty() && v != "null") draftMap[k] = v
+                                    if (v.isNotEmpty() && v != "null") {
+                                        // v29 P4: canonical key par lao.
+                                        draftMap[TagRegistry.normalizeTag(k)] = v
+                                    }
                                 }
                             }
                             if (draftMap.isNotEmpty()) {
                                 sessionDetails.putAll(draftMap)
+                                // v29 P1c: draft wali details bhi turant
+                                // memory me (rotation par na khoyen).
+                                persistWorkMemory()
+                                // v29 P1.5: jo card me pehle se wahi value hai
+                                // use dobara mat bhejo (saveFreshToCard turant
+                                // save kar chuka hoga) — double-PATCH noise nahi.
+                                val newDraft = LinkedHashMap<String, String>()
+                                for ((k, v) in draftMap) {
+                                    if (cardCachedDetails[k] != v) newDraft[k] = v
+                                }
                                 val tag = activeCategory ?: "chat"
                                 val cid = activeCardId
                                 val tok = activeCardToken
                                     ?: cid?.let { CardStore.token(it) }
-                                if (cid != null && !tok.isNullOrEmpty()) {
+                                if (newDraft.isEmpty()) {
+                                    // Sab pehle se card me saved — kuch nahi karna.
+                                } else if (cid != null && !tok.isNullOrEmpty()) {
+                                    val snapshot = LinkedHashMap(newDraft)
                                     Thread {
-                                        val details = JSONObject()
-                                        for ((k, v) in draftMap) {
-                                            details.put(
-                                                k,
-                                                JSONObject().put("value", v)
-                                                    .put("tag", tag)
-                                            )
-                                        }
-                                        val r = try {
-                                            AgentApi.patchCard(context, cid, tok, details)
-                                        } catch (_: Exception) {
-                                            AgentApi.ApiResult(-1, null)
-                                        }
+                                        // v29 P2: verify-after-write — "chat me
+                                        // dikhna ≠ saved hona". Draft wali
+                                        // details bhi re-read se confirm.
+                                        val res = CardSaveVerifier.saveAndVerify(
+                                            patch = { details ->
+                                                try {
+                                                    AgentApi.patchCard(context, cid, tok, details).code
+                                                } catch (_: Exception) { -1 }
+                                            },
+                                            reread = {
+                                                try {
+                                                    AgentApi.cardDetail(context, cid, tok).json
+                                                } catch (_: Exception) { null }
+                                            },
+                                            toSave = snapshot,
+                                            tag = tag
+                                        )
                                         post {
-                                            toast(
-                                                if (r.code in 200..299)
-                                                    "✓ Details card me save ho gayi"
-                                                else "⚠️ Save me dikkat — details surakshit hain, baad me try karo"
-                                            )
+                                            when (res) {
+                                                is CardSaveVerifier.Result.Verified -> {
+                                                    cardCachedDetails.putAll(snapshot)
+                                                    persistWorkMemory()
+                                                    toast("✓ Details card me save ho gayi")
+                                                }
+                                                else -> {
+                                                    CardStore.pendingAddAll(context, snapshot, tag)
+                                                    toast(
+                                                        "❌ Card me SAVE NAHI HUA — " +
+                                                            "${CardSaveVerifier.loudReason(res)} — " +
+                                                            "details surakshit hain, baad me phir try hogi"
+                                                    )
+                                                }
+                                            }
                                         }
                                     }.start()
                                 } else {
                                     // #4: card nahi → pending (khoyengi nahi)
                                     // + create-card redirect.
-                                    CardStore.pendingAddAll(context, draftMap, tag)
+                                    CardStore.pendingAddAll(context, newDraft, tag)
                                     post {
                                         val act = context as? Activity
                                         if (act != null) {
                                             CardFlow.offerCreateCardForDetails(
-                                                act, draftMap.size,
+                                                act, newDraft.size,
                                                 onAgentCreate = { prefill ->
                                                     onAgentCreateRequest?.invoke(prefill)
                                                 },
@@ -1089,7 +1283,7 @@ class AgentChatView(
                                             )
                                         } else {
                                             toast(
-                                                "🪪 Card banao — ${draftMap.size} " +
+                                                "🪪 Card banao — ${newDraft.size} " +
                                                     "details surakshit rakhi hain"
                                             )
                                         }
@@ -1144,11 +1338,26 @@ class AgentChatView(
         if (newSession) {
             // P8: purani chat saaf — bacha hua message/context kuch nahi.
             history.clear()
+            // v29 P1: purane work ki details/asked-keys naye work me na
+            // ghulein — naya work = nayi shuruaat.
+            sessionDetails.clear()
+            askedKeys.clear()
+            // v29 P1c (isolation): prefs me bachi purani memory bhi saaf —
+            // naye work par purani memory leak NAHI hogi.
+            clearWorkMemory(category)
             try {
                 draftPrefs().edit().remove(histKey(category)).apply()
             } catch (_: Exception) { }
             post { messageList.removeAllViews() }
+        } else {
+            // v29 P1c (no-loss): resume par is work ki memory wapas —
+            // rotation/kill ke baad bhi user ko dobara details nahi deni.
+            restoreWorkMemory(category)
         }
+        // v29 P1: card details cache refresh (prefill = card se aayi
+        // details, canonical keys). Har request me known_details me jayengi.
+        cardCachedDetails.clear()
+        cardCachedDetails.putAll(prefill)
         // B: card details session me rakho — agent dobara na maange.
         // Ye intro message ke saath server ko bhi jati hain (history me).
         if (prefill.isNotEmpty()) sessionDetails.putAll(prefill)
@@ -1185,6 +1394,8 @@ class AgentChatView(
     /** Chip ka ✕ — category context hatao, aam chat par wapas. */
     fun clearCategory() {
         saveChatHistory()
+        // v29 P1c: jaate-jaate memory persist — resume par wapas milegi.
+        persistWorkMemory()
         activeCategory = null
         rememberCategory(null) // v28 P14
         activeTrackingType = null
@@ -1227,6 +1438,81 @@ class AgentChatView(
                     else addAssistantBubble(content)
                 }
             }
+        } catch (_: Exception) { }
+    }
+
+    // ---------- v29 P1c: per-work memory persistence (isolation + no-loss) ----------
+
+    /**
+     * v29 P1c ROOT FIX — do directions:
+     *  (a) ISOLATION: naya work = saaf session. clearWorkMemory() naye
+     *      work par purani memory (memory + prefs dono) mitata hai —
+     *      purani memory naye work me leak NAHI hoti.
+     *  (b) NO-LOSS: isi work ki memory rotation/kill/reopen par bhi
+     *      rehti hai. Har mutation ke baad persistWorkMemory() turant
+     *      prefs me likhta hai; resume par restoreWorkMemory() wapas
+     *      lata hai.
+     * Per-work namespace: "chat_mem_<work>_session" / "_asked".
+     * work = category, ya card-create mode me "card_create".
+     */
+    private fun workKey(): String? =
+        activeCategory ?: if (cardCreateMode) "card_create" else null
+
+    private fun memKey(work: String, field: String) = "chat_mem_${work}_$field"
+
+    /** Har mutation ke baad turant call karo — koi delay/queue nahi. */
+    private fun persistWorkMemory() {
+        val work = workKey() ?: return
+        try {
+            val e = draftPrefs().edit()
+            e.putString(
+                memKey(work, "session"),
+                JSONObject(sessionDetails as Map<*, *>).toString()
+            )
+            e.putString(memKey(work, "asked"), askedKeys.joinToString(","))
+            e.apply()
+        } catch (_: Exception) { }
+    }
+
+    /** Resume path — prefs se is work ki memory wapas. */
+    private fun restoreWorkMemory(work: String) {
+        try {
+            sessionDetails.clear()
+            val raw = draftPrefs().getString(memKey(work, "session"), null)
+            if (raw != null) {
+                val o = JSONObject(raw)
+                val it = o.keys()
+                while (it.hasNext()) {
+                    val k = it.next()
+                    val v = o.optString(k, "")
+                    // v29 P4: restore par keys canonicalize — purani memory
+                    // me legacy "address" ho to "address_line" ban jaye.
+                    val canon = TagRegistry.normalizeTag(k)
+                    if (v.isNotEmpty() && canon.isNotEmpty()) {
+                        sessionDetails[canon] = v
+                    }
+                }
+            }
+            askedKeys.clear()
+            val asked =
+                draftPrefs().getString(memKey(work, "asked"), "").orEmpty()
+            if (asked.isNotEmpty()) {
+                // v29 P4: asked-keys bhi canonicalize karke restore.
+                for (k in asked.split(",")) {
+                    val canon = TagRegistry.normalizeTag(k.trim())
+                    if (canon.isNotEmpty()) askedKeys.add(canon)
+                }
+            }
+        } catch (_: Exception) { }
+    }
+
+    /** Naya work — is work ki purani memory memory + prefs dono se saaf. */
+    private fun clearWorkMemory(work: String) {
+        try {
+            draftPrefs().edit()
+                .remove(memKey(work, "session"))
+                .remove(memKey(work, "asked"))
+                .apply()
         } catch (_: Exception) { }
     }
 
@@ -1575,36 +1861,59 @@ class AgentChatView(
         val tag = activeCategory ?: "chat"
         val cid = activeCardId
         val tok = activeCardToken ?: cid?.let { CardStore.token(it) }
+        // v29 P4: canonical key par lao (detector pehle se canonical/
+        // fallback deta hai; normalize idempotent hai).
+        val canon = LinkedHashMap<String, String>()
+        for ((k, v) in extras) {
+            val ck = TagRegistry.normalizeTag(k)
+            if (ck.isNotEmpty() && v.isNotEmpty()) canon[ck] = v
+        }
+        if (canon.isEmpty()) return
         if (cid != null && !tok.isNullOrEmpty()) {
+            val snapshot = LinkedHashMap(canon)
             Thread({
-                val details = JSONObject()
-                for ((label, v) in extras) {
-                    details.put(
-                        label,
-                        JSONObject().put("value", v).put("tag", tag)
-                    )
-                }
-                val r = try {
-                    AgentApi.patchCard(context, cid, tok, details)
-                } catch (_: Exception) { AgentApi.ApiResult(-1, null) }
+                // v29 P2: verify-after-write — detector wali details bhi
+                // re-read se confirm (chat me dikhna ≠ saved hona).
+                val res = CardSaveVerifier.saveAndVerify(
+                    patch = { details ->
+                        try {
+                            AgentApi.patchCard(context, cid, tok, details).code
+                        } catch (_: Exception) { -1 }
+                    },
+                    reread = {
+                        try {
+                            AgentApi.cardDetail(context, cid, tok).json
+                        } catch (_: Exception) { null }
+                    },
+                    toSave = snapshot,
+                    tag = tag
+                )
                 post {
-                    if (r.code in 200..299) {
-                        val msg = "✅ Card me save ho gaya: " +
-                            extras.keys.joinToString(", ")
-                        addAssistantBubble(msg)
-                        history.add("assistant" to msg)
-                        saveChatHistory()
-                    } else {
-                        CardStore.pendingAddAll(context, extras, tag)
-                        toast(
-                            "⚠️ Save me dikkat — detail surakshit hai, " +
-                                "baad me try karo"
-                        )
+                    when (res) {
+                        is CardSaveVerifier.Result.Verified -> {
+                            cardCachedDetails.putAll(snapshot)
+                            persistWorkMemory()
+                            val msg = "✅ Card me save ho gaya: " +
+                                snapshot.keys.joinToString(", ") {
+                                    TagRegistry.labelOf(it)
+                                }
+                            addAssistantBubble(msg)
+                            history.add("assistant" to msg)
+                            saveChatHistory()
+                        }
+                        else -> {
+                            CardStore.pendingAddAll(context, snapshot, tag)
+                            toast(
+                                "❌ Card me SAVE NAHI HUA — " +
+                                    "${CardSaveVerifier.loudReason(res)} — " +
+                                    "detail surakshit hai, baad me phir try hogi"
+                            )
+                        }
                     }
                 }
             }, "fm-extra-save").start()
         } else {
-            CardStore.pendingAddAll(context, extras, tag)
+            CardStore.pendingAddAll(context, canon, tag)
             (context as? Activity)?.let { act ->
                 post {
                     CardFlow.offerCreateCardForDetails(
@@ -1766,6 +2075,9 @@ class AgentChatView(
                                     positiveLabel = "💾 Save karo",
                                     onProceed = { verified ->
                                         sessionDetails.putAll(verified)
+                                        // v29 P1c: verify-dialog wali details
+                                        // bhi turant memory me.
+                                        persistWorkMemory()
                                         val diffs = verified.filter { (k, v) -> merged[k] != v }
                                         if (diffs.isNotEmpty()) {
                                             doSend(
@@ -1794,6 +2106,8 @@ class AgentChatView(
         title: String,
         url: String,
         category: String = "",
+        knownDetails: Map<String, String> = emptyMap(),
+        askedAlready: List<String> = emptyList(),
         onDone: () -> Unit
     ) {
         val flightKey = "$title|$url"
@@ -1826,7 +2140,9 @@ class AgentChatView(
                         VoiceOutput.speak(context, vt.take(300))
                     }
                 }
-                val (code, taskId) = AgentApi.createTask(context, title, url, category)
+                val (code, taskId) = AgentApi.createTask(
+                    context, title, url, category, knownDetails, askedAlready
+                )
                 // A: category → task threading (device-local backup bhi;
                 // step JSON me bhi gayi — FormRunService wahan se uthayega)
                 if (!taskId.isNullOrEmpty()) CategoryStore.saveForTask(context, taskId, category)
@@ -1867,7 +2183,7 @@ class AgentChatView(
                     addErrorBubble(
                         "⚠️ Kaam shuru karte waqt dikkat aayi — dobara try karo.",
                         "🔁 Dobara try karo"
-                    ) { enqueueTask(title, url, category, onDone) }
+                    ) { enqueueTask(title, url, category, knownDetails, askedAlready, onDone) }
                     onDone()
                 }
             } finally {
@@ -1981,8 +2297,14 @@ class AgentChatView(
                 handlePollResult(runs)
                 if (prompt != null) {
                     val act = context as? Activity
-                    if (act != null && !PromptDialog.isShowing(prompt.runId)) {
-                        PromptDialog.show(act, prompt)
+                    // v29 zero-crash gate: finishing/destroyed activity par
+                    // dialog show() = BadTokenException = UI-thread crash.
+                    if (act != null && !act.isFinishing && !act.isDestroyed &&
+                        !PromptDialog.isShowing(prompt.runId)
+                    ) {
+                        try {
+                            PromptDialog.show(act, prompt)
+                        } catch (_: Exception) { }
                     }
                 }
             }
@@ -2409,8 +2731,15 @@ class AgentChatView(
         }.start()
     }
 
+    /**
+     * v29 zero-crash gate: toast kabhi crash na kare — context destroyed
+     * Activity ho to Toast.makeText throw karta hai (UI thread par =
+     * app crash). Har call site protected.
+     */
     private fun toast(msg: String) {
-        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+        try {
+            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+        } catch (_: Exception) { }
     }
 
     private fun dp(v: Int): Int =

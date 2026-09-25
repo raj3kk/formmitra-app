@@ -15,34 +15,41 @@ package com.formmitra.app.agent
  *  - label mila par value khaali/chhoti/bekar → IGNORE.
  *  - value me "mera", "hai", "hain" jaise filler shabd akele hon → IGNORE.
  *
- * @return tag-label → value (sirf pakki pakad).
+ * @return key → value (sirf pakki pakad).
+ * v29: keys canonical (aadhar_no, pan_no, ...) ya stable fallback
+ * (bank_account_no, ifsc, ...) — caller TagRegistry.normalizeTag se
+ * guzarta hai (idempotent), UI label TagRegistry.labelOf se.
  */
 object ExtraDetailDetector {
 
     /**
-     * keyword → display label (bilingual). Keyword match case-insensitive,
-     * word-boundary par (taaki "pan" "company" me na mile).
+     * keyword → CANONICAL key (v29 P4). UI label chahiye to
+     * TagRegistry.labelOf(key) use karo — yahan display label mat rakho
+     * (pehle display label key ban raha tha, isliye card me alag-alag
+     * naam se save hota tha).
+     * Keyword match case-insensitive, word-boundary par (taaki "pan"
+     * "company" me na mile).
      */
     private val KEYWORDS = linkedMapOf(
-        "aadhar" to "Aadhar No. (आधार नं.)",
-        "aadhaar" to "Aadhar No. (आधार नं.)",
-        "adhar" to "Aadhar No. (आधार नं.)",
-        "pan" to "PAN (पैन)",
-        "voter" to "Voter ID (वोटर आईडी)",
-        "ration" to "Ration Card (राशन कार्ड)",
-        "driving licence" to "Driving Licence (ड्राइविंग लाइसेंस)",
-        "driving license" to "Driving Licence (ड्राइविंग लाइसेंस)",
-        "dl no" to "Driving Licence (ड्राइविंग लाइसेंस)",
-        "passport" to "Passport (पासपोर्ट)",
-        "bank account" to "Bank Account (बैंक खाता)",
-        "account no" to "Bank Account (बैंक खाता)",
-        "khata sankhya" to "Bank Account (बैंक खाता)",
-        "ifsc" to "IFSC (आईएफएससी)",
-        "uan" to "UAN (यूएएन)",
-        "esic" to "ESIC (ईएसआईसी)",
-        "pf no" to "PF No. (पीएफ नं.)",
-        "epf" to "PF No. (पीएफ नं.)",
-        "pradhan mantri" to "Yojana Labh (योजना लाभ)"
+        "aadhar" to "aadhar_no",
+        "aadhaar" to "aadhar_no",
+        "adhar" to "aadhar_no",
+        "pan" to "pan_no",
+        "voter" to "voter_id",
+        "ration" to "ration_card_no",
+        "driving licence" to "driving_licence_no",
+        "driving license" to "driving_licence_no",
+        "dl no" to "driving_licence_no",
+        "passport" to "passport_no",
+        "bank account" to "bank_account_no",
+        "account no" to "bank_account_no",
+        "khata sankhya" to "bank_account_no",
+        "ifsc" to "ifsc",
+        "uan" to "uan_no",
+        "esic" to "esic_no",
+        "pf no" to "pf_no",
+        "epf" to "pf_no",
+        "pradhan mantri" to "yojana_labh"
     )
 
     /** Akele aaye to value NAHI maane jayenge. */
@@ -64,11 +71,11 @@ object ExtraDetailDetector {
         for (rawLine in lines) {
             val line = rawLine.trim()
             if (line.length < 4) continue
-            for ((kw, label) in KEYWORDS) {
-                if (out.containsKey(label)) continue
+            for ((kw, canonKey) in KEYWORDS) {
+                if (out.containsKey(canonKey)) continue
                 val v = valueAfter(line, kw) ?: continue
                 if (v.length >= 3 && !isFillerOnly(v)) {
-                    out[label] = v
+                    out[canonKey] = v
                 }
             }
         }

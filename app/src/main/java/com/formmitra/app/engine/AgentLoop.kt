@@ -78,6 +78,17 @@ object AgentLoop {
          *  job_find / scholarship). */
         category: String = "",
         /**
+         * v29 (P1-APP): is work me user jo details de chuka (card + session
+         * merged, canonical keys) — har /api/agent/act call me
+         * `known_details` jayega taaki brain dobara wahi detail na maange.
+         */
+        knownDetails: Map<String, String> = emptyMap(),
+        /**
+         * v29 (P1-APP): is work me pehle poochhe gaye keys (asked_for
+         * dedupe) — har act() call me `asked_already` jayega.
+         */
+        askedAlready: List<String> = emptyList(),
+        /**
          * G2 (Background Working Mode): resume par ye step already ho chuke
          * hain — loop (startStep + 1) se continue karega, shuru se nahi.
          */
@@ -361,6 +372,21 @@ object AgentLoop {
                     // Category-wise automation: brain har step par jaane kaam
                     // kis category ka hai (khali ho to field nahi bhejte)
                     .apply { if (category.isNotEmpty()) put("category", category) }
+                    // v29 (P1-APP): is work me pehle se mili details — brain
+                    // inhe "already known" maane, dobara na maange.
+                    // (khali ho to field nahi bhejte)
+                    .apply {
+                        if (knownDetails.isNotEmpty()) {
+                            val kd = JSONObject()
+                            for ((k, v) in knownDetails) {
+                                if (k.isNotEmpty() && v.isNotEmpty()) kd.put(k, v)
+                            }
+                            if (kd.length() > 0) put("known_details", kd)
+                        }
+                        if (askedAlready.isNotEmpty()) {
+                            put("asked_already", JSONArray(askedAlready.filter { it.isNotEmpty() }))
+                        }
+                    }
                     // OTP/password yahan se filtered — AI/server ko kabhi nahi jate
                     .put("user_provided", filteredUserProvided(userProvided, sensitiveKeys))
                 // forceStandalone (offline task): server ko chhodo, seedha user ki

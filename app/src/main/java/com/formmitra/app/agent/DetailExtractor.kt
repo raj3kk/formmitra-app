@@ -11,36 +11,17 @@ package com.formmitra.app.agent
  *
  * Sirf strong patterns: phone (10-digit), email, dob, pincode, naam.
  * Galat pakad le to user dialog me theek/cancel kar sakta hai.
+ *
+ * v29 (P4): saare field keys TagRegistry canonical keys par — labels
+ * aur order bhi wahi se. Wire format me hamesha canonical key jayegi.
  */
 object DetailExtractor {
 
-    // v24 (D17): sab labels English (Hindi) bilingual.
-    private val LABELS = linkedMapOf(
-        "full_name" to "Naam (नाम)",
-        "phone" to "Phone (फ़ोन)",
-        "email" to "Email (ईमेल)",
-        "dob" to "Janm tithi (जन्म तिथि)",
-        "pincode" to "Pincode (पिनकोड)",
-        "address" to "Pata (पता)",
-        "father_name" to "Pita ka naam (पिता का नाम)",
-        "mother_name" to "Mata ka naam (माता का नाम)",
-        "gender" to "Ling (लिंग)",
-        "village" to "Gaon (गांव)",
-        "post" to "Post (डाकघर)",
-        "district" to "Zila (ज़िला)",
-        "state" to "Rajya (राज्य)",
-        "qualification" to "Yogyata (योग्यता)",
-        "occupation" to "Pesha (पेशा)",
-        "category_caste" to "Category/Jati (श्रेणी/जाति)",
-        "id_numbers" to "ID numbers (पहचान संख्या)",
-        "khata" to "Khata (खाता)",
-        "khesra" to "Khesra (खेसरा)",
-        "mauza" to "Mauza (मौज़ा)"
-    )
+    /** v29: bilingual labels TagRegistry se (canonical key → "En (हिंदी)"). */
+    fun label(key: String): String = TagRegistry.labelOf(key)
 
-    fun label(key: String): String = LABELS[key] ?: key
-
-    fun orderedKeys(): List<String> = LABELS.keys.toList()
+    /** v29: canonical order TagRegistry se. */
+    fun orderedKeys(): List<String> = TagRegistry.orderedKeys()
 
     /**
      * @return field → value (sirf mile hue fields).

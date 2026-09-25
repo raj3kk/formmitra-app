@@ -213,7 +213,7 @@ Rules:
             "phone" to listOf("phone", "mobile", "tel", "number"),
             "dob" to listOf("dob", "birth", "janm", "date of birth"),
             "gender" to listOf("gender", "ling"),
-            "address" to listOf("address", "pata", "street"),
+            "address_line" to listOf("address", "pata", "street"),
             "city" to listOf("city", "shahar"),
             "state" to listOf("state", "rajya"),
             "pincode" to listOf("pin", "pincode", "postal", "zip"),

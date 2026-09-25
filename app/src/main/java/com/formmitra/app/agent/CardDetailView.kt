@@ -61,8 +61,10 @@ class CardDetailView(
     private var detailsData = JSONObject()
 
     /** v28 P9/P10: form state — staged edits, Save par ek PATCH. */
-    private val knownKeys: List<String> =
-        DetailExtractor.orderedKeys() + listOf("khata", "khesra", "mauza")
+    // v29 P2+P4: knownKeys = TagRegistry canonical 25 (pehle
+    // DetailExtractor.orderedKeys() + khata/khesra/mauza — jo usme PEHLE
+    // SE the → form me 3 fields DO-DO baar dikhte the; ab fixed).
+    private val knownKeys: List<String> = TagRegistry.orderedKeys()
     private val fieldEdits = LinkedHashMap<String, EditText>()
     private val customEdits = LinkedHashMap<String, EditText>()
     private val knownOriginal = LinkedHashMap<String, String>()
@@ -70,6 +72,21 @@ class CardDetailView(
     private val customOriginal = LinkedHashMap<String, String>()
     private val customTags = LinkedHashMap<String, String>()
     private val customDeleted = mutableSetOf<String>()
+
+    /**
+     * v29 P2: per-field save-state indicators — teen states visually alag:
+     * saved ✓ (hara), pending/unsaved ● (narangi), khaali (grey).
+     */
+    private val knownStatus = LinkedHashMap<String, TextView>()
+    private val customStatus = LinkedHashMap<String, TextView>()
+
+    /** v29 P2: Save ka inline result — LOUD Hinglish (toast ke saath). */
+    private lateinit var saveStatus: TextView
+    private lateinit var saveBtn: Button
+    private var saving = false
+
+    /** v29 P2: load fail par inline banner (silent khaali form nahi). */
+    private lateinit var loadError: TextView
 
     /** Upload hone wali file ka pending tag (picker → tag dialog → upload). */
     private var pendingUploadUri: Uri? = null
@@ -139,6 +156,14 @@ class CardDetailView(
             setTextColor(Color.parseColor("#80868B"))
             setPadding(0, 0, 0, dp(4))
         })
+        // v29 P2: load fail par LOUD inline banner (silent khaali form nahi).
+        loadError = TextView(context).apply {
+            textSize = 13f
+            setTextColor(Color.parseColor("#C5221F"))
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            visibility = View.GONE
+        }
+        content.addView(loadError)
         detailsList.orientation = VERTICAL
         content.addView(detailsList)
 
@@ -165,7 +190,9 @@ class CardDetailView(
         })
 
         // ---- 💾 EK Save button (v28 P9) — saare badlav ek PATCH me ----
-        val saveBtn = Button(context).apply {
+        // v29 P2: neeche inline saveStatus — Save ka natija LOUD Hinglish
+        // me (toast ke SAATH); fail par retry = yehi Save button dobara.
+        saveBtn = Button(context).apply {
             text = "💾 Save (सहेजें)"
             textSize = 15f
             setTypeface(null, Typeface.BOLD)
@@ -177,6 +204,12 @@ class CardDetailView(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
             ).apply { setMargins(0, dp(10), 0, 0) }
         })
+        saveStatus = TextView(context).apply {
+            textSize = 13f
+            setPadding(dp(4), dp(6), dp(4), 0)
+            visibility = View.GONE
+        }
+        content.addView(saveStatus)
 
         // ---- 📁 Document Vault (Add button UPAR — C11) ----
         content.addView(sectionTitle("📁 Document Vault (दस्तावेज़)"))
@@ -218,6 +251,7 @@ class CardDetailView(
 
     fun load() {
         detailsCount.text = "La raha hun…"
+        loadError.visibility = View.GONE
         Thread({
             val det = try { AgentApi.cardDetail(context, cardId, cardToken) }
             catch (_: Exception) { AgentApi.ApiResult(-1, null) }
@@ -227,6 +261,19 @@ class CardDetailView(
                 if (det.code == 401 || det.code == 403) {
                     toast("🔒 Session khatm — PIN se dobara kholo")
                     onBack()
+                    return@post
+                }
+                // v29 P2 ROOT FIX: load fail par pehle CHUPCHAAP khaali form
+                // render ho jata tha — user ko lagta data hi gayab hai.
+                // Ab LOUD banner: details dikhengi hi nahi jab tak load na ho.
+                if (det.code !in 200..299) {
+                    val why = if (det.code == -1) "internet nahi lag raha"
+                    else "server me dikkat"
+                    loadError.text =
+                        "❌ Details LOAD NAHI HUI — $why.\n" +
+                            "🔄 Refresh dabao — purani details gayab NAHI hui hain."
+                    loadError.visibility = View.VISIBLE
+                    detailsCount.text = "Load nahi hui"
                     return@post
                 }
                 renderDetails(det.json?.optJSONObject("details"))
@@ -252,12 +299,19 @@ class CardDetailView(
      * har field ka EditText. P10: uske neeche custom Tag+Value rows
      * (unknown keys — chat se auto-save hue ya "＋ Add more" se jude).
      * Badlav staged rehte hain — 💾 Save par EK PATCH jata hai.
+     *
+     * v29 P2+P4: aane wali keys normalize hoti hain — legacy "address" →
+     * "address_line", purane display labels ("Aadhar No. (आधार नं.)") →
+     * canonical. Collision par exact canonical key jeetegi. Har field par
+     * save-state indicator (✓/●/khaali).
      */
     private fun renderDetails(det: JSONObject?) {
         detailsList.removeAllViews()
         customList.removeAllViews()
         fieldEdits.clear()
         customEdits.clear()
+        knownStatus.clear()
+        customStatus.clear()
         knownOriginal.clear()
         knownTags.clear()
         customOriginal.clear()
@@ -265,11 +319,48 @@ class CardDetailView(
         customDeleted.clear()
         detailsData = det ?: JSONObject()
 
+        // v29 P4: keys normalize karo.
+        val knownSet = knownKeys.toSet()
+        val knownVals = LinkedHashMap<String, String>()
+        val knownTagMap = LinkedHashMap<String, String>()
+        val customVals = LinkedHashMap<String, String>()
+        val customTagMap = LinkedHashMap<String, String>()
+        val rawKeys = mutableListOf<String>()
+        val ki = detailsData.keys()
+        while (ki.hasNext()) rawKeys.add(ki.next())
+        // Pass 1: exact canonical keys.
+        for (k in rawKeys) {
+            if (k in knownSet) {
+                knownVals[k] = storedValue(k).let { if (it == "null") "" else it }
+                knownTagMap[k] = storedTag(k)
+            }
+        }
+        // Pass 2: baaki keys normalize karke.
+        for (k in rawKeys) {
+            if (k in knownSet) continue
+            val nk = TagRegistry.normalizeTag(k)
+            if (nk.isEmpty()) continue
+            val v = storedValue(k).let { if (it == "null") "" else it }
+            if (v.isEmpty()) continue
+            val t = storedTag(k)
+            if (nk in knownSet) {
+                if (!knownVals.containsKey(nk)) {
+                    knownVals[nk] = v
+                    knownTagMap[nk] = t
+                }
+            } else {
+                if (!customVals.containsKey(nk)) {
+                    customVals[nk] = v
+                    customTagMap[nk] = t
+                }
+            }
+        }
+
         // Known fields — sab, khaali ho to bhi.
         var filled = 0
         for (k in knownKeys) {
-            val v = storedValue(k).let { if (it == "null") "" else it }
-            val tag = storedTag(k)
+            val v = knownVals[k].orEmpty()
+            val tag = knownTagMap[k].orEmpty()
             knownOriginal[k] = v
             knownTags[k] = tag
             if (v.isNotEmpty()) filled++
@@ -278,21 +369,12 @@ class CardDetailView(
         detailsCount.text =
             "$filled/${knownKeys.size} fields bhare hue — badlo, phir neeche 💾 Save dabao"
 
-        // Custom rows — unknown keys (P10/P11).
-        val knownSet = knownKeys.toSet()
-        val customKeys = mutableListOf<String>()
-        val it = detailsData.keys()
-        while (it.hasNext()) {
-            val k = it.next()
-            if (k !in knownSet && storedValue(k).let { v -> v.isNotEmpty() && v != "null" }) {
-                customKeys.add(k)
-            }
-        }
-        for (k in customKeys.sorted()) {
-            val v = storedValue(k)
-            customOriginal[k] = v
-            customTags[k] = storedTag(k)
-            customList.addView(customRow(k, v))
+        // Custom rows — unknown keys (P10/P11), normalized.
+        val customKeys = customVals.keys.sorted()
+        for (k in customKeys) {
+            customOriginal[k] = customVals.getValue(k)
+            customTags[k] = customTagMap[k].orEmpty()
+            customList.addView(customRow(k, customVals.getValue(k)))
         }
         if (customKeys.isEmpty()) {
             customList.addView(TextView(context).apply {
@@ -304,29 +386,108 @@ class CardDetailView(
         }
     }
 
-    /** P9: known field ki ek form row — label + EditText (khaali ho to bhi). */
+    /**
+     * P9: known field ki ek form row — label + EditText (khaali ho to bhi)
+     * + save-state indicator (v29 P2).
+     */
     private fun knownFieldRow(key: String, value: String, tag: String): LinearLayout {
         return LinearLayout(context).apply {
             orientation = VERTICAL
             setPadding(dp(4), dp(6), dp(4), dp(6))
             addView(TextView(context).apply {
-                text = DetailExtractor.label(key) +
+                text = TagRegistry.labelOf(key) +
                     (if (tag.isNotEmpty()) "  🏷️ $tag" else "")
                 textSize = 12f
                 setTextColor(Color.parseColor("#80868B"))
             })
-            addView(EditText(context).apply {
+            val et = EditText(context).apply {
                 setText(value)
-                hint = DetailExtractor.label(key)
+                hint = TagRegistry.labelOf(key)
                 textSize = 15f
                 setTextColor(Color.parseColor("#202124"))
                 setPadding(dp(8), dp(8), dp(8), dp(8))
-                fieldEdits[key] = this
+            }
+            fieldEdits[key] = et
+            addView(et)
+            // v29 P2: har field par saved ✓ indicator.
+            val st = TextView(context).apply {
+                textSize = 11f
+                setPadding(dp(8), dp(2), dp(8), 0)
+            }
+            knownStatus[key] = st
+            addView(st)
+            // Badlav par turant "pending" state (Save dabane tak).
+            et.addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(
+                    s: CharSequence?, a: Int, b: Int, c: Int
+                ) { }
+                override fun onTextChanged(
+                    s: CharSequence?, a: Int, b: Int, c: Int
+                ) { }
+                override fun afterTextChanged(s: android.text.Editable?) {
+                    try { updateFieldStatus(key) } catch (_: Exception) { }
+                }
             })
+            updateFieldStatus(key)
         }
     }
 
-    /** P10: custom Tag+Value row — label, value EditText, per-row delete. */
+    /**
+     * v29 P2: teen states visually alag —
+     *  saved (✓ hara-bhara) / pending-unsaved (● narangi) / khaali (grey).
+     */
+    private fun updateFieldStatus(key: String) {
+        val st = knownStatus[key] ?: return
+        val et = fieldEdits[key] ?: return
+        val cur = et.text.toString().trim()
+        val orig = knownOriginal[key].orEmpty()
+        when {
+            cur != orig -> {
+                st.text = "● badla — Save dabao"
+                st.setTextColor(Color.parseColor("#E8710A"))
+            }
+            cur.isNotEmpty() -> {
+                st.text = "✓ save hua"
+                st.setTextColor(Color.parseColor("#0E7C5B"))
+            }
+            else -> {
+                st.text = "khaali"
+                st.setTextColor(Color.parseColor("#80868B"))
+            }
+        }
+    }
+
+    /** v29 P2: custom row ka status — known jaisa hi. */
+    private fun updateCustomStatus(key: String) {
+        val st = customStatus[key] ?: return
+        val et = customEdits[key] ?: return
+        val cur = et.text.toString().trim()
+        val orig = customOriginal[key].orEmpty()
+        when {
+            key in customDeleted -> {
+                st.text = "🗑️ hatega — Save dabao"
+                st.setTextColor(Color.parseColor("#C5221F"))
+            }
+            cur != orig -> {
+                st.text = "● badla — Save dabao"
+                st.setTextColor(Color.parseColor("#E8710A"))
+            }
+            cur.isNotEmpty() -> {
+                st.text = "✓ save hua"
+                st.setTextColor(Color.parseColor("#0E7C5B"))
+            }
+            else -> {
+                st.text = "khaali"
+                st.setTextColor(Color.parseColor("#80868B"))
+            }
+        }
+    }
+
+    /**
+     * P10: custom Tag+Value row — label, value EditText, per-row delete +
+     * save-state indicator (v29 P2). `label` normalized key hai (render
+     * ya add-dialog se).
+     */
     private fun customRow(label: String, value: String): LinearLayout {
         val row = LinearLayout(context).apply {
             orientation = HORIZONTAL
@@ -338,7 +499,9 @@ class CardDetailView(
             orientation = VERTICAL
             layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
             addView(TextView(context).apply {
-                text = "🏷️ $label"
+                // v29 P2+P4: bilingual label (canonical → contract label,
+                // baaki → readable).
+                text = "🏷️ ${TagRegistry.labelOf(label)}"
                 textSize = 12f
                 setTypeface(null, Typeface.BOLD)
                 setTextColor(Color.parseColor("#5F6368"))
@@ -348,6 +511,21 @@ class CardDetailView(
                 textSize = 15f
                 setTextColor(Color.parseColor("#202124"))
                 customEdits[label] = this
+                addTextChangedListener(object : android.text.TextWatcher {
+                    override fun beforeTextChanged(
+                        s: CharSequence?, a: Int, b: Int, c: Int
+                    ) { }
+                    override fun onTextChanged(
+                        s: CharSequence?, a: Int, b: Int, c: Int
+                    ) { }
+                    override fun afterTextChanged(s: android.text.Editable?) {
+                        try { updateCustomStatus(label) } catch (_: Exception) { }
+                    }
+                })
+            })
+            addView(TextView(context).apply {
+                textSize = 11f
+                customStatus[label] = this
             })
         }
         row.addView(mid)
@@ -360,6 +538,7 @@ class CardDetailView(
         row.layoutParams = LayoutParams(
             LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
         ).apply { setMargins(0, 0, 0, dp(6)) }
+        updateCustomStatus(label)
         return row
     }
 
@@ -407,11 +586,18 @@ class CardDetailView(
             .create()
         dlg.setOnShowListener {
             dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val tag = tagEt.text.toString().trim()
+                val tagRaw = tagEt.text.toString().trim()
                 val v = valEt.text.toString().trim()
+                // v29 P2+P4: tag canonical key par lao — "Aadhar number"
+                // → aadhar_no; unknown → sanitized fallback.
+                val tag = TagRegistry.normalizeTag(tagRaw)
                 when {
-                    tag.isEmpty() -> {
+                    tagRaw.isEmpty() -> {
                         errTv.text = "❌ Tag khaali hai"
+                        errTv.visibility = View.VISIBLE
+                    }
+                    tag.isEmpty() -> {
+                        errTv.text = "❌ Tag samajh nahi aaya"
                         errTv.visibility = View.VISIBLE
                     }
                     v.isEmpty() -> {
@@ -443,13 +629,14 @@ class CardDetailView(
         AlertDialog.Builder(act)
             .setTitle("🗑️ Extra detail hatao?")
             .setMessage(
-                "\"$label\" is card se hat jayega.\n" +
+                "\"${TagRegistry.labelOf(label)}\" is card se hat jayega.\n" +
                     "Ye wapas nahi aayega!"
             )
             .setPositiveButton("🗑️ Hatao (हटाएं)") { d, _ ->
                 d.dismiss()
                 customList.removeView(row)
                 customEdits.remove(label)
+                customStatus.remove(label)
                 // Server par maujood tha → Save par null jayega (delete).
                 if (customOriginal.containsKey(label)) {
                     customDeleted.add(label)
@@ -465,8 +652,16 @@ class CardDetailView(
      *  - known field badla → {value, tag}; khaali kiya (pehle bhara tha) → null.
      *  - custom badla/naya → {value, tag}; delete confirm hua → null.
      *  - validate fail → ruko, error dikhao (galat save nahi).
+     *
+     * v29 P2 ROOT FIX: fail par pehle CHUPCHAAP "⚠️ Save nahi hua — dobara
+     * try karo" toast tha — user samjhta hi nahi tha KIYA galat hua. Ab:
+     * inline LOUD red error (kaaran Hinglish me) + retry = yehi Save
+     * button dobara dabana. Failed PATCH par fields ke values baney
+     * rehte hain (reload nahi) — kuch khoyega nahi.
      */
     private fun saveAllDetails() {
+        // Double-tap guard — do PATCH ek saath nahi.
+        if (saving) return
         val details = JSONObject()
         // Known fields
         for ((k, et) in fieldEdits) {
@@ -476,7 +671,10 @@ class CardDetailView(
             if (nv.isNotEmpty()) {
                 val err = CardFlow.validateField(k, nv)
                 if (err != null) {
-                    toast("❌ ${DetailExtractor.label(k)}: $err")
+                    toast("❌ ${TagRegistry.labelOf(k)}: $err")
+                    saveStatus.text = "❌ ${TagRegistry.labelOf(k)}: $err"
+                    saveStatus.setTextColor(Color.parseColor("#C5221F"))
+                    saveStatus.visibility = View.VISIBLE
                     et.requestFocus()
                     return
                 }
@@ -510,19 +708,81 @@ class CardDetailView(
             toast("Koi badlav nahi")
             return
         }
-        toast("Save ho raha hai…")
+        saving = true
+        saveBtn.isEnabled = false
+        saveBtn.text = "⏳ Save ho raha hai…"
+        saveStatus.text = "⏳ Save ho raha hai…"
+        saveStatus.setTextColor(Color.parseColor("#80868B"))
+        saveStatus.visibility = View.VISIBLE
+        val payload = details
+        // v29 P2 (verify-after-write): likhi/hatayi keys alag — re-read se
+        // milan hoga (payload me per-key tags + delete-NULL hain).
+        val toVerify = LinkedHashMap<String, String>()
+        val toVerifyDeleted = mutableSetOf<String>()
+        val pit = payload.keys()
+        while (pit.hasNext()) {
+            val k = pit.next()
+            val o = payload.optJSONObject(k)
+            if (o != null) toVerify[k] = o.optString("value", "")
+            else toVerifyDeleted.add(k)
+        }
         Thread({
-            val res = try { AgentApi.patchCard(context, cardId, cardToken, details) }
-            catch (_: Exception) { AgentApi.ApiResult(-1, null) }
+            val res = CardSaveVerifier.saveAndVerify(
+                patch = { d ->
+                    try { AgentApi.patchCard(context, cardId, cardToken, d).code }
+                    catch (_: Exception) { -1 }
+                },
+                reread = {
+                    try { AgentApi.cardDetail(context, cardId, cardToken).json }
+                    catch (_: Exception) { null }
+                },
+                prebuilt = payload,
+                toVerify = toVerify,
+                toVerifyDeleted = toVerifyDeleted
+            )
             post {
-                if (res.code in 200..299) {
-                    toast("✓ Save ho gaya (सहेजा गया)")
-                    load()
-                } else if (res.code == 401 || res.code == 403) {
-                    toast("🔒 Session khatm — PIN se dobara kholo")
-                    onBack()
-                } else {
-                    toast("⚠️ Save nahi hua — dobara try karo")
+                saving = false
+                saveBtn.isEnabled = true
+                saveBtn.text = "💾 Save (सहेजें)"
+                when (res) {
+                    is CardSaveVerifier.Result.Verified -> {
+                        // v29 P2: re-read me confirm — TABHI "✓ save ho gaya".
+                        saveStatus.text = "✓ Sab save ho gaya"
+                        saveStatus.setTextColor(Color.parseColor("#0E7C5B"))
+                        saveStatus.visibility = View.VISIBLE
+                        toast("✓ Save ho gaya (सहेजा गया)")
+                        load()
+                    }
+                    is CardSaveVerifier.Result.PatchFailed -> {
+                        if (res.code == 401 || res.code == 403) {
+                            // Session khatm — retry ka matlab nahi, dobara kholo.
+                            saveStatus.text = "🔒 Session khatm — PIN se dobara kholo"
+                            saveStatus.setTextColor(Color.parseColor("#C5221F"))
+                            saveStatus.visibility = View.VISIBLE
+                            toast("🔒 Session khatm — PIN se dobara kholo")
+                            onBack()
+                        } else {
+                            // v29 P2: kaaran saaf-saaf — retry = Save dobara
+                            // dabana. Fields ki values bani rehti hain.
+                            val why = CardSaveVerifier.loudReason(res)
+                            val msg = "❌ SAVE NAHI HUA — $why. Aapki typing " +
+                                "gayab nahi hui — 💾 Save dobara dabao."
+                            saveStatus.text = msg
+                            saveStatus.setTextColor(Color.parseColor("#C5221F"))
+                            saveStatus.visibility = View.VISIBLE
+                            toast("❌ Save nahi hua — $why — dobara try karo")
+                        }
+                    }
+                    is CardSaveVerifier.Result.Mismatch -> {
+                        // PATCH 2xx par re-read mismatch — LOUD + retry.
+                        val why = CardSaveVerifier.loudReason(res)
+                        val msg = "❌ SAVE VERIFY NAHI HUA — $why. " +
+                            "💾 Save dobara dabao."
+                        saveStatus.text = msg
+                        saveStatus.setTextColor(Color.parseColor("#C5221F"))
+                        saveStatus.visibility = View.VISIBLE
+                        toast("❌ Save verify nahi hua — dobara try karo")
+                    }
                 }
             }
         }, "fm-card-saveall").start()
