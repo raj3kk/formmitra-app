@@ -83,6 +83,27 @@ object DocsStore {
     }
 
     /**
+     * Vault se file hatao — sirf docs dir ke ANDAR ki file (canonical-path
+     * guard; traversal bahar nahi). Bina confirm ke mat bulao.
+     * @return true agar file delete hui.
+     */
+    fun deleteDoc(ctx: Context, name: String): Boolean {
+        return try {
+            if (name.isEmpty()) return false
+            val dir = docsDir(ctx)
+            val f = File(dir, name)
+            val canonBase = try { dir.canonicalPath }
+            catch (_: Exception) { dir.absolutePath }
+            val canonFile = try { f.canonicalPath }
+            catch (_: Exception) { return false }
+            if (!canonFile.startsWith(canonBase + File.separator)) return false
+            f.isFile && f.delete()
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
      * v14: purani plaintext file → successful read ke baad encrypted me
      * migrate karo (best-effort). docs dir ke bahar ki files ko chhedo mat.
      */

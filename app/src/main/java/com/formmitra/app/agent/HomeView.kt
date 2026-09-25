@@ -2,24 +2,30 @@ package com.formmitra.app.agent
 
 import android.content.Context
 import android.graphics.Color
+import android.graphics.Typeface
 import android.view.View
 import android.widget.Button
+import android.widget.GridLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.TextView
 import java.io.File
 
 /**
- * HomeView — Home tab ka native view: services strip + live-browser button
- * + embedded Mitra chat (AgentChatView).
+ * HomeView — Home tab ka native view: services strip + category cards +
+ * live-browser button + embedded Mitra chat (AgentChatView).
  *
  * Agent chat ab alag "Agent" tab me nahi — Home me fixed hai (user demand).
  * Services (Tracking/Jobs/Scholarships/Resume) dabane par WebView me khulte
  * hain, nav me Home highlight rehta hai; Home dabao → wapas chat.
+ * Category cards (Wallet/History/Document Vault/Profile) dabane par sahi
+ * tab khulta hai.
  */
 class HomeView(
     context: Context,
     chatView: AgentChatView,
     private val onOpenService: (String) -> Unit,
+    private val onOpenTab: (String) -> Unit,
     private val onShowMirror: () -> Unit
 ) : LinearLayout(context) {
 
@@ -74,6 +80,39 @@ class HomeView(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
             ).apply { setMargins(pad, 0, pad, dp(4)) }
         )
+
+        // Category cards — tap par sahi tab khule (v19, BUG 5)
+        addView(TextView(context).apply {
+            text = "Categories"
+            textSize = 14f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#202124"))
+            setPadding(pad, dp(6), pad, dp(4))
+        })
+        val grid = GridLayout(context).apply {
+            columnCount = 2
+            setPadding(pad, 0, pad, dp(6))
+        }
+        val cards = listOf(
+            "💰 Wallet" to "/wallet",
+            "🕘 History" to "/history",
+            "📁 Document Vault" to "vault",
+            "👤 Profile" to "/profile"
+        )
+        for ((label, target) in cards) {
+            val b = Button(context).apply {
+                text = label
+                textSize = 13f
+                setOnClickListener { onOpenTab(target) }
+            }
+            val lp = GridLayout.LayoutParams().apply {
+                width = 0
+                columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
+                setMargins(dp(4), dp(4), dp(4), dp(4))
+            }
+            grid.addView(b, lp)
+        }
+        addView(grid)
 
         // Mitra chat — baki poori jagah
         chatView.layoutParams = LayoutParams(

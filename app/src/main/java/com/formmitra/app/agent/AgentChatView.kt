@@ -264,11 +264,13 @@ class AgentChatView(
         inputRow.addView(sendBtn)
         addView(inputRow)
 
-        // Greeting
+        // Greeting (v19): product ab tracking assistant hai — form-filling
+        // direction user ne cancel kar di thi, isliye copy badli.
         post {
             addAssistantBubble(
-                "Namaste! 🙏 Kaun sa form bharna hai? Batao, " +
-                    "main link + kya-kya lagega nikal deta hoon."
+                "Namaste! 🙏 Main aapka tracking assistant hun — " +
+                    "zameen tracking, sarkari jobs, scholarships ya " +
+                    "resume me help chahiye to batao."
             )
         }
     }

@@ -25,19 +25,22 @@ import android.widget.Button
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import com.formmitra.app.agent.AgentChatView
 import com.formmitra.app.agent.HomeView
+import com.formmitra.app.agent.ProfileView
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * FormMitra v16 — tabs: Home (Mitra chat embedded), History, Wallet, Profile.
+ * FormMitra v19 — tabs: Home (Mitra chat embedded), History, Wallet, Profile (native).
  * (+ Admin tab sirf owner email par.)
  *
- * Home = native HomeView (services strip + live-browser button + agent chat).
- * Wallet/Profile/Admin = website WebView me. Purane Agent/Browser/Tracking/
- * Jobs tabs hata diye — services Home strip se khulte hain.
+ * Home = native HomeView (services strip + category cards + live button + agent chat).
+ * History = native HistoryView. Profile = native ProfileView (details/vault/admin/logout).
+ * Wallet/Admin = website WebView me (unhi par ?app=1 lagta hai).
+ * Purane Agent/Browser/Tracking/Jobs tabs hata diye — services Home strip se khulte hain.
  */
 class MainActivity : Activity() {
 
@@ -47,6 +50,8 @@ class MainActivity : Activity() {
     private var homeVisible = false
     private lateinit var historyView: com.formmitra.app.agent.HistoryView
     private var historyVisible = false
+    private lateinit var profileView: ProfileView
+    private var profileVisible = false
 
     // Live browser mirror (ab tab nahi — Home ke "🔴 Live" button se)
     private lateinit var browserMirrorView: LinearLayout
@@ -109,13 +114,28 @@ class MainActivity : Activity() {
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
                 view: WebView, request: WebResourceRequest
-            ): Boolean = false
+            ): Boolean {
+                val u = try { request.url?.toString() }
+                catch (_: Exception) { null } ?: return false
+                // v19 BUG 2: same-origin in-page navigation (website ke Link
+                // clicks) par app=1 jod do taaki param khoye nahi. Bahar ke
+                // official links ko chhedo mat — WebView khud handle kare.
+                if (isSameOrigin(u)) {
+                    val withParam = appUrl(u)
+                    if (withParam != u) {
+                        view.loadUrl(withParam)
+                        return true
+                    }
+                }
+                return false
+            }
 
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 // Owner check: /profile page ke text me owner email dikhe
                 // to Admin tab dikhao (fail-closed: na dikhe to tab nahi).
-                if (!isOwner && url.trimEnd('/') == baseUrl() + "/profile") {
+                // Query strip karke compare (app=1 lagne ke baad bhi match).
+                if (!isOwner && stripQuery(url) == baseUrl() + "/profile") {
                     checkOwner(view)
                 }
             }
@@ -132,6 +152,10 @@ class MainActivity : Activity() {
             this,
             agentChatView,
             onOpenService = { path -> selectTab(path) },
+            onOpenTab = { target ->
+                if (target == "vault") openProfileVault()
+                else selectTab(target)
+            },
             onShowMirror = { showMirror() }
         ).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -149,6 +173,21 @@ class MainActivity : Activity() {
             visibility = View.GONE
         }
         root.addView(historyView)
+
+        // Profile tab — native (v19, BUG 4): details + edit + vault + admin + logout
+        profileView = ProfileView(
+            this,
+            ownerEmail,
+            onOwnerConfirmed = { onOwnerConfirmed() },
+            onOpenAdmin = { if (isOwner) selectTab("/admin") },
+            onLogout = { doLogout() }
+        ).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            )
+            visibility = View.GONE
+        }
+        root.addView(profileView)
 
         // Live browser mirror — engine ka agent_mirror.png har 3s refresh
         browserMirrorView = LinearLayout(this).apply {
@@ -307,10 +346,12 @@ class MainActivity : Activity() {
         val wasHome = homeVisible
         homeVisible = false
         historyVisible = false
+        profileVisible = false
         mirrorVisible = false
         mirrorHandler.removeCallbacks(mirrorRunnable)
         homeView.visibility = View.GONE
         historyView.visibility = View.GONE
+        profileView.visibility = View.GONE
         browserMirrorView.visibility = View.GONE
         webView.visibility = View.GONE
         if (wasHome && path != "/") agentChatView.onTabHidden()
@@ -327,30 +368,98 @@ class MainActivity : Activity() {
                 historyVisible = true
                 historyView.onTabShown()
             }
+            path == "/profile" -> {
+                // v19 BUG 4: native ProfileView (WebView nahi)
+                profileView.visibility = View.VISIBLE
+                profileVisible = true
+                profileView.onTabShown()
+            }
             tabPaths.contains(path) -> {
-                // Wallet / Profile / Admin — website WebView me
+                // Wallet / Admin — website WebView me (?app=1 ke saath)
                 webView.visibility = View.VISIBLE
-                webView.loadUrl(baseUrl() + path)
+                webView.loadUrl(appUrl(baseUrl() + path))
             }
             else -> {
                 // Service paths (/tracking, /jobs, /scholarships, /resume)
                 // WebView me, nav me Home highlight
                 webView.visibility = View.VISIBLE
-                val full = baseUrl() + path
-                if (webView.url != full) webView.loadUrl(full)
+                val full = appUrl(baseUrl() + path)
+                if (stripQuery(webView.url ?: "") != stripQuery(full)) {
+                    webView.loadUrl(full)
+                }
             }
         }
         activePath = if (tabPaths.contains(path)) path else "/"
         updateNavHighlight(activePath)
     }
 
+    /** Home ke "📁 Document Vault" card se — Profile kholo + vault par scroll. */
+    private fun openProfileVault() {
+        selectTab("/profile")
+        try { profileView.jumpToVault() } catch (_: Exception) { }
+    }
+
+    /** ProfileView ka owner check (ya purana WebView check) confirm hua. */
+    private fun onOwnerConfirmed() {
+        if (!isOwner) {
+            isOwner = true
+            runOnUiThread { buildNav() }
+        }
+        if (::profileView.isInitialized) profileView.setOwner(true)
+    }
+
+    /** Logout: website session clear, native state reset, Home par wapas. */
+    private fun doLogout() {
+        try {
+            CookieManager.getInstance().removeAllCookies(null)
+        } catch (_: Exception) { }
+        try {
+            if (::profileView.isInitialized) profileView.onLoggedOut()
+        } catch (_: Exception) { }
+        selectTab("/")
+        Toast.makeText(this, "Logout ho gaya", Toast.LENGTH_SHORT).show()
+    }
+
+    // ---------- v19 BUG 2: website URLs par ?app=1 ----------
+
+    /** Sirf apna domain (baseUrl ka host) — bahar ke official links kabhi nahi. */
+    private fun isSameOrigin(url: String): Boolean {
+        return try {
+            val u = Uri.parse(url)
+            val b = Uri.parse(baseUrl())
+            val uh = u.host ?: return false
+            val bh = b.host ?: return false
+            uh.equals(bh, ignoreCase = true)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Website URL par ?app=1 (ya &app=1) jodo — sirf same-origin par.
+     * Pehle se app=1 ho to wapas wahi URL (double param nahi).
+     */
+    private fun appUrl(url: String): String {
+        if (!isSameOrigin(url)) return url
+        val frag = if (url.contains("#")) "#" + url.substringAfter("#") else ""
+        val noFrag = url.substringBefore("#")
+        if (noFrag.contains("app=1")) return url
+        val sep = if (noFrag.contains("?")) "&" else "?"
+        return "$noFrag${sep}app=1$frag"
+    }
+
+    /** Query string hatakar compare — app=1 lagne ke baad bhi match kare. */
+    private fun stripQuery(url: String): String = url.substringBefore("?").trimEnd('/')
+
     /** Home ke "🔴 Live" button se — agent ka live browser dikhao. */
     private fun showMirror() {
         homeVisible = false
         historyVisible = false
+        profileVisible = false
         mirrorHandler.removeCallbacks(mirrorRunnable)
         homeView.visibility = View.GONE
         historyView.visibility = View.GONE
+        profileView.visibility = View.GONE
         webView.visibility = View.GONE
         agentChatView.onTabHidden()
         browserMirrorView.visibility = View.VISIBLE
@@ -365,19 +474,23 @@ class MainActivity : Activity() {
         if (homeVisible) agentChatView.onTabHidden()
         homeVisible = false
         historyVisible = false
+        profileVisible = false
         mirrorVisible = false
         mirrorHandler.removeCallbacks(mirrorRunnable)
         homeView.visibility = View.GONE
         historyView.visibility = View.GONE
+        profileView.visibility = View.GONE
         browserMirrorView.visibility = View.GONE
         webView.visibility = View.VISIBLE
-        webView.loadUrl(url)
+        // v19 BUG 2: apne domain par ?app=1 — bahar ke official links jaisi hain waisi
+        webView.loadUrl(appUrl(url))
         activePath = "/"
         updateNavHighlight("/")
     }
 
     private fun loadDeepUrl(fullUrl: String) {
-        val path = fullUrl.removePrefix(baseUrl())
+        // v19 BUG 2: query (app=1) hatakar path nikalo — warna tab match toot jayega
+        val path = fullUrl.substringBefore("?").removePrefix(baseUrl())
         val tabPaths = setOf("/", "/history", "/wallet", "/profile", "/admin")
         if (path in tabPaths) {
             selectTab(path)
@@ -385,13 +498,15 @@ class MainActivity : Activity() {
             if (homeVisible) agentChatView.onTabHidden()
             homeVisible = false
             historyVisible = false
+            profileVisible = false
             mirrorVisible = false
             mirrorHandler.removeCallbacks(mirrorRunnable)
             homeView.visibility = View.GONE
             historyView.visibility = View.GONE
+            profileView.visibility = View.GONE
             browserMirrorView.visibility = View.GONE
             webView.visibility = View.VISIBLE
-            webView.loadUrl(fullUrl)
+            webView.loadUrl(appUrl(fullUrl))
             activePath = "/"
             updateNavHighlight("/")
         }
@@ -429,7 +544,7 @@ class MainActivity : Activity() {
     override fun onBackPressed() {
         if (mirrorVisible) {
             selectTab("/")
-        } else if (homeVisible || historyVisible) {
+        } else if (homeVisible || historyVisible || profileVisible) {
             super.onBackPressed()
         } else if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
     }
@@ -513,6 +628,10 @@ class MainActivity : Activity() {
         } catch (_: Exception) { }
         if (::agentChatView.isInitialized) {
             agentChatView.handleActivityResult(requestCode, resultCode, data)
+        }
+        // v19: Document Vault (ProfileView) ka file picker
+        if (::profileView.isInitialized) {
+            profileView.handleActivityResult(requestCode, resultCode, data)
         }
     }
 
