@@ -5,7 +5,10 @@ import android.util.Log
 import androidx.work.Configuration
 import androidx.work.WorkManager
 import com.formmitra.app.agent.FcmPush
+import com.formmitra.app.agent.NotifCenter
+import com.formmitra.app.agent.PendingPromptStore
 import com.formmitra.app.agent.WorkingMode
+import com.formmitra.app.engine.UserPrompt
 
 /**
  * FmApp — FormMitra ka Application class.
@@ -48,6 +51,61 @@ class FmApp : Application(), Configuration.Provider {
             if (WorkingMode.isEnabled(this)) WakeWorker.enqueue(this)
         } catch (t: Throwable) {
             Log.e("FmApp", "WakeWorker enqueue failed (non-fatal)", t)
+        }
+        // K1+K4: agent → user detail-request loop.
+        // Sawal uthe → PendingPromptStore me entry + notification
+        // ("ek detail chahiye — tap karke do"; payment = approval).
+        // Jawab/cancel mile → entry + notification saaf.
+        // Timeout par entry REHTI HAI — History ke Pending tab me dikhegi
+        // jab tak detail na mile (loop kabhi nahi toot-ta).
+        try {
+            UserPrompt.onRaised { req ->
+                try {
+                    PendingPromptStore.raise(this, req)
+                    // L4: prompt khula to user ko sunao bhi (voice ON ho to)
+                    try {
+                        val say = when (req.kind) {
+                            "otp" -> "OTP chahiye — SMS aate hi apne aap bhar jayega, warna type kar do."
+                            "payment" -> "Payment approval chahiye — app kholo."
+                            "login" -> "Login chahiye — app kholo."
+                            "document" -> "Document chahiye — app kholo."
+                            "device_auth" -> "Ab aapko apne phone par fingerprint ya PIN dena hai."
+                            else -> "Ek detail chahiye — app kholo."
+                        }
+                        com.formmitra.app.agent.VoiceOutput.speak(this, say)
+                    } catch (_: Exception) { }
+                    if (req.kind == "payment") {
+                        NotifCenter.notify(
+                            this, NotifCenter.Cat.APPROVAL,
+                            "Approval chahiye 💰",
+                            "${req.title} — tap karke approve karo",
+                            deepTab = "/history",
+                            deepRunId = req.runId,
+                            openPromptRunId = req.runId,
+                            key = req.runId
+                        )
+                    } else {
+                        NotifCenter.notify(
+                            this, NotifCenter.Cat.DETAIL,
+                            "Ek detail chahiye ✋",
+                            "${req.title} — tap karke do, agent aage badhega",
+                            deepTab = "/history",
+                            deepRunId = req.runId,
+                            openPromptRunId = req.runId,
+                            key = req.runId
+                        )
+                    }
+                } catch (_: Exception) { }
+            }
+            UserPrompt.onResolved { runId ->
+                try {
+                    PendingPromptStore.clear(this, runId)
+                    NotifCenter.cancel(this, NotifCenter.Cat.DETAIL, runId)
+                    NotifCenter.cancel(this, NotifCenter.Cat.APPROVAL, runId)
+                } catch (_: Exception) { }
+            }
+        } catch (t: Throwable) {
+            Log.e("FmApp", "UserPrompt listeners failed (non-fatal)", t)
         }
         // J1: FCM init (best-effort). google-services.json me com.formmitra.app
         // client na ho to skip — polling fallback tab bhi zinda rehta hai.

@@ -38,10 +38,10 @@ import org.json.JSONObject
  * v16 changes (user demands):
  * - Send path hardened: fail par saaf error + retry button (silent fail nahi);
  *   401 par "Login karo" button (Profile tab kholta hai); 75s watchdog.
- * - Verify-before-save gate: personal details wala message PEHLE verify card
- *   me dikhta hai — Proceed dabane par hi server ko jata hai (bina Proceed
- *   ke save ho hi nahi sakta). Edit ka option built-in.
- * - "Shuru karo" se pehle bhi details ka verify card (vault + session merge).
+ * - PERMANENT FULL APPROVAL (2026-09-25): koi verify/Proceed gate NAHI —
+ *   details seedha save hoti hain, task seedha banta hai. Galat detail
+ *   user Profile me theek kar sakta hai; run ke beech detail-request
+ *   loop (K4) maang lega.
  * - Voice: live partial transcription, sun-ne ka clear indicator, hi-IN →
  *   en-IN fallback, error codes ke saaf messages.
  * - Attach (📎): koi bhi file type (limited selector hata diya).
@@ -64,8 +64,7 @@ class AgentChatView(
 
     // v20 Task 5: work-wise category context (chat body me `category` jayega)
     private var activeCategory: String? = null
-    /** Category flow me plan aate hi verify+start khud khule (ek Proceed tap
-     *  bachta hai; verify dialog ka Proceed phir bhi user hi dabata hai). */
+    /** Category flow me plan aate hi start khud ho (koi Proceed tap nahi). */
     private var autoPlanArmed = false
     private lateinit var categoryChip: TextView
 
@@ -267,6 +266,21 @@ class AgentChatView(
             setOnFocusChangeListener { _, hasFocus ->
                 if (hasFocus) post { scrollToBottom() }
             }
+            // L2: chat draft — type karte jao, app band ho to bhi bacha rahe
+            addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(
+                    s: CharSequence?, st: Int, c: Int, a: Int
+                ) { }
+                override fun onTextChanged(
+                    s: CharSequence?, st: Int, b: Int, c: Int
+                ) { }
+                override fun afterTextChanged(s: android.text.Editable?) {
+                    saveDraft(s?.toString().orEmpty())
+                }
+            })
+            // Pichla draft restore karo (bheja nahi gaya tha)
+            val draft = loadDraft()
+            if (draft.isNotEmpty()) setText(draft)
         }
         inputRow.addView(input)
         micBtn = Button(context).apply {
@@ -529,7 +543,7 @@ class AgentChatView(
             }
         }
 
-        // Shuru karo — verify gate ke saath (details ho to pehle verify card)
+        // Shuru karo — seedha task (koi verify gate nahi)
         val startBtn = Button(context).apply {
             text = "▶ Shuru karo"
             textSize = 15f
@@ -552,56 +566,18 @@ class AgentChatView(
     /**
      * Plan ka "Shuru karo" flow — button tap ya category auto-start, dono
      * yahi aate hain. startBtn null = auto path (button state skip hota hai).
-     * Verify dialog ka Proceed hamesha user dabata hai (guard barkarar).
+     *
+     * PERMANENT FULL APPROVAL (2026-09-25): koi verify/Proceed gate NAHI —
+     * agent seedha task banata hai. Galat detail hui to run ke beech
+     * detail-request loop (K4) se maang lega.
      */
     private fun onStartPlanClicked(plan: JSONObject, link: String, startBtn: Button?) {
         startBtn?.isEnabled = false
-        startBtn?.text = "⏳ Details la raha hun…"
-        Thread {
-            // Vault profile + session details merge karke verify card
-            val merged = LinkedHashMap<String, String>()
-            try {
-                val vault = AgentApi.profile(context)
-                if (vault != null) {
-                    for (k in DetailExtractor.orderedKeys()) {
-                        val v = vault.optString(k, "").trim()
-                        if (v.isNotEmpty() && v != "null") merged[k] = v
-                    }
-                }
-            } catch (_: Exception) { }
-            for ((k, v) in sessionDetails) merged[k] = v
-            post {
-                if (merged.isEmpty()) {
-                    beginEnqueue(plan, link, startBtn)
-                } else {
-                    showVerifyDialog(
-                        merged,
-                        title = "✔️ Aage badhne se pehle verify karo",
-                        subtitle = "Agent inhi details se kaam karega. " +
-                            "Proceed dabane par hi task banega.",
-                        positiveLabel = "✅ Proceed",
-                        onProceed = { verified ->
-                            // User ne theek kiya ho to server ko correction bhejo
-                            val diffs = verified.filter { (k, v) -> merged[k] != v }
-                            if (diffs.isNotEmpty()) {
-                                sessionDetails.putAll(verified)
-                                doSend(
-                                    "Meri in details ko theek kar do: " +
-                                        diffs.entries.joinToString(", ") {
-                                            "${DetailExtractor.label(it.key)}: ${it.value}"
-                                        }
-                                )
-                            }
-                            beginEnqueue(plan, link, startBtn)
-                        },
-                        onCancel = {
-                            startBtn?.text = "▶ Shuru karo"
-                            startBtn?.isEnabled = true
-                        }
-                    )
-                }
-            }
-        }.start()
+        startBtn?.text = "⏳ Task ban raha hai…"
+        // Seedha task banao — koi Proceed confirmation nahi.
+        // Details server ke vault profile + chat history se aati hain;
+        // galat hui to run ke beech detail-request loop (K4) maang lega.
+        beginEnqueue(plan, link, startBtn)
     }
 
     private fun beginEnqueue(plan: JSONObject, link: String, startBtn: Button?) {
@@ -618,8 +594,9 @@ class AgentChatView(
     // ---------- flow ----------
 
     /**
-     * Verify-before-save gate: message me nayi personal details dikhin to
-     * PEHLE verify card — Proceed par hi message server ko jayega.
+     * PERMANENT FULL APPROVAL (2026-09-25): message me nayi personal details
+     * dikhin to seedha session me rakho aur bhejo — koi verify/Proceed gate
+     * nahi. Galat hui to user Profile me theek kar sakta hai.
      */
     fun sendMessage(raw: String) {
         val text = raw.trim()
@@ -627,28 +604,30 @@ class AgentChatView(
         val candidates = DetailExtractor.extract(text)
         val fresh = candidates.filterKeys { !sessionDetails.containsKey(it) }
         if (fresh.isNotEmpty()) {
-            showVerifyDialog(
-                fresh,
-                title = "✔️ Details verify karo",
-                subtitle = "Ye details save hongi. Sahi hain to Proceed dabao — " +
-                    "bina Proceed ke kuch save nahi hoga.",
-                positiveLabel = "✅ Sahi hai — bhejo",
-                onProceed = { verified ->
-                    sessionDetails.putAll(verified)
-                    var finalText = text
-                    val edited = verified.filter { (k, v) -> candidates[k] != v }
-                    if (edited.isNotEmpty()) {
-                        finalText += "\n(Sahi: " + edited.entries.joinToString(", ") {
-                            "${DetailExtractor.label(it.key)}=${it.value}"
-                        } + ")"
-                    }
-                    doSend(finalText)
-                },
-                onCancel = { toast("Message nahi bheja — details save nahi hui") }
-            )
-            return
+            sessionDetails.putAll(fresh)
         }
         doSend(text)
+    }
+
+    /**
+     * L2: chat draft persistence — adhura likha message app band/crash
+     * hone par bhi bacha rahe. Send hote hi clear.
+     */
+    private fun draftPrefs() =
+        context.getSharedPreferences("formmitra_chat", Context.MODE_PRIVATE)
+
+    private fun saveDraft(text: String) {
+        try {
+            draftPrefs().edit().putString("chat_draft", text.take(2000)).apply()
+        } catch (_: Exception) { }
+    }
+
+    private fun loadDraft(): String = try {
+        draftPrefs().getString("chat_draft", "").orEmpty()
+    } catch (_: Exception) { "" }
+
+    private fun clearDraft() {
+        try { draftPrefs().edit().remove("chat_draft").apply() } catch (_: Exception) { }
     }
 
     /** Asli send — gate se guzarne ke baad. Retry bhi yahi aata hai. */
@@ -658,6 +637,7 @@ class AgentChatView(
         waiting = true
         lastFailedText = t
         input.text.clear()
+        clearDraft()
         sendBtn.isEnabled = false
         addUserBubble(t)
         history.add("user" to t)
@@ -698,7 +678,18 @@ class AgentChatView(
                         "🔑 Pehle login karna hoga — tabhi agent baat karega.",
                         "🔑 Login karo"
                     ) { onOpenProfile() }
-                    429 -> addAssistantBubble("Aaj ka limit khatam, kal try karo ⏳")
+                    429 -> {
+                        addAssistantBubble("Aaj ka limit khatam, kal try karo ⏳")
+                        // K1: status/limit change — local fallback notification.
+                        try {
+                            NotifCenter.notify(
+                                context, NotifCenter.Cat.STATUS,
+                                "⏳ Aaj ka limit khatam",
+                                "Agent ka daily limit poora ho gaya — kal phir try karo.",
+                                deepTab = "/"
+                            )
+                        } catch (_: Exception) { }
+                    }
                     200 -> {
                         lastFailedText = null
                         val json = res.json
@@ -711,9 +702,8 @@ class AgentChatView(
                         val plan = json?.optJSONObject("plan")
                         if (plan != null) {
                             addPlanCard(plan)
-                            // A: category flow — plan aate hi verify+start
-                            // flow khud kholo (Proceed user dabayega; guard
-                            // barkarar). Normal chat me nahi.
+                            // A: category flow — plan aate hi start flow khud
+                            // kholo (koi Proceed nahi). Normal chat me nahi.
                             if (autoPlanArmed) {
                                 autoPlanArmed = false
                                 onStartPlanClicked(
@@ -739,12 +729,10 @@ class AgentChatView(
                                 "🔁 Dobara bhejo"
                             ) { lastFailedText?.let { doSend(it) } }
                         }
-                        // VERIFY-BEFORE-SAVE contract (server app/api/agent/profile/route.ts):
-                        // CHAT route bina user-confirmation ke draft_profile +
-                        // needs_confirmation wapas karta hai — usi existing verify
-                        // dialog me dikhao. Proceed = user ne verify kiya →
-                        // PUT /api/agent/profile (confirmed:true) se save.
-                        // Cancel = kuch nahi.
+                        // PERMANENT FULL APPROVAL (2026-09-25): server ka
+                        // draft_profile + needs_confirmation ab AUTO-CONFIRM —
+                        // koi verify/Proceed dialog nahi. PUT /api/agent/profile
+                        // (confirmed:true) seedha save karo.
                         val draftObj = json?.optJSONObject("draft_profile")
                         if (json?.optBoolean("needs_confirmation", false) == true &&
                             draftObj != null && draftObj.length() > 0
@@ -763,25 +751,15 @@ class AgentChatView(
                                 }
                             }
                             if (draftMap.isNotEmpty()) {
-                                showVerifyDialog(
-                                    draftMap,
-                                    title = "✔️ Details verify karo",
-                                    subtitle = "AI ne ye details nikali hain. Sahi hain to Proceed dabao — " +
-                                        "bina Proceed ke kuch save nahi hoga.",
-                                    positiveLabel = "✅ Sahi hai — save karo",
-                                    onProceed = { verified ->
-                                        sessionDetails.putAll(verified)
-                                        Thread {
-                                            val ok = try {
-                                                AgentApi.saveProfile(context, verified)
-                                            } catch (_: Exception) { false }
-                                            post {
-                                                toast(if (ok) "✓ Details save ho gayi" else "⚠️ Save me dikkat — baad me try karo")
-                                            }
-                                        }.start()
-                                    },
-                                    onCancel = { toast("Details save nahi hui") }
-                                )
+                                sessionDetails.putAll(draftMap)
+                                Thread {
+                                    val ok = try {
+                                        AgentApi.saveProfile(context, draftMap)
+                                    } catch (_: Exception) { false }
+                                    post {
+                                        toast(if (ok) "✓ Details save ho gayi" else "⚠️ Save me dikkat — baad me try karo")
+                                    }
+                                }.start()
                             }
                         }
                         val savedArr = json?.optJSONArray("saved")
@@ -790,7 +768,7 @@ class AgentChatView(
                         }
                     }
                     else -> addErrorBubble(
-                        "⚠️ Server se dikkat (code ${res.code}) — message nahi gaya.",
+                        "⚠️ Server se baat nahi ho payi — message nahi gaya.",
                         "🔁 Dobara bhejo"
                     ) { lastFailedText?.let { doSend(it) } }
                 }
@@ -802,8 +780,7 @@ class AgentChatView(
 
     /**
      * Home ke work-category card se: category context set karo + intro
-     * message bhejo. sendMessage() ke verify gate se guzarta hai — popup
-     * ki details server ko bina user-verify ke nahi jayengi.
+     * message bhejo (koi verify gate nahi — seedha bhejta hai).
      */
     fun startCategoryChat(
         category: String,
@@ -840,8 +817,9 @@ class AgentChatView(
     // ---------- verify dialog ----------
 
     /**
-     * Details ka verify card: arrange karke dikhao, har field editable,
-     * Proceed par hi aage badho. Bina Proceed ke kuch nahi hota.
+     * Details ka edit card: arrange karke dikhao, har field editable.
+     * SIRF user-initiated edit ke liye ("Meri details" → "Theek karo") —
+     * automation flow me iska koi gate nahi hai.
      */
     private fun showVerifyDialog(
         fields: Map<String, String>,
@@ -1002,13 +980,22 @@ class AgentChatView(
         }.start()
     }
 
+    // L5: double-tap guard — ek (title,url) ka enqueue ek waqt me ek hi
+    private val enqueueInFlight = mutableSetOf<String>()
+
     private fun enqueueTask(
         title: String,
         url: String,
         category: String = "",
         onDone: () -> Unit
     ) {
+        val flightKey = "$title|$url"
+        if (!enqueueInFlight.add(flightKey)) {
+            post { onDone() }
+            return
+        }
         Thread {
+            try {
             var msg: String
             if (url.isEmpty()) {
                 msg = "Is form ka official link nahi mila — dobara pucho."
@@ -1044,7 +1031,7 @@ class AgentChatView(
                             startStandaloneTask(title, url)
                         code == -1 -> "Internet nahi hai 📡 — server bhi nahi mil raha. " +
                             "Standalone ab server-managed hai."
-                        else -> "Task ban nahi paya (code $code). Dobara try karo."
+                        else -> "Task ban nahi paya — server se baat nahi ho payi. Dobara try karo."
                     }
                 } else {
                     val runCode = AgentApi.runNow(context, taskId)
@@ -1057,7 +1044,7 @@ class AgentChatView(
                     } else if (runCode == -1) {
                         "Internet nahi hai 📡"
                     } else {
-                        "Task ban gaya par run nahi hua (code $runCode). " +
+                        "Task ban gaya par shuru nahi ho paya. " +
                             "Baad me dobara try karo."
                     }
                 }
@@ -1066,6 +1053,9 @@ class AgentChatView(
                 addAssistantBubble(msg)
                 onDone()
             }
+        } finally {
+            enqueueInFlight.remove(flightKey)
+        }
         }.start()
     }
 
@@ -1094,7 +1084,7 @@ class AgentChatView(
             "Server nahi mil raha — standalone mode me shuru kiya ✅\n" +
                 "Progress notification me dikhega."
         } catch (e: Exception) {
-            "Standalone task shuru nahi hua: ${(e.message ?: "error").take(120)}"
+            "Standalone task shuru nahi ho paya — dobara try karo."
         }
     }
 
@@ -1260,7 +1250,7 @@ class AgentChatView(
                 when (code) {
                     -1 -> "Internet nahi hai 📡"
                     401 -> "Pehle Profile tab me login karo 🔑"
-                    else -> "Task ban nahi paya (code $code). Dobara try karo."
+                    else -> "Task ban nahi paya — server se baat nahi ho payi. Dobara try karo."
                 }
             } else {
                 val runCode = AgentApi.runNow(context, taskId)
@@ -1271,7 +1261,7 @@ class AgentChatView(
                 } else if (runCode == -1) {
                     "Internet nahi hai 📡"
                 } else {
-                    "Task ban gaya par run nahi hua (code $runCode)."
+                    "Task ban gaya par shuru nahi ho paya — baad me dobara try karo."
                 }
             }
             post {

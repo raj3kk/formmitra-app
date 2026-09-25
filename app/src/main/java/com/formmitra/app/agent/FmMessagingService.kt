@@ -1,35 +1,38 @@
 package com.formmitra.app.agent
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
 import android.os.Build
 import android.util.Log
-import com.formmitra.app.MainActivity
 import com.formmitra.app.WakeWorker
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 
 /**
- * FmMessagingService — J1: FCM push receive.
+ * FmMessagingService — J1: FCM push receive (+ K1: notification deep links).
  *
  * Server (sirf nazar rakhne wala) ye data-push bhej sakta hai:
- *   { "type": "wake" | "task" | "refresh" | "status",
- *     "title": "...", "body": "...", "task_id": "..." }
+ *   { "type": "wake" | "task" | "refresh" | "status" | "detail" |
+ *             "approval" | "task_done" | "task_fail" | "doc_ready",
+ *     "title": "...", "body": "...",
+ *     "task_id": "...", "run_id": "...", "deep_tab": "/history" }
  *
- * - type = wake/task/refresh:
- *     Working Mode ON  → WakeWorker.enqueue → server ping + pending run ka
- *                        USI STEP se resume (ya naya claimed task).
- *     Working Mode OFF → automation start NAHI; sirf ek status notification
- *                        ("server se update aaya — Working Mode OFF hai").
- * - type = status (ya title/body ke saath koi bhi): hamesha notification.
+ * - wake/task/refresh: Working Mode ON → WakeWorker.enqueue (resume);
+ *   OFF → sirf status notification (automation start NAHI).
+ * - detail: agent ko user se detail chahiye → DETAIL channel (HIGH),
+ *   tap → History + prompt khule.
+ * - approval: approval chahiye (payment) → APPROVAL channel (HIGH).
+ * - task_done / task_fail: TASK channel, tap → History + run detail.
+ * - doc_ready: DOC channel, tap → History + run detail.
+ * - status: STATUS channel (limit/status change).
+ *
+ * Sab notifications NotifCenter se — channels + Profile on/off +
+ * inbox + badge + deep link ek jagah. Category OFF ho to push bhi
+ * nahi dikhega (user ki setting).
  *
  * Manifest me MESSAGING_EVENT intent-filter ke saath declared hai.
- * Push na aaye / FCM configured na ho → polling fallback (FormTaskWorker
- * 30-min, NetWake, app-open WakeWorker) — feature kabhi dead nahi.
+ * Push na aaye / FCM configured na ho → local fallback (FormTaskWorker
+ * 30-min, NetWake, app-open WakeWorker, UserPrompt listeners) — feature
+ * kabhi dead nahi.
  */
 class FmMessagingService : FirebaseMessagingService() {
 
@@ -46,7 +49,9 @@ class FmMessagingService : FirebaseMessagingService() {
             val type = (data["type"] ?: "").lowercase()
             val title = data["title"] ?: msg.notification?.title ?: "FormMitra"
             val body = data["body"] ?: msg.notification?.body ?: ""
-            Log.i(TAG, "push aaya: type=$type")
+            val runId = data["run_id"] ?: data["task_id"] ?: ""
+            val deepTab = (data["deep_tab"] ?: "/history").ifEmpty { "/history" }
+            Log.i(TAG, "push aaya: type=$type run=$runId")
             when (type) {
                 "wake", "task", "refresh" -> {
                     if (WorkingMode.isEnabled(applicationContext)) {
@@ -54,17 +59,102 @@ class FmMessagingService : FirebaseMessagingService() {
                         WakeWorker.enqueue(applicationContext)
                     } else {
                         Log.i(TAG, "Working Mode OFF — sirf status notification")
-                        showStatus(
+                        NotifCenter.notify(
+                            applicationContext, NotifCenter.Cat.STATUS,
                             title.ifEmpty { "FormMitra" },
-                            body.ifEmpty { "Server se update aaya — Working Mode OFF hai, automation start nahi hua." }
+                            body.ifEmpty {
+                                "Server se update aaya — Working Mode OFF hai, " +
+                                    "automation start nahi hua."
+                            },
+                            deepTab = "/profile"
                         )
                     }
                 }
-                "status" -> showStatus(title, body.ifEmpty { "Server se update aaya hai." })
+                // K1: agent ko user se detail chahiye (server-side trigger).
+                // Tap → History khulti hai + prompt entry (Pending tab me
+                // dikhegi jab tak detail na mile — K4 loop).
+                "detail" -> {
+                    // L5: remote prompt persist — deep link khulne par prompt
+                    // dialog/resume ke paas data ho (khaali History nahi).
+                    if (runId.isNotEmpty()) {
+                        try {
+                            PendingPromptStore.raiseRemote(
+                                applicationContext, runId, "detail",
+                                title.ifEmpty { "Ek detail chahiye ✋" },
+                                body.ifEmpty { "Tap karke detail do — agent aage badhega." }
+                            )
+                        } catch (_: Exception) { }
+                    }
+                    NotifCenter.notify(
+                        applicationContext, NotifCenter.Cat.DETAIL,
+                        title.ifEmpty { "Ek detail chahiye ✋" },
+                        body.ifEmpty { "Tap karke detail do — agent aage badhega." },
+                        deepTab = deepTab,
+                        deepRunId = runId,
+                        openPromptRunId = runId,
+                        key = runId.ifEmpty { "detail-$title" }
+                    )
+                }
+                // K1: approval chahiye (payment / sensitive action).
+                "approval" -> {
+                    // L5: remote prompt persist (detail jaisa).
+                    if (runId.isNotEmpty()) {
+                        try {
+                            PendingPromptStore.raiseRemote(
+                                applicationContext, runId, "approval",
+                                title.ifEmpty { "Approval chahiye 💰" },
+                                body.ifEmpty { "Tap karke approve karo." }
+                            )
+                        } catch (_: Exception) { }
+                    }
+                    NotifCenter.notify(
+                        applicationContext, NotifCenter.Cat.APPROVAL,
+                        title.ifEmpty { "Approval chahiye 💰" },
+                        body.ifEmpty { "Tap karke approve karo." },
+                        deepTab = deepTab,
+                        deepRunId = runId,
+                        openPromptRunId = runId,
+                        key = runId.ifEmpty { "approval-$title" }
+                    )
+                }
+                "task_done" -> NotifCenter.notify(
+                    applicationContext, NotifCenter.Cat.TASK,
+                    title.ifEmpty { "Ho gaya ✅" },
+                    body.ifEmpty { "Kaam poora ho gaya." },
+                    deepTab = deepTab,
+                    deepRunId = runId,
+                    key = runId.ifEmpty { "done-$title" }
+                )
+                "task_fail" -> NotifCenter.notify(
+                    applicationContext, NotifCenter.Cat.TASK,
+                    title.ifEmpty { "Dhyaan chahiye ⚠️" },
+                    body.ifEmpty { "Kaam me dikkat aayi — detail dekho." },
+                    deepTab = deepTab,
+                    deepRunId = runId,
+                    key = runId.ifEmpty { "fail-$title" }
+                )
+                "doc_ready" -> NotifCenter.notify(
+                    applicationContext, NotifCenter.Cat.DOC,
+                    title.ifEmpty { "📄 Document ready" },
+                    body.ifEmpty { "Document taiyaar hai — dekho." },
+                    deepTab = deepTab,
+                    deepRunId = runId,
+                    key = runId.ifEmpty { "doc-$title" }
+                )
+                "status" -> NotifCenter.notify(
+                    applicationContext, NotifCenter.Cat.STATUS,
+                    title.ifEmpty { "FormMitra" },
+                    body.ifEmpty { "Server se update aaya hai." },
+                    deepTab = deepTab,
+                    deepRunId = runId
+                )
                 else -> {
                     // Bina type ke notification-payload → seedha dikhao.
                     if (msg.notification != null || title.isNotEmpty()) {
-                        showStatus(title, body)
+                        NotifCenter.notify(
+                            applicationContext, NotifCenter.Cat.STATUS,
+                            title, body, deepTab = deepTab, deepRunId = runId
+                        )
                     } else {
                         Log.i(TAG, "unknown push type, ignore: $type")
                     }
@@ -75,44 +165,7 @@ class FmMessagingService : FirebaseMessagingService() {
         }
     }
 
-    private fun showStatus(title: String, body: String) {
-        try {
-            val ctx = applicationContext
-            val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            if (Build.VERSION.SDK_INT >= 26) {
-                nm.createNotificationChannel(
-                    NotificationChannel(
-                        CHANNEL_ID, "FormMitra Updates",
-                        NotificationManager.IMPORTANCE_DEFAULT
-                    )
-                )
-            }
-            val tap = PendingIntent.getActivity(
-                ctx, 4300,
-                Intent(ctx, MainActivity::class.java).apply {
-                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-                },
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            val nb = if (Build.VERSION.SDK_INT >= 26) {
-                Notification.Builder(ctx, CHANNEL_ID)
-            } else {
-                Notification.Builder(ctx)
-            }
-            nb.setContentTitle(title.take(60))
-                .setContentText(body.take(200))
-                .setSmallIcon(android.R.drawable.ic_dialog_info)
-                .setContentIntent(tap)
-                .setAutoCancel(true)
-            nm.notify(NOTIF_ID, nb.build())
-        } catch (t: Throwable) {
-            Log.e(TAG, "status notification failed (non-fatal)", t)
-        }
-    }
-
     companion object {
         private const val TAG = "FmPush"
-        private const val CHANNEL_ID = "formmitra_push"
-        private const val NOTIF_ID = 4301
     }
 }

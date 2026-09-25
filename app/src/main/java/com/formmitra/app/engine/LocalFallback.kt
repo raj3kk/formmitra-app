@@ -108,6 +108,12 @@ object LocalFallback {
         }
 
         val profile = fetchVaultProfile(ctx)
+        if (profile.isNotEmpty()) {
+            // L4: milestone announcement — details khud bhari ja rahi hain
+            com.formmitra.app.agent.FlowAnnouncer.say(
+                ctx, "Tumhari saved details se form bhara ja raha hai."
+            )
+        }
         if (profile.isEmpty()) {
             return FormEngine.RunResult(
                 "needs_user",

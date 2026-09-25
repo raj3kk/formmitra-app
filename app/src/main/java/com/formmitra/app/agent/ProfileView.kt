@@ -57,6 +57,7 @@ class ProfileView(
     private val vaultSection = LinearLayout(context)
     private val adminBtn: Button
     private val logoutBtn: Button
+    private lateinit var inboxBtn: Button
     private var cachedProfile = linkedMapOf<String, String>()
     private var owner = false
 
@@ -173,6 +174,82 @@ class ProfileView(
                 .apply { setMargins(0, dp(4), 0, 0) }
         )
 
+        // (b4) K5: Notification settings — kaunsi categories ON.
+        // OFF category ki notification bilkul nahi aati (na shade, na inbox).
+        content.addView(sectionTitle("🔔 Notifications"))
+        val notifCard = LinearLayout(context).apply {
+            orientation = VERTICAL
+            background = cardBg()
+            setPadding(pad, dp(10), pad, dp(10))
+        }
+        val notifSwitches = ArrayList<android.widget.Switch>()
+        for ((cat, label) in NotifSettings.categories()) {
+            val row = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                setPadding(0, dp(4), 0, dp(4))
+            }
+            row.addView(TextView(context).apply {
+                text = label
+                textSize = 14f
+                setTextColor(Color.parseColor("#202124"))
+                layoutParams = LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+            })
+            val sw = android.widget.Switch(context).apply {
+                isChecked = NotifSettings.isEnabled(context, cat)
+                setOnCheckedChangeListener { _, on ->
+                    NotifSettings.setEnabled(context, cat, on)
+                    toast(if (on) "✓ $label ON" else "$label OFF")
+                }
+            }
+            notifSwitches.add(sw)
+            row.addView(sw)
+            notifCard.addView(row)
+        }
+        // L4: agent ki awaaz (TTS) on/off — mute par bhi text announcements
+        // (notifications/inbox) hamesha dikhte hain.
+        run {
+            val row = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                setPadding(0, dp(4), 0, dp(4))
+            }
+            row.addView(TextView(context).apply {
+                text = "🔊 Agent ki awaaz (voice)"
+                textSize = 14f
+                setTextColor(Color.parseColor("#202124"))
+                layoutParams = LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+            })
+            val sw = android.widget.Switch(context).apply {
+                isChecked = VoiceOutput.isEnabled(context)
+                setOnCheckedChangeListener { _, on ->
+                    VoiceOutput.setEnabled(context, on)
+                    toast(if (on) "✓ Agent ki awaaz ON" else "Agent ki awaaz OFF — text rahega")
+                }
+            }
+            row.addView(sw)
+            notifCard.addView(row)
+        }
+        content.addView(
+            notifCard,
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
+                .apply { setMargins(0, dp(4), 0, 0) }
+        )
+        // (b5) K5: Notification inbox — purani notifications ka tray.
+        inboxBtn = Button(context).apply {
+            text = "📥 Notification Inbox"
+            textSize = 14f
+            setOnClickListener {
+                NotifInboxView.show(context) { refreshInboxBtn() }
+            }
+        }
+        UiKit.pressFeedback(inboxBtn)
+        content.addView(
+            inboxBtn,
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
+                .apply { setMargins(0, dp(8), 0, 0) }
+        )
+
         // (c) Document Vault
         vaultSection.orientation = VERTICAL
         vaultSection.addView(sectionTitle("📁 Document Vault"))
@@ -193,6 +270,72 @@ class ProfileView(
             setOnClickListener { pickDoc() }
         })
         content.addView(vaultSection)
+
+        // (c2) L1-UPGRADE: Saved logins — site credentials (device-encrypted).
+        // Yahan se dekh/saaf kar sakte ho. Delete par confirm (L3c).
+        val loginSection = LinearLayout(context).apply { orientation = VERTICAL }
+        loginSection.addView(sectionTitle("🔑 Saved Logins"))
+        loginSection.addView(TextView(context).apply {
+            text = "In sites par agent apne aap login karta hai. " +
+                "Credentials sirf is phone me encrypted hain."
+            textSize = 12f
+            setTextColor(Color.parseColor("#80868B"))
+            setPadding(0, 0, 0, dp(6))
+        })
+        val loginList = LinearLayout(context).apply { orientation = VERTICAL }
+        loginSection.addView(loginList)
+        fun refreshLogins() {
+            loginList.removeAllViews()
+            val domains = try { SiteCredentialStore.domains(context) }
+            catch (_: Exception) { emptyList() }
+            if (domains.isEmpty()) {
+                loginList.addView(TextView(context).apply {
+                    text = "Koi saved login nahi"
+                    textSize = 13f
+                    setTextColor(Color.parseColor("#80868B"))
+                })
+            }
+            for (d in domains) {
+                val row = LinearLayout(context).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = android.view.Gravity.CENTER_VERTICAL
+                    setPadding(0, dp(4), 0, dp(4))
+                }
+                row.addView(TextView(context).apply {
+                    text = "🌐 $d"
+                    textSize = 14f
+                    setTextColor(Color.parseColor("#202124"))
+                    layoutParams = LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+                })
+                row.addView(Button(context).apply {
+                    text = "🗑️"
+                    textSize = 13f
+                    setOnClickListener {
+                        val act = context as? Activity ?: return@setOnClickListener
+                        AlertDialog.Builder(act)
+                            .setTitle("Login hatao?")
+                            .setMessage("$d ka saved login hata diya jayega — " +
+                                "agli baar manually dena hoga.")
+                            .setPositiveButton("🗑️ Hatao") { dd, _ ->
+                                try { SiteCredentialStore.clear(context, d) }
+                                catch (_: Exception) { }
+                                toast("Login hata diya: $d")
+                                refreshLogins()
+                                dd.dismiss()
+                            }
+                            .setNegativeButton("Rehne do", null)
+                            .show()
+                    }
+                })
+                loginList.addView(row)
+            }
+        }
+        refreshLogins()
+        content.addView(
+            loginSection,
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
+                .apply { setMargins(0, dp(12), 0, 0) }
+        )
 
         // (d) Admin entry — owner ko hi dikhega
         adminBtn = Button(context).apply {
@@ -237,6 +380,18 @@ class ProfileView(
         loadDetails()
         refreshVault()
         checkOwnerHttp()
+        refreshInboxBtn()
+    }
+
+    /** Inbox button par unread count (badge jaisa). */
+    private fun refreshInboxBtn() {
+        try {
+            val n = NotifStore.unreadCount(context)
+            post {
+                inboxBtn.text =
+                    if (n > 0) "📥 Notification Inbox ($n nayi)" else "📥 Notification Inbox"
+            }
+        } catch (_: Exception) { }
     }
 
     /** Home ke "Document Vault" card se — seedha vault section par scroll. */
@@ -274,6 +429,15 @@ class ProfileView(
             post {
                 if (!saved.isNullOrEmpty()) {
                     toast("✓ Document save ho gaya")
+                    // K1: document ready — vault me doc jod diya (DOC channel).
+                    try {
+                        NotifCenter.notify(
+                            context, NotifCenter.Cat.DOC,
+                            "📄 Document vault me jod diya",
+                            "Agent tasks me ye document auto-available rahega.",
+                            deepTab = "/profile"
+                        )
+                    } catch (_: Exception) { }
                     // v20 Task 3: "Kaun sa document hai?" — type device-local
                     // save hota hai, server ko kabhi nahi jata (doc-privacy).
                     val act = context as? Activity
@@ -481,23 +645,45 @@ class ProfileView(
                         return@setOnClickListener
                     }
                     dlg.dismiss()
-                    toast("Save ho raha hai…")
-                    Thread({
-                        val ok = try {
-                            AgentApi.saveProfileForm(context, vals)
-                        } catch (_: Exception) { false }
-                        post {
-                            toast(
-                                if (ok) "✓ Poora profile save ho gaya"
-                                else "⚠️ Save me dikkat — baad me try karo"
-                            )
-                            if (ok) loadDetails()
-                        }
-                    }, "fm-fullformsave").start()
+                    saveFullProfileWithRetry(vals)
                 }
             }
             dlg.show()
         }
+    }
+
+    /**
+     * L2: profile save — fail ho to user ko pata chale + retry mile.
+     * Vals dialog me hi rehte hain, dobara bharna nahi padta.
+     */
+    private fun saveFullProfileWithRetry(vals: Map<String, String>) {
+        val act = context as? Activity ?: return
+        toast("Save ho raha hai…")
+        Thread({
+            val ok = try {
+                AgentApi.saveProfileForm(context, vals)
+            } catch (_: Exception) { false }
+            post {
+                if (ok) {
+                    toast("✓ Poora profile save ho gaya")
+                    loadDetails()
+                } else {
+                    AlertDialog.Builder(act)
+                        .setTitle("⚠️ Save nahi hua")
+                        .setMessage(
+                            "Internet ya server me dikkat hai. " +
+                                "Tumhari bhari hui details surakshit hain — " +
+                                "dobara try karo."
+                        )
+                        .setPositiveButton("🔁 Dobara try karo") { d, _ ->
+                            d.dismiss()
+                            saveFullProfileWithRetry(vals)
+                        }
+                        .setNegativeButton("Band karo", null)
+                        .show()
+                }
+            }
+        }, "fm-fullformsave").start()
     }
 
     private fun hintFor(key: String): String = when (key) {

@@ -442,6 +442,14 @@ class FormEngine(private val appContext: Context) {
         }
     }
 
+    /**
+     * Current page ka URL (L1-UPGRADE: login auto-fill ke liye domain
+     * nikaalne me kaam aata hai).
+     */
+    fun pageUrl(): String = try {
+        unwrapJsString(evalJsSync("location.href", 10_000))
+    } catch (_: Exception) { "" }
+
     private fun unwrapJsObject(raw: String): JSONObject {
         return try {
             JSONObject(unwrapJsString(raw))

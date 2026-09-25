@@ -52,7 +52,7 @@ object AgentResume {
                 .putString(K_CATEGORY, category)
                 .putInt(K_STEPS, 0)
                 .putString(K_SUMMARY, "")
-                .apply()
+                .commit() // L2: sync — kill/crash par bhi resume state pakki
         } catch (_: Exception) {
         }
     }
@@ -63,7 +63,7 @@ object AgentResume {
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .putInt(K_STEPS, stepsTaken)
                 .putString(K_SUMMARY, summary.take(300))
-                .apply()
+                .commit() // L2: sync — har step ki progress pakki save
         } catch (_: Exception) {
         }
     }
@@ -94,7 +94,7 @@ object AgentResume {
                 .remove(K_GOAL).remove(K_URL).remove(K_TASK_ID)
                 .remove(K_RUN_ID).remove(K_CATEGORY)
                 .remove(K_STEPS).remove(K_SUMMARY)
-                .apply()
+                .commit() // L2: sync — clear bhi pakka
         } catch (_: Exception) {
         }
     }

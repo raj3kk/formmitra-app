@@ -113,8 +113,15 @@ class WakeWorker(appContext: Context, params: WorkerParameters) :
                             .build()
                     )
                     .build()
-                WorkManager.getInstance(ctx.applicationContext).enqueue(req)
-                Log.i("WakeWorker", "enqueued")
+                // L5: unique one-time work — 10 rapid taps = 1 hi wake,
+                // wake storm nahi.
+                WorkManager.getInstance(ctx.applicationContext)
+                    .enqueueUniqueWork(
+                        "fm-wake",
+                        androidx.work.ExistingWorkPolicy.KEEP,
+                        req
+                    )
+                Log.i("WakeWorker", "enqueued (unique)")
             } catch (t: Throwable) {
                 Log.e("WakeWorker", "enqueue failed (non-fatal)", t)
             }

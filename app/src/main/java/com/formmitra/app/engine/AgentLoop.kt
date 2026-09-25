@@ -2,6 +2,12 @@ package com.formmitra.app.engine
 
 import android.content.Context
 import com.formmitra.app.agent.AgentApi
+import com.formmitra.app.agent.ChoiceMemory
+import com.formmitra.app.agent.DetailStore
+import com.formmitra.app.agent.DocumentAutoPick
+import com.formmitra.app.agent.FlowAnnouncer
+import com.formmitra.app.agent.NotifCenter
+import com.formmitra.app.agent.SiteCredentialStore
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.Callable
@@ -403,7 +409,20 @@ object AgentLoop {
                             val proofUrl = RunReporter.uploadProof(
                                 ctx, agentRunId ?: "", finalShot
                             )
-                            if (!proofUrl.isNullOrEmpty()) "\n📸 proof saved" else ""
+                            if (!proofUrl.isNullOrEmpty()) {
+                                // K1: document ready — proof taiyaar, tap par History.
+                                try {
+                                    NotifCenter.notify(
+                                        ctx, NotifCenter.Cat.DOC,
+                                        "📄 Document ready",
+                                        "$goal — submission proof save ho gaya.",
+                                        deepTab = "/history",
+                                        deepRunId = agentRunId ?: effectiveRunId,
+                                        key = "proof-${agentRunId ?: effectiveRunId}"
+                                    )
+                                } catch (_: Exception) { }
+                                "\n📸 proof saved"
+                            } else ""
                         } catch (_: Exception) {
                             ""
                         }
@@ -607,24 +626,57 @@ object AgentLoop {
     ): Boolean {
         val kind = (prompt["kind"] as? String)?.trim()?.ifEmpty { null } ?: "input"
         val req = buildPromptRequest(runId, kind, prompt)
-        notifyPrompt(ctx, "🤖 ${req.title}", req.message)
+        // NOTE: duplicate notification nahi — UserPrompt.ask par FmApp ka
+        // raised-listener NotifCenter se notify + PendingPrompt persist
+        // karta hai (K1/K4). Yahan sirf automation logic.
         if (kind == "payment") {
             return doPaymentFlow(ctx, engine, req, runId) == "verified"
         }
-        val ansStr = UserPrompt.ask(req) ?: return false
+        // ---- L1-UPGRADE: puchhne se PEHLE permanent automation ----
+        if (kind == "login") {
+            // Saved credentials ho to apne aap login — user se mat puchho
+            if (tryAutoLogin(ctx, engine, runId, sensitiveKeys, history)) return true
+        }
+        if (kind == "document") {
+            // Vault me sahi document ho to apne aap attach
+            if (tryAutoDocument(ctx, engine, req.docType, userProvided, history)) return true
+        }
+        if (kind == "choice") {
+            return handleChoicePrompt(ctx, engine, req, userProvided, history)
+        }
+        if (kind == "device_auth") {
+            // User-gated #2 (biometric/device PIN): sirf user de sakta hai.
+            // Maximum assistance: seedha dialog + TTS announcement.
+            FlowAnnouncer.say(
+                ctx,
+                "Ab aapko apne phone par fingerprint ya PIN dena hai — baaki sab taiyar hai."
+            )
+            val devStr = UserPrompt.ask(req) ?: return false
+            val devAns = try { JSONObject(devStr) } catch (_: Exception) { return false }
+            val ok = devAns.optBoolean("approved", false)
+            history.add(
+                JSONObject().put("action", "device_auth")
+                    .put("result", if (ok) "ok" else "cancelled")
+            )
+            return ok
+        }
+        // ---- L1-UPGRADE: input — DetailStore (device-local saved details)
+        // se jo pata ho wo seedha bharo; sirf jo NA mile uske liye puchho
+        // (dialog me pata values pre-filled dikhengi). ----
+        var askReq = req
+        if (kind == "input") {
+            if (tryAutoFillInput(ctx, engine, req, prompt, userProvided, sensitiveKeys, history)) {
+                return true
+            }
+            val prefill = collectKnownInputValues(ctx, req)
+            if (prefill.isNotEmpty()) askReq = req.copy(prefill = prefill)
+        }
+        val ansStr = UserPrompt.ask(askReq) ?: return false
         val ans = try { JSONObject(ansStr) } catch (_: Exception) { return false }
         if (!ans.optBoolean("approved", false)) return false
         when (kind) {
             "login" -> return handleLoginPrompt(ctx, engine, req, ans, sensitiveKeys, history)
             "document" -> return handleDocumentPrompt(ctx, engine, req, ans, userProvided, history)
-            "choice" -> {
-                val choice = ans.optString("choice", "")
-                if (choice.isNotEmpty()) userProvided.put("choice", choice)
-                history.add(
-                    JSONObject().put("action", "user_choice")
-                        .put("result", "ok").put("detail", choice.take(200))
-                )
-            }
             else -> { // otp | input
                 // field key -> type (sensitive = otp/password: KABHI server/AI
                 // ko mat bhejo, sirf page me locally bharo)
@@ -663,6 +715,14 @@ object AgentLoop {
                     } else {
                         userProvided.put(k, v)
                         filledAny = true
+                        // L1-UPGRADE: non-sensitive jawab DetailStore me yaad
+                        // rakho — agli baar puchhe bina apne aap bharega.
+                        // (OTP/password kabhi save nahi hote.)
+                        if (kind == "input") {
+                            try {
+                                DetailStore.saveAll(ctx, mapOf(k to v))
+                            } catch (_: Exception) { }
+                        }
                     }
                 }
                 // Non-sensitive value + fill_selector (purana behavior):
@@ -721,16 +781,183 @@ object AgentLoop {
      * NAHI — sirf page me locally bharo, phir submit dabane ki koshish karo.
      * true = kuch bhara (loop continue kare).
      */
-    private fun handleLoginPrompt(
+    /**
+     * L1-UPGRADE: saved site credentials se apne aap login.
+     * true = credentials mile aur page me bhar diye (user se nahi puchha).
+     * false = saved nahi hain → caller user se puchega.
+     */
+    private fun tryAutoLogin(
         ctx: Context,
         engine: FormEngine,
-        req: UserPrompt.Request,
-        ans: JSONObject,
+        runId: String,
         sensitiveKeys: MutableSet<String>,
         history: ArrayList<JSONObject>
     ): Boolean {
-        val username = ans.optString("username", "").trim()
-        val password = ans.optString("password", "")
+        val domain = try {
+            SiteCredentialStore.domainOf(engine.pageUrl())
+        } catch (_: Exception) { "" }
+        if (domain.isEmpty()) return false
+        val creds = try {
+            SiteCredentialStore.get(ctx, domain)
+        } catch (_: Exception) { null } ?: return false
+        val ok = fillLoginFields(engine, creds.first, creds.second, sensitiveKeys, history)
+        if (ok) {
+            history.add(
+                JSONObject().put("action", "fill_login_auto")
+                    .put("result", "ok")
+                    .put("detail", "saved credentials se auto-login (domain=$domain, value hidden)")
+            )
+            FlowAnnouncer.say(ctx, "Login apne aap ho raha hai — $domain")
+        }
+        return ok
+    }
+
+    /**
+     * L1-UPGRADE: vault document apne aap attach.
+     * true = unambiguous doc mila aur set/upload ho gaya.
+     */
+    private fun tryAutoDocument(
+        ctx: Context,
+        engine: FormEngine,
+        docTypeHint: String,
+        userProvided: JSONObject,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        val pick = try {
+            DocumentAutoPick.pick(ctx, docTypeHint)
+        } catch (_: Exception) { null } ?: return false
+        val ok = applyDocument(engine, pick, userProvided, history)
+        if (ok) {
+            history.add(
+                JSONObject().put("action", "document_auto")
+                    .put("result", "ok")
+                    .put("detail", "vault se apne aap chuna (name hidden, local-only)")
+            )
+            FlowAnnouncer.say(ctx, "Document apne aap attach ho raha hai.")
+        }
+        return ok
+    }
+
+    /**
+     * L1-UPGRADE: input prompt auto-resolve — DetailStore me saved details
+     * se jo fields mil jayein unhe page me seedha bharo (mat puchho).
+     * Sab fields mile + fill_selector ho → true (koi prompt nahi).
+     * Partial/unknown → false (caller prefill ke saath puchega).
+     */
+    private fun collectKnownInputValues(
+        ctx: Context, req: UserPrompt.Request
+    ): Map<String, String> {
+        val fields = req.fields.ifEmpty {
+            listOf(UserPrompt.Field("value", "Likho", "text"))
+        }
+        val known = LinkedHashMap<String, String>()
+        for (f in fields) {
+            val v = try { DetailStore.findValue(ctx, f.key) } catch (_: Exception) { "" }
+            val v2 = if (v.isNotEmpty()) v else try {
+                DetailStore.findValue(ctx, f.label)
+            } catch (_: Exception) { "" }
+            if (v2.isNotEmpty()) known[f.key] = v2
+        }
+        return known
+    }
+
+    private fun tryAutoFillInput(
+        ctx: Context,
+        engine: FormEngine,
+        req: UserPrompt.Request,
+        prompt: Map<String, Any?>,
+        userProvided: JSONObject,
+        sensitiveKeys: MutableSet<String>,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        val fields = req.fields.ifEmpty {
+            listOf(UserPrompt.Field("value", "Likho", "text"))
+        }
+        val known = collectKnownInputValues(ctx, req)
+        if (known.size != fields.size || known.isEmpty()) return false
+        @Suppress("UNCHECKED_CAST")
+        val sel = prompt["fill_selector"] as? Map<String, Any?>
+        val mode = sel?.get("mode") as? String ?: ""
+        val selVal = sel?.get("value") as? String ?: ""
+        if (mode.isEmpty() || selVal.isEmpty()) return false
+        var okAll = true
+        for ((k, v) in known) {
+            val t = fields.firstOrNull { it.key == k }?.type ?: "text"
+            val ok = try {
+                val detail = engine.runAgentStep(
+                    JSONObject().put("type", "fill")
+                        .put(
+                            "selector",
+                            JSONObject().put("mode", mode).put("value", selVal)
+                        )
+                        .put("text", v)
+                )
+                detail.optBoolean("verified", true)
+            } catch (_: Exception) { false }
+            if (isSensitiveField(k, t)) sensitiveKeys.add(k)
+            else try { userProvided.put(k, v) } catch (_: Exception) { }
+            okAll = okAll && ok
+        }
+        if (okAll) {
+            history.add(
+                JSONObject().put("action", "fill_input_auto").put("result", "ok")
+                    .put("detail", "DetailStore se apne aap bhara (values hidden)")
+            )
+            FlowAnnouncer.say(ctx, "Details apne aap bhar di hain.")
+            return true
+        }
+        return false
+    }
+
+    /**
+     * L1-UPGRADE: choice prompt — pehle yaad kiya hua option apne aap.
+     * Yaad na ho to user se puchho aur jawab yaad rakho (agli baar auto).
+     */
+    private fun handleChoicePrompt(
+        ctx: Context,
+        engine: FormEngine,
+        req: UserPrompt.Request,
+        userProvided: JSONObject,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        val domain = try {
+            SiteCredentialStore.domainOf(engine.pageUrl())
+        } catch (_: Exception) { "" }
+        val scope = ChoiceMemory.scope(domain, req.title)
+        val remembered = try { ChoiceMemory.get(ctx, scope) } catch (_: Exception) { null }
+        if (!remembered.isNullOrEmpty() && req.options.contains(remembered)) {
+            userProvided.put("choice", remembered)
+            history.add(
+                JSONObject().put("action", "user_choice")
+                    .put("result", "ok (auto, remembered)")
+                    .put("detail", remembered.take(200))
+            )
+            FlowAnnouncer.say(ctx, "Pichli baar wala option apne aap chun liya: $remembered")
+            return true
+        }
+        val ansStr = UserPrompt.ask(req) ?: return false
+        val ans = try { JSONObject(ansStr) } catch (_: Exception) { return false }
+        if (!ans.optBoolean("approved", false)) return false
+        val choice = ans.optString("choice", "")
+        if (choice.isNotEmpty()) {
+            userProvided.put("choice", choice)
+            try { ChoiceMemory.save(ctx, scope, choice) } catch (_: Exception) { }
+        }
+        history.add(
+            JSONObject().put("action", "user_choice")
+                .put("result", "ok").put("detail", choice.take(200))
+        )
+        return true
+    }
+
+    /** Login fields bharo + submit dabao (auto aur manual dono yahi use karte hain). */
+    private fun fillLoginFields(
+        engine: FormEngine,
+        username: String,
+        password: String,
+        sensitiveKeys: MutableSet<String>,
+        history: ArrayList<JSONObject>
+    ): Boolean {
         if (username.isEmpty() || password.isEmpty()) return false
         sensitiveKeys.add("username")
         sensitiveKeys.add("password")
@@ -763,7 +990,6 @@ object AgentLoop {
                 if (d.optBoolean("verified", true)) filledAny = true
             } catch (_: Exception) { }
         }
-        // Submit/login button dabane ki koshish (user ne "Login bhardo" dabakar approve kiya)
         var submitted = false
         if (filledAny) {
             submitted = tryTapSubmit(engine)
@@ -776,6 +1002,34 @@ object AgentLoop {
         return filledAny
     }
 
+    private fun handleLoginPrompt(
+        ctx: Context,
+        engine: FormEngine,
+        req: UserPrompt.Request,
+        ans: JSONObject,
+        sensitiveKeys: MutableSet<String>,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        val username = ans.optString("username", "").trim()
+        val password = ans.optString("password", "")
+        val ok = fillLoginFields(engine, username, password, sensitiveKeys, history)
+        // L1-UPGRADE: user ne "save karo" tick kiya → agli baar apne aap login
+        if (ok && ans.optBoolean("save_login", false)) {
+            try {
+                val domain = SiteCredentialStore.domainOf(engine.pageUrl())
+                if (domain.isNotEmpty()) {
+                    SiteCredentialStore.save(ctx, domain, username, password)
+                    history.add(
+                        JSONObject().put("action", "login_saved")
+                            .put("result", "ok")
+                            .put("detail", "credentials encrypted save (domain=$domain)")
+                    )
+                }
+            } catch (_: Exception) { }
+        }
+        return ok
+    }
+
     /**
      * Document prompt: ans = {doc: "<vault filename>"}. Filename SIRF device
      * par rehta hai (engine.selectedDoc) — server/AI ko kabhi nahi jata.
@@ -783,15 +1037,13 @@ object AgentLoop {
      * ko pata chale document ready hai; upload ke liye brain {"type":"upload"}
      * bheje (bina naam) aur engine locally-selected file use karega.
      */
-    private fun handleDocumentPrompt(
-        ctx: Context,
+    /** Document set + turant upload (auto aur manual dono yahi use karte hain). */
+    private fun applyDocument(
         engine: FormEngine,
-        req: UserPrompt.Request,
-        ans: JSONObject,
+        doc: String,
         userProvided: JSONObject,
         history: ArrayList<JSONObject>
     ): Boolean {
-        val doc = ans.optString("doc", "").trim()
         if (doc.isEmpty()) return false
         val file = engine.docFile(doc)
         if (file == null) {
@@ -825,6 +1077,18 @@ object AgentLoop {
                 )
         )
         return true
+    }
+
+    private fun handleDocumentPrompt(
+        ctx: Context,
+        engine: FormEngine,
+        req: UserPrompt.Request,
+        ans: JSONObject,
+        userProvided: JSONObject,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        val doc = ans.optString("doc", "").trim()
+        return applyDocument(engine, doc, userProvided, history)
     }
 
     /** Page par login field dhoondho: which = "username" | "password". */
@@ -915,6 +1179,8 @@ object AgentLoop {
         // (filename local-only: engine.selectedDoc se check)
         val existingAvailable = userProvided.optBoolean("document_available", false)
         if (existingAvailable && engine.selectedDocFile() != null) return true
+        // L1-UPGRADE: vault me unambiguous doc ho to apne aap attach — puchho mat
+        if (tryAutoDocument(ctx, engine, "", userProvided, history)) return true
         val req = UserPrompt.Request(
             runId = runId,
             kind = "document",
@@ -922,14 +1188,13 @@ object AgentLoop {
             message = "Is form me document upload karna hai. Vault se chuno ya naya upload karo.",
             timeoutSec = 600L
         )
-        notifyPrompt(ctx, "📎 Document chahiye", req.message)
         val ansStr = UserPrompt.ask(req) ?: return false
         val ans = try { JSONObject(ansStr) } catch (_: Exception) { return false }
         if (!ans.optBoolean("approved", false)) return false
         return handleDocumentPrompt(ctx, engine, req, ans, userProvided, history)
     }
 
-    /** Login form par atke → user se credentials maango (local-only), same run continue. */
+    /** Login form par atke → saved credentials se apne aap, nahi to user se maango. */
     private fun askLoginProactively(
         ctx: Context,
         engine: FormEngine,
@@ -937,18 +1202,20 @@ object AgentLoop {
         sensitiveKeys: MutableSet<String>,
         history: ArrayList<JSONObject>
     ): Boolean {
+        // L1-UPGRADE: saved ho to apne aap login — dialog mat dikhao
+        if (tryAutoLogin(ctx, engine, runId, sensitiveKeys, history)) return true
         val req = UserPrompt.Request(
             runId = runId,
             kind = "login",
             title = "Login chahiye",
-            message = "Ye page login maang raha hai. Username-password do — sirf is page me bhare jayenge, kahin save nahi honge.",
+            message = "Ye page login maang raha hai. Pehli baar details do — " +
+                "\"save karo\" tick karoge to agli baar apne aap login hoga.",
             fields = listOf(
                 UserPrompt.Field("username", "Username / Email", "text"),
                 UserPrompt.Field("password", "Password", "password")
             ),
             timeoutSec = 600L
         )
-        notifyPrompt(ctx, "🔑 Login chahiye", req.message)
         val ansStr = UserPrompt.ask(req) ?: return false
         val ans = try { JSONObject(ansStr) } catch (_: Exception) { return false }
         if (!ans.optBoolean("approved", false)) return false
@@ -1074,7 +1341,6 @@ object AgentLoop {
             payment = UserPrompt.Payment(amount, merchant, ""),
             timeoutSec = 600
         )
-        notifyPrompt(ctx, "💰 Payment approval", "₹$amount — $merchant")
         return doPaymentFlow(ctx, engine, req, runId)
     }
 
@@ -1194,6 +1460,13 @@ object AgentLoop {
                 UserPrompt.Field("password", "Password", "password")
             )
         }
+        // otp kind: default field key "otp" ho taaki loop ishe hamesha
+        // sensitive maane (sirf page me locally bhare, server/AI ko kabhi na bheje)
+        if (kind == "otp" && fields.isEmpty()) {
+            fields = listOf(
+                UserPrompt.Field("otp", "OTP", "otp")
+            )
+        }
         val options = ((prompt["options"] as? List<*>) ?: emptyList<Any>())
             .mapNotNull { (it as? String)?.ifEmpty { null } }
         @Suppress("UNCHECKED_CAST")
@@ -1218,39 +1491,6 @@ object AgentLoop {
             timeoutSec = (prompt["timeout_s"] as? Number)?.toLong() ?: 600L
         )
     }
-
-    /** Prompt aaye to notification bhi (user kisi bhi tab/app me ho). */
-    private fun notifyPrompt(ctx: Context, title: String, msg: String) {
-        try {
-            val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE)
-                as android.app.NotificationManager
-            val chId = "fm_prompts"
-            if (android.os.Build.VERSION.SDK_INT >= 26) {
-                nm.createNotificationChannel(
-                    android.app.NotificationChannel(
-                        chId, "Agent sawal",
-                        android.app.NotificationManager.IMPORTANCE_HIGH
-                    )
-                )
-            }
-            val intent = android.content.Intent(
-                ctx, com.formmitra.app.MainActivity::class.java
-            ).putExtra("open_tab", "/agent")
-            val pi = android.app.PendingIntent.getActivity(
-                ctx, 99, intent,
-                android.app.PendingIntent.FLAG_UPDATE_CURRENT or
-                    android.app.PendingIntent.FLAG_IMMUTABLE
-            )
-            val nb = android.app.Notification.Builder(ctx, chId)
-                .setContentTitle(title)
-                .setContentText(msg.take(120))
-                .setSmallIcon(android.R.drawable.ic_dialog_info)
-                .setContentIntent(pi)
-                .setAutoCancel(true)
-            nm.notify(9011, nb.build())
-        } catch (_: Exception) { }
-    }
-
     /**
      * CAPTCHA safety net + AUTO-SOLVE (user-authorized: "tum solve kro har ek baar").
      *

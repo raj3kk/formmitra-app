@@ -81,6 +81,18 @@ object CryptoVault {
             .apply()
     }
 
+    /**
+     * Synchronous secret save (commit) — L2: app band/crash ho to bhi
+     * pakka save. Critical saves (site credentials, vault) yahi use karo.
+     */
+    fun putSecureSync(ctx: Context, key: String, value: String) {
+        val blob = encryptBytes(value.toByteArray(Charsets.UTF_8))
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString(key, Base64.encodeToString(blob, Base64.NO_WRAP))
+            .commit()
+    }
+
     /** Secret padho. Missing/corrupt → null (kabhi throw nahi). */
     fun getSecure(ctx: Context, key: String): String? {
         val b64 = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

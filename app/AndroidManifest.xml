@@ -7,6 +7,10 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- L1-UPGRADE (OTP maximum assistance): SMS User Consent API —
+         koi SMS permission NAHI chahiye. OTP dialog khulne par Play
+         Services SMS sunta hai; user ek tap me message padhne ki
+         permission deta hai, OTP field me auto-bharta hai. -->
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
     <application
         android:name=".FmApp"

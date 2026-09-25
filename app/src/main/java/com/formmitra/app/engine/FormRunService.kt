@@ -9,10 +9,16 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.workDataOf
 import com.formmitra.app.MainActivity
 import com.formmitra.app.agent.CategoryStore
+import com.formmitra.app.agent.FlowAnnouncer
+import com.formmitra.app.agent.NotifCenter
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.TimeUnit
 
 /**
  * FormRunService — foreground service jo ek claimed form-task ko
@@ -48,6 +54,21 @@ class FormRunService : Service() {
         @Volatile
         var activeTaskId: String? = null
             private set
+        private val activeLock = Any()
+
+        /**
+         * L5: atomic run claim — do startWithTask ek saath aaye to sirf
+         * pehla claim jeetega, doosra handoff ignore hoga (overwrite nahi).
+         */
+        private fun tryClaim(taskId: String): Boolean = synchronized(activeLock) {
+            if (activeTaskId != null) return false
+            activeTaskId = taskId
+            true
+        }
+
+        private fun releaseClaim(taskId: String) = synchronized(activeLock) {
+            if (activeTaskId == taskId) activeTaskId = null
+        }
 
         fun startWithTask(ctx: Context, task: JSONObject) {
             val intent = Intent(ctx, FormRunService::class.java).apply {
@@ -75,15 +96,29 @@ class FormRunService : Service() {
         ensureChannel()
         startForeground(NOTIF_ID, buildNotif("Form bhar raha hai: $name", "Kaam chal raha hai…"))
         notifySimple(NOTIF_ID + 10, "Form bharna shuru: $name", "FormMitra automation kaam kar raha hai")
+        // L4: flow milestone — TTS + notification
+        try {
+            FlowAnnouncer.say(this, "Form bharna shuru ho gaya: $name")
+        } catch (_: Exception) { }
 
-        // Duplicate-run guard: doosra handoff aaye to ye run pehle se active hai.
+        // Duplicate-run guard (atomic): pehle se koi run active ho to
+        // ye handoff ignore — overwrite/double-run nahi.
         val claimId = task.optString("run_id").ifEmpty { task.optString("id") }
-        activeTaskId = claimId
+        if (!tryClaim(claimId)) {
+            try {
+                android.util.Log.i(
+                    "FormRunService",
+                    "duplicate handoff ignored (active=$activeTaskId)"
+                )
+            } catch (_: Exception) { }
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         runThread = Thread({
             try {
                 runTask(task, name)
             } finally {
-                if (activeTaskId == claimId) activeTaskId = null
+                releaseClaim(claimId)
             }
             stopSelf(startId)
         }, "formmitra-run").also { it.start() }
@@ -188,29 +223,87 @@ class FormRunService : Service() {
             } catch (_: Exception) { }
         }
 
-        // User notification (Hinglish)
+        // User notification (Hinglish) — K1: NotifCenter se (channel +
+        // Profile on/off + inbox + badge). Tap → History + run detail.
+        // L3a: technical summary kabhi user ko mat dikhao — UserText.friendly.
+        val runKey = runId.ifEmpty { name }
         when (result.status) {
-            "done" -> notifySimple(
-                DONE_NOTIF_ID, "Ho gaya ✅ $name",
-                "Form successfully bhar diya gaya."
+            "done" -> {
+                notifyEvent(
+                    NotifCenter.Cat.TASK, "Ho gaya ✅ $name",
+                    "Form successfully bhar diya gaya.", runId, runKey
+                )
+                try {
+                    FlowAnnouncer.say(this, "Kaam ho gaya: $name")
+                } catch (_: Exception) { }
+            }
+            "vetoed" -> notifyEvent(
+                NotifCenter.Cat.TASK, "Dhyaan chahiye: $name",
+                "Payment page mila — safety ke liye rok diya.", runId, runKey
             )
-            "vetoed" -> notifySimple(
-                DONE_NOTIF_ID, "Dhyaan chahiye: $name",
-                "Payment page mila — safety ke liye rok diya."
+            "needs_admin" -> notifyEvent(
+                NotifCenter.Cat.TASK, "Dhyaan chahiye: $name",
+                "Captcha aaya hai — aapko dekhna hoga.", runId, runKey
             )
-            "needs_admin" -> notifySimple(
-                DONE_NOTIF_ID, "Dhyaan chahiye: $name",
-                "Captcha aaya hai — aapko dekhna hoga."
+            "needs_user" -> notifyEvent(
+                NotifCenter.Cat.DETAIL, "Ek detail chahiye ✋ $name",
+                UserText.friendly(result.summary.take(120))
+                    .ifEmpty { "Agent ko aapse ek detail chahiye — tap karke do." },
+                runId, runKey
             )
-            "needs_user" -> notifySimple(
-                DONE_NOTIF_ID, "Dhyaan chahiye: $name",
-                result.summary.take(120)
-            )
-            else -> notifySimple(
-                DONE_NOTIF_ID, "Dhyaan chahiye: $name",
-                result.summary.take(120)
-            )
+            else -> {
+                notifyEvent(
+                    NotifCenter.Cat.TASK, "Dhyaan chahiye: $name",
+                    UserText.friendly(result.summary.take(200)), runId, runKey
+                )
+                try {
+                    FlowAnnouncer.say(this, "Kaam me dikkat aayi: $name")
+                } catch (_: Exception) { }
+                // L1-UPGRADE: retry with refill — fail hua to EK baar bounded
+                // auto-retry (15 min baad), saved details se refill hokar.
+                // Vetoed/needs_user par kabhi nahi (wahan user ka action chahiye).
+                scheduleOneRetry(task, name, result.status)
+            }
         }
+    }
+
+    /**
+     * L1-UPGRADE: "failed" par ek bounded auto-retry. DetailStore me saved
+     * details se refill hokar wahi task dobara chalega (AgentResume ka
+     * pending state bana rehta hai → same step se resume).
+     * - Sirf status "failed" par (vetoed/needs_user/needs_admin/done nahi).
+     * - Sirf ek baar (task JSON me fm_retry flag).
+     * - Standalone tasks par nahi (server claim flow ka hissa nahi).
+     */
+    private fun scheduleOneRetry(task: JSONObject, name: String, status: String) {
+        try {
+            if (status != "failed") return
+            if (task.optBoolean("standalone", false)) return
+            if (task.optInt("fm_retry", 0) >= 1) return
+            val runId = task.optString("run_id", "")
+            if (runId.isEmpty()) return
+            val retryTask = JSONObject(task.toString()).put("fm_retry", 1)
+            val req = OneTimeWorkRequestBuilder<RetryWorker>()
+                .setInitialDelay(15, TimeUnit.MINUTES)
+                .setInputData(
+                    workDataOf(
+                        "task_json" to retryTask.toString(),
+                        "name" to name
+                    )
+                )
+                .addTag("fm_retry_$runId")
+                .build()
+            WorkManager.getInstance(this).enqueue(req)
+            try {
+                NotifCenter.notify(
+                    this, NotifCenter.Cat.STATUS,
+                    "Ek baar phir try karega 🔁",
+                    "$name — 15 minute me saved details se apne aap dobara chalega.",
+                    deepTab = "/history", deepRunId = runId,
+                    key = "retry_$runId"
+                )
+            } catch (_: Exception) { }
+        } catch (_: Exception) { }
     }
 
     // ---------------- notifications ----------------
@@ -261,18 +354,35 @@ class FormRunService : Service() {
     }
 
     private fun notifySimple(id: Int, title: String, text: String) {
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val nb = if (Build.VERSION.SDK_INT >= 26) {
-            Notification.Builder(this, CHANNEL_ID)
-        } else {
-            Notification.Builder(this)
-        }
-        nb.setContentTitle(title)
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentIntent(tapIntent())
-            .setAutoCancel(true)
-        nm.notify(id, nb.build())
+        // K1: start notice bhi NotifCenter se — channel + inbox + deep link.
+        // (id param ab NotifCenter ke stable id me map hota hai.)
+        try {
+            NotifCenter.notify(
+                this, NotifCenter.Cat.TASK, title, text,
+                deepTab = "/history", key = "start-$title"
+            )
+        } catch (_: Exception) { }
+    }
+
+    /**
+     * K1: terminal event notification — tap seedha History + is run ki
+     * detail par le jata hai (deep link).
+     */
+    private fun notifyEvent(
+        cat: NotifCenter.Cat,
+        title: String,
+        text: String,
+        runId: String,
+        key: String
+    ) {
+        try {
+            NotifCenter.notify(
+                this, cat, title, text,
+                deepTab = "/history",
+                deepRunId = runId,
+                key = key
+            )
+        } catch (_: Exception) { }
     }
 
     override fun onDestroy() {

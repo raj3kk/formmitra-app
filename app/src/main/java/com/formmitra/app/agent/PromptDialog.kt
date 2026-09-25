@@ -20,6 +20,7 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -72,6 +73,7 @@ object PromptDialog {
                     "choice" -> showChoice(activity, req)
                     "document" -> showDocument(activity, req)
                     "login" -> showLogin(activity, req)
+                    "device_auth" -> showDeviceAuth(activity, req)
                     else -> showFields(activity, req) // otp | input
                 }
                 // Sawal bol ke bhi puchho (voice) — secret values kabhi nahi
@@ -190,7 +192,8 @@ object PromptDialog {
             setPadding(48, 32, 48, 16)
         }
         layout.addView(TextView(activity).apply {
-            text = req.message + "\n\n🔒 Ye details sirf is page me bhari jayengi — kahin save ya bheji nahi jayengi."
+            text = req.message + "\n\n🔒 Ye details sirf is page me bhari jayengi — " +
+                "server/AI ko kabhi nahi bheji jayengi."
             textSize = 15f
             setPadding(0, 0, 0, 16)
         })
@@ -210,6 +213,15 @@ object PromptDialog {
             text = "Password"; textSize = 14f; setPadding(0, 16, 0, 0)
         })
         layout.addView(passEt)
+        // L1-UPGRADE: save tick → agli baar is site par apne aap login
+        // (sirf is phone me encrypted — server/AI ko kabhi nahi jata)
+        val saveCb = CheckBox(activity).apply {
+            text = "🔒 Is phone me save karo — agli baar apne aap login hoga"
+            textSize = 14f
+            isChecked = true
+            setPadding(0, 20, 0, 0)
+        }
+        layout.addView(saveCb)
         val dlg = AlertDialog.Builder(activity)
             .setTitle("🔑 ${req.title}")
             .setView(ScrollView(activity).apply { addView(layout) })
@@ -227,7 +239,13 @@ object PromptDialog {
                 }
                 // Values yahin rehti hain — answer me loop ko milti hain,
                 // loop unhe sirf page me bharta hai (server/AI ko kabhi nahi).
-                answer(activity, req, mapOf("approved" to true, "username" to u, "password" to p))
+                answer(
+                    activity, req,
+                    mapOf(
+                        "approved" to true, "username" to u, "password" to p,
+                        "save_login" to saveCb.isChecked
+                    )
+                )
                 userEt.setText("")
                 passEt.setText("")
                 dlg.dismiss()
@@ -241,6 +259,141 @@ object PromptDialog {
             }
         }
         dlg.show()
+    }
+
+    /**
+     * device_auth — user-gated #2 (biometric / device PIN): sirf user de
+     * sakta hai. Maximum assistance:
+     *  1. Pehle REAL system BiometricPrompt (framework API 29+) — user ek
+     *     tap me fingerprint/face ya device PIN se authenticate kare.
+     *  2. Device me biometric/PIN na ho ya fail ho → saaf manual dialog.
+     * TTS announcement dono raaston me.
+     */
+    private fun showDeviceAuth(activity: Activity, req: UserPrompt.Request) {
+        if (trySystemBiometric(activity, req)) return
+        showManualDeviceAuth(activity, req)
+    }
+
+    /** Real system biometric prompt. @return true agar system prompt khul gaya. */
+    @Suppress("DEPRECATION")
+    private fun trySystemBiometric(activity: Activity, req: UserPrompt.Request): Boolean {
+        if (android.os.Build.VERSION.SDK_INT < 29) return false
+        return try {
+            val mgr = activity.getSystemService(
+                android.hardware.biometrics.BiometricManager::class.java
+            ) ?: return false
+            val can = if (android.os.Build.VERSION.SDK_INT >= 30) {
+                mgr.canAuthenticate(
+                    android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_WEAK or
+                        android.hardware.biometrics.BiometricManager.Authenticators.DEVICE_CREDENTIAL
+                )
+            } else {
+                mgr.canAuthenticate()
+            }
+            if (can != android.hardware.biometrics.BiometricManager.BIOMETRIC_SUCCESS) {
+                return false
+            }
+            val prompt = android.hardware.biometrics.BiometricPrompt.Builder(activity)
+                .setTitle(req.title.ifEmpty { "Pehchan verify karo" })
+                .setSubtitle("Agent ka kaam aage badhane ke liye")
+                .setDescription(
+                    req.message.ifEmpty {
+                        "Apne phone par fingerprint, face ya PIN se confirm karo."
+                    }
+                )
+                .apply {
+                    if (android.os.Build.VERSION.SDK_INT >= 30) {
+                        setAllowedAuthenticators(
+                            android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_WEAK or
+                                android.hardware.biometrics.BiometricManager.Authenticators.DEVICE_CREDENTIAL
+                        )
+                    } else {
+                        setDeviceCredentialAllowed(true)
+                    }
+                }
+                .build()
+            val cbs = object : android.hardware.biometrics.BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(
+                    result: android.hardware.biometrics.BiometricPrompt.AuthenticationResult?
+                ) {
+                    VoiceOutput.speak(activity, "Verify ho gaya — kaam aage badh raha hai.")
+                    answer(activity, req, mapOf("approved" to true))
+                }
+
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence?) {
+                    // User ne cancel kiya ya lockout — prompt khatam
+                    UserPrompt.cancel(req.runId)
+                    showingFor = ""
+                    VoiceOutput.stop()
+                }
+
+                override fun onAuthenticationFailed() {
+                    // Galat fingerprint — system khud retry deta hai, kuch nahi
+                }
+            }
+            prompt.authenticate(
+                android.os.CancellationSignal(), activity.mainExecutor, cbs
+            )
+            VoiceOutput.speak(
+                activity,
+                "Ab aapko apne phone par fingerprint ya PIN dena hai. Baaki sab taiyar hai."
+            )
+            showingFor = req.runId
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** Manual fallback — system biometric available na ho tab. */
+    private fun showManualDeviceAuth(activity: Activity, req: UserPrompt.Request) {
+        val layout = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 32, 48, 16)
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        layout.addView(TextView(activity).apply {
+            text = "🔐"
+            textSize = 44f
+            gravity = Gravity.CENTER
+        })
+        layout.addView(TextView(activity).apply {
+            text = req.message.ifEmpty {
+                "Ab aapko apne phone par fingerprint ya PIN dena hai — baaki sab taiyar hai."
+            }
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setPadding(0, 16, 0, 8)
+        })
+        var dlg: AlertDialog? = null
+        val doneBtn = Button(activity).apply {
+            text = "✅ Ho gaya"
+            textSize = 16f
+            setOnClickListener {
+                answer(activity, req, mapOf("approved" to true))
+                dlg?.dismiss()
+            }
+        }
+        val cancelBtn = Button(activity).apply {
+            text = "❌ Cancel"
+            setOnClickListener {
+                UserPrompt.cancel(req.runId)
+                showingFor = ""
+                dlg?.dismiss()
+            }
+        }
+        layout.addView(doneBtn)
+        layout.addView(cancelBtn)
+        dlg = AlertDialog.Builder(activity)
+            .setTitle("🔐 ${req.title}")
+            .setView(layout)
+            .setCancelable(false)
+            .create()
+        dlg.show()
+        VoiceOutput.speak(
+            activity,
+            "Ab aapko apne phone par fingerprint ya PIN dena hai. Baaki sab taiyar hai."
+        )
     }
 
     // ---------- fields (otp / input) ----------
@@ -257,7 +410,10 @@ object PromptDialog {
         })
         val edits = mutableMapOf<String, EditText>()
         val fields = req.fields.ifEmpty {
-            listOf(UserPrompt.Field("value", "Likho", if (req.kind == "otp") "otp" else "text"))
+            // otp kind: key "otp" rakho taaki loop ishe hamesha sensitive
+            // maane (sirf page me locally bhare, server/AI ko kabhi na bheje)
+            if (req.kind == "otp") listOf(UserPrompt.Field("otp", "OTP", "otp"))
+            else listOf(UserPrompt.Field("value", "Likho", "text"))
         }
         for (f in fields) {
             layout.addView(TextView(activity).apply {
@@ -273,6 +429,8 @@ object PromptDialog {
             val et = EditText(activity).apply {
                 hint = f.label
                 textSize = 16f
+                // L1-UPGRADE: pata values pre-filled — sirf khaali bharega user
+                req.prefill[f.key]?.let { if (it.isNotEmpty()) setText(it) }
                 layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
                 inputType = when (f.type) {
                     "otp", "number", "phone" -> InputType.TYPE_CLASS_NUMBER
@@ -292,6 +450,40 @@ object PromptDialog {
             layout.addView(row)
             edits[f.key] = et
         }
+        // L1-UPGRADE (OTP maximum assistance): SMS User Consent — koi
+        // permission nahi. Dialog khulne par listener start; OTP SMS aate
+        // hi consent dialog auto-launch (ek tap), OTP field me auto-bharo.
+        val isOtpPrompt = req.kind == "otp" ||
+            fields.any { it.type == "otp" || it.key.lowercase().contains("otp") }
+        var smsBtn: Button? = null
+        var otpEdit: EditText? = null
+        if (isOtpPrompt) {
+            otpEdit = fields.firstOrNull {
+                it.type == "otp" || it.key.lowercase().contains("otp")
+            }?.let { edits[it.key] } ?: edits.values.firstOrNull()
+            smsBtn = Button(activity).apply {
+                text = "📩 SMS ka intezar hai…"
+                textSize = 14f
+                isEnabled = false
+                setOnClickListener {
+                    // Consent ready ho to turant launch
+                    if (!SmsOtpConsent.launchConsent()) {
+                        Toast.makeText(
+                            activity,
+                            "OTP wala SMS aate hi yahan se le lunga — thoda ruko",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            }
+            layout.addView(smsBtn)
+            layout.addView(TextView(activity).apply {
+                text = "OTP wala SMS aayega to ek tap me bhar jayega — type karne ki zaroorat nahi."
+                textSize = 12f
+                setTextColor(Color.parseColor("#80868B"))
+                setPadding(0, 8, 0, 0)
+            })
+        }
         val dlg = AlertDialog.Builder(activity)
             .setTitle("🤖 ${req.title}")
             .setView(ScrollView(activity).apply { addView(layout) })
@@ -303,13 +495,58 @@ object PromptDialog {
             dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 val map = mutableMapOf<String, Any?>("approved" to true)
                 edits.forEach { (k, et) -> map[k] = et.text.toString().trim() }
+                if (isOtpPrompt) SmsOtpConsent.stop()
                 answer(activity, req, map)
                 dlg.dismiss()
             }
             dlg.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+                if (isOtpPrompt) SmsOtpConsent.stop()
                 UserPrompt.cancel(req.runId)
                 showingFor = ""
                 dlg.dismiss()
+            }
+            if (isOtpPrompt) {
+                // SMS consent flow start
+                SmsOtpConsent.setActivity(activity)
+                val et = otpEdit
+                val btn = smsBtn
+                SmsOtpConsent.onOtp = { otp ->
+                    activity.runOnUiThread {
+                        et?.setText(otp)
+                        Toast.makeText(
+                            activity, "✓ OTP SMS se bhar diya",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        // L1: user ne consent me OTP dekh liya hai — ab
+                        // auto-submit (user ne kuch badla to nahi hoga).
+                        VoiceOutput.speak(activity, "OTP mil gaya, bhej raha hoon.")
+                        val posBtn = dlg.getButton(AlertDialog.BUTTON_POSITIVE)
+                        posBtn?.postDelayed({
+                            try {
+                                if (dlg.isShowing &&
+                                    et?.text?.toString() == otp
+                                ) {
+                                    posBtn.performClick()
+                                }
+                            } catch (_: Exception) { }
+                        }, 1200)
+                    }
+                }
+                SmsOtpConsent.onConsentReady = {
+                    activity.runOnUiThread {
+                        btn?.text = "📩 SMS se OTP lo"
+                        btn?.isEnabled = true
+                        // Dialog foreground me hai — consent turant launch
+                        // karo taaki user ko ek hi tap karna pade
+                        SmsOtpConsent.launchConsent()
+                    }
+                }
+                SmsOtpConsent.startListening(activity)
+                VoiceOutput.speak(
+                    activity,
+                    "Ab aapko sirf OTP dalna hai, baaki sab taiyar hai. " +
+                        "SMS aate hi OTP apne aap bhar jayega."
+                )
             }
         }
         dlg.show()
@@ -596,7 +833,8 @@ object PromptDialog {
         handler.post(tick)
         VoiceOutput.speak(
             activity,
-            "$amount rupaye ka payment karo. Time hai ${timeoutSec / 60} minute. Ho jaye to payment ho gaya dabao."
+            "Ab aapko sirf $amount rupaye pay karne hain $merchant ko — baaki sab taiyar hai. " +
+                "UPI app kholo ya QR scan karo. Ho jaye to payment ho gaya dabao."
         )
     }
 

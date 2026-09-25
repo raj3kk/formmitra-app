@@ -1,12 +1,6 @@
 package com.formmitra.app
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
-import android.os.Build
 import android.webkit.CookieManager
 import androidx.work.Worker
 import androidx.work.WorkerParameters
@@ -47,18 +41,6 @@ class DigestWorker(appContext: Context, params: WorkerParameters) : Worker(appCo
                 ?: return Result.success()
             if (alerts.length() == 0) return Result.success()
 
-            val nm = applicationContext
-                .getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            if (Build.VERSION.SDK_INT >= 26) {
-                nm.createNotificationChannel(
-                    NotificationChannel(
-                        CHANNEL_ID, "FormMitra Alerts",
-                        NotificationManager.IMPORTANCE_DEFAULT
-                    )
-                )
-            }
-
-            var notifIdx = 0
             for (i in 0 until alerts.length()) {
                 val a = alerts.optJSONObject(i) ?: continue
                 val id = a.optString("id")
@@ -69,34 +51,18 @@ class DigestWorker(appContext: Context, params: WorkerParameters) : Worker(appCo
                 val path = a.optString("url", "/")
                 val deep = BuildConfig.SITE_URL.trimEnd('/') + path
 
-                val tapIntent = Intent(applicationContext, MainActivity::class.java).apply {
-                    putExtra("deep_url", deep)
-                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-                }
-                val pi = PendingIntent.getActivity(
-                    applicationContext, 2000 + i, tapIntent,
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                )
-                val notif: Notification = if (Build.VERSION.SDK_INT >= 26) {
-                    Notification.Builder(applicationContext, CHANNEL_ID)
-                        .setContentTitle(title)
-                        .setContentText(text)
-                        .setSmallIcon(android.R.drawable.ic_dialog_info)
-                        .setContentIntent(pi)
-                        .setAutoCancel(true)
-                        .build()
-                } else {
-                    // minSdk 26 — unreachable, keeps compiler happy on old branches
-                    Notification.Builder(applicationContext)
-                        .setContentTitle(title)
-                        .setContentText(text)
-                        .setSmallIcon(android.R.drawable.ic_dialog_info)
-                        .setContentIntent(pi)
-                        .setAutoCancel(true)
-                        .build()
-                }
-                nm.notify(3000 + notifIdx, notif)
-                notifIdx++
+                // L5: NotifCenter se — channel + Profile on/off + inbox +
+                // badge + deep link, sab ek jagah.
+                try {
+                    com.formmitra.app.agent.NotifCenter.notify(
+                        applicationContext,
+                        com.formmitra.app.agent.NotifCenter.Cat.STATUS,
+                        title, text,
+                        deepTab = "/",
+                        key = "digest_$id",
+                        deepUrl = deep
+                    )
+                } catch (_: Exception) { }
                 seen.add(id)
             }
 

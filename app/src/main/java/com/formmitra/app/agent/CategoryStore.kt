@@ -16,8 +16,9 @@ object CategoryStore {
 
     fun saveForTask(ctx: Context, taskId: String, category: String) {
         if (taskId.isEmpty() || category.isEmpty()) return
+        // L2: sync — task create ke turant baad kill ho to bhi category bache
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit().putString("task:$taskId", category).apply()
+            .edit().putString("task:$taskId", category).commit()
     }
 
     /** Pehli mili key se category nikaalo aur hatao (ek baar ka use). */

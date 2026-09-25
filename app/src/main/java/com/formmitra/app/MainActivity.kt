@@ -257,6 +257,8 @@ class MainActivity : Activity() {
         } else {
             selectTab("/")
         }
+        // K1: notification tap ka deep link — seedha sahi screen par.
+        handleNotifDeepLink(intent)
 
         // FmApp.onCreate me WorkManager pehle hi init ho chuka hai (v15 fix).
         // Belt-and-braces: scheduler kabhi launch crash na banaye.
@@ -312,6 +314,37 @@ class MainActivity : Activity() {
         if (!deepUrl.isNullOrEmpty()) loadDeepUrl(deepUrl)
         val openTab = intent.getStringExtra("open_tab")?.let { mapLegacyTab(it) }
         if (!openTab.isNullOrEmpty()) selectTab(openTab)
+        // K1: notification tap ka deep link (app pehle se khuli ho tab bhi).
+        handleNotifDeepLink(intent)
+    }
+
+    /**
+     * K1: notification tap → seedha sahi screen.
+     * Extras (NotifCenter se):
+     *  - fm_deep_tab: "/history" | "/profile" | "/" (wallet/admin = WebView tab)
+     *  - fm_deep_run_id: History me is run ki detail khule
+     *  - fm_deep_prompt: is run ka pending prompt (dialog/resume rasta)
+     * Purane deep_url/open_tab flow ko nahi chhoota.
+     */
+    private fun handleNotifDeepLink(intent: Intent) {
+        val tab = intent.getStringExtra(com.formmitra.app.agent.NotifCenter.EXTRA_TAB)
+        val runId = intent.getStringExtra(com.formmitra.app.agent.NotifCenter.EXTRA_RUN_ID) ?: ""
+        val promptRunId =
+            intent.getStringExtra(com.formmitra.app.agent.NotifCenter.EXTRA_PROMPT_RUN_ID) ?: ""
+        if (tab.isNullOrEmpty() && runId.isEmpty() && promptRunId.isEmpty()) return
+        // Ek baar consume — dobara onNewIntent me same intent aaye to repeat na ho.
+        try {
+            intent.removeExtra(com.formmitra.app.agent.NotifCenter.EXTRA_TAB)
+            intent.removeExtra(com.formmitra.app.agent.NotifCenter.EXTRA_RUN_ID)
+            intent.removeExtra(com.formmitra.app.agent.NotifCenter.EXTRA_PROMPT_RUN_ID)
+        } catch (_: Exception) { }
+        val target = mapLegacyTab(tab ?: "/history")
+        selectTab(target)
+        if (promptRunId.isNotEmpty() && target == "/history") {
+            historyView.openPromptEntry(promptRunId)
+        } else if (runId.isNotEmpty() && target == "/history") {
+            historyView.openRunDetail(runId)
+        }
     }
 
     override fun onResume() {
@@ -630,6 +663,13 @@ class MainActivity : Activity() {
     @Deprecated("Document picker AgentChatView ke liye")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        // L1-UPGRADE: SMS User Consent result → OTP auto-fill
+        try {
+            if (com.formmitra.app.agent.SmsOtpConsent.handleActivityResult(
+                    requestCode, resultCode, data
+                )
+            ) return
+        } catch (_: Exception) { }
         try {
             com.formmitra.app.agent.PromptDialog.onDocPickResult(requestCode, data)
         } catch (_: Exception) { }
