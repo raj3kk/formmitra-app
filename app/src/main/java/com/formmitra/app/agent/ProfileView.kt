@@ -6,35 +6,34 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
-import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
-import com.formmitra.app.BuildConfig
-import java.net.HttpURLConnection
-import java.net.URL
+import android.widget.Toast
+import org.json.JSONObject
 
 /**
- * ProfileView (v19) — Profile tab ka NATIVE view (website WebView hata diya).
+ * ProfileView (v24) — Profile tab.
  *
- * Sections:
- *  (a) My Details card — GET /api/agent/profile se (AgentApi.profile).
- *  (b) Edit Profile button → form (naam, phone, email, DOB, pincode, address)
- *      → confirm dialog (verify-before-save spirit) → PUT /api/agent/profile.
- *  (c) Document Vault — DocsStore (encrypted, device-local): list, Add
- *      (file picker, koi bhi type), Remove (confirm ke saath). Har doc ke
- *      saath hint: "agent tasks me auto-available rahega".
- *      DOC-PRIVACY: filename sirf device par dikhta hai — server ko kabhi
- *      naam nahi bheja jata (PromptDialog/FormEngine bhi sirf local name
- *      istemal karte hain; upload me content jata hai, naam list nahi).
- *  (d) Admin entry — SIRF ownerEmail wale user ko (fail-closed).
- *  (e) Logout — session cookies clear.
+ * v24: sirf 3 cheezein (user order):
+ *  (1) 🪪 FormMitra Cards — list + Naya Card; tap → PIN unlock →
+ *      CardDetailView (Details edit+save, Document Vault andar).
+ *      Edit Profile + A-Z form HATA DIYE — card creation flow me MERGE.
+ *      Standalone Document Vault/Details HATA DIYA — sab card ke andar.
+ *  (2) 👤 Profile Detail (पंजीकरण विवरण) — registration wali: name, mobile,
+ *      state. READ-ONLY, kisi kaam me use NAHI hoti (sirf pehchan).
+ *  (3) 🔊 Talking Voice (बोलने वाली आवाज़) — English/Hindi × Male/Female
+ *      (server jaisa).
+ *  (4) ⚙️ Account (खाता) — operational cheezein jo hatayi nahi ja sakti:
+ *      Working Mode, notifications, inbox, saved logins, admin, logout.
+ *      (Profile DATA nahi — isliye alag section.)
  *
- * Wallet tab website WebView me hi rehta hai (wo theek hai).
+ *  Sab labels English (Hindi) bilingual (D17). Har delete par confirmation
+ *  popup (D18). Sab kuch named sections me (D19).
  */
 class ProfileView(
     context: Context,
@@ -44,325 +43,257 @@ class ProfileView(
     private val onLogout: () -> Unit
 ) : LinearLayout(context) {
 
-    companion object {
-        /** MainActivity.onActivityResult se forward hota hai. */
-        const val REQ_VAULT_PICK = 2001
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    private fun toast(msg: String) {
+        try { Toast.makeText(context, msg, Toast.LENGTH_SHORT).show() }
+        catch (_: Exception) { }
     }
 
-    private val scroll = ScrollView(context)
+    private val mainScroll = ScrollView(context)
     private val content = LinearLayout(context)
-    private val detailsText: TextView
-    private val editBtn: Button
-    private val vaultList: LinearLayout
-    private val vaultSection = LinearLayout(context)
-    private val adminBtn: Button
-    private val logoutBtn: Button
-    private lateinit var inboxBtn: Button
-    private var cachedProfile = linkedMapOf<String, String>()
+
+    // (1) cards
+    private val cardsList = LinearLayout(context)
+    private val cardsCount = TextView(context)
+    private var cachedCards = mutableListOf<JSONObject>()
     private var owner = false
+
+    // (2) profile detail
+    private val profileText = TextView(context)
+
+    // (3) voice
+    private val voiceLabel = TextView(context)
+
+    // (4) account
+    private val adminBtn: Button
+    private val inboxBtn: Button
+    private val loginsList = LinearLayout(context)
+
+    /** Card khula ho to uska view (back par wapas list). */
+    private var cardDetailView: CardDetailView? = null
 
     init {
         orientation = VERTICAL
-        setBackgroundColor(Color.WHITE)
-        val pad = dp(14)
+        setBackgroundColor(Color.parseColor("#FAFBFC"))
         content.orientation = VERTICAL
-        content.setPadding(pad, pad, pad, pad * 2)
+        val pad = dp(14)
+        content.setPadding(pad, dp(8), pad, pad * 2)
 
-        // Header
-        content.addView(TextView(context).apply {
-            text = "👤 Profile"
-            textSize = 20f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.parseColor("#202124"))
-            setPadding(0, 0, 0, dp(8))
+        // ============ (1) 🪪 FormMitra Cards ============
+        content.addView(sectionTitle("🪪 FormMitra Cards (फॉर्ममित्र कार्ड)"))
+        content.addView(cardsCount.apply {
+            textSize = 12f
+            setTextColor(Color.parseColor("#80868B"))
+            setPadding(0, 0, 0, dp(4))
+        })
+        val cardBtnRow = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+        }
+        val newCardBtn = Button(context).apply {
+            text = "➕ Naya Card (नया कार्ड)"
+            textSize = 14f
+            setOnClickListener { onNewCardClicked() }
+        }
+        UiKit.pressFeedback(newCardBtn)
+        cardBtnRow.addView(newCardBtn.apply {
+            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+                .apply { setMargins(0, 0, dp(6), 0) }
+        })
+        val refreshBtn = Button(context).apply {
+            text = "🔄"
+            textSize = 14f
+            setOnClickListener { loadCards() }
+        }
+        UiKit.pressFeedback(refreshBtn)
+        cardBtnRow.addView(refreshBtn.apply {
+            layoutParams = LayoutParams(
+                LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(dp(6), 0, 0, 0) }
+        })
+        content.addView(cardBtnRow)
+        cardsList.orientation = VERTICAL
+        content.addView(cardsList.apply {
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(6), 0, 0) }
         })
 
-        // (a) My Details card
-        content.addView(sectionTitle("📋 My Details"))
-        val card = LinearLayout(context).apply {
-            orientation = VERTICAL
-            background = cardBg()
-            setPadding(pad, dp(10), pad, dp(10))
-        }
-        detailsText = TextView(context).apply {
-            text = "Details la raha hun…"
-            textSize = 15f
+        // ============ (2) 👤 Profile Detail (read-only) ============
+        content.addView(sectionTitle("👤 Profile Detail (पंजीकरण विवरण)"))
+        content.addView(TextView(context).apply {
+            text = "Ye sirf registration ki pehchan hai — kisi kaam me use NAHI hoti. " +
+                "Kaam ke liye hamesha 🪪 Card ka data use hota hai."
+            textSize = 12f
+            setTextColor(Color.parseColor("#80868B"))
+            setPadding(0, 0, 0, dp(4))
+        })
+        profileText.apply {
+            textSize = 14f
             setTextColor(Color.parseColor("#202124"))
-            setLineSpacing(dp(4).toFloat(), 1f)
+            background = with(UiKit) { context.cardBg() }
+            setPadding(dp(12), dp(10), dp(12), dp(10))
         }
-        card.addView(detailsText)
-        content.addView(card)
-        editBtn = Button(context).apply {
-            text = "✏️ Edit Profile"
-            textSize = 14f
-            setOnClickListener { showEditDialog() }
-        }
-        content.addView(
-            editBtn,
-            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
-                .apply { setMargins(0, dp(8), 0, 0) }
-        )
-        // (b2) v20 Task 4: A-to-Z vault profile form (sab optional)
-        val fullFormBtn = Button(context).apply {
-            text = "📝 Poora Profile Form (A–Z)"
-            textSize = 14f
-            setTextColor(Color.WHITE)
-            background = with(UiKit) { context.primaryBtnBg() }
-            setOnClickListener { showFullProfileForm() }
-        }
-        UiKit.pressFeedback(fullFormBtn)
-        content.addView(
-            fullFormBtn,
-            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
-                .apply { setMargins(0, dp(8), 0, 0) }
-        )
+        content.addView(profileText)
 
-        // (b3) G1: Working Mode toggle — background automation ON/OFF.
-        // ON: WorkManager (form-tasks 30-min, digest 6h) + NetWake active;
-        //     FCM push / network-wake / app-open par WakeWorker resume karega.
-        // OFF: workers cancel, wake callback hatao (chalta run poora hoga).
-        content.addView(sectionTitle("⚙️ Working Mode"))
-        val wmCard = LinearLayout(context).apply {
-            orientation = VERTICAL
-            background = cardBg()
-            setPadding(pad, dp(10), pad, dp(10))
-        }
-        val wmRow = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = android.view.Gravity.CENTER_VERTICAL
-        }
-        val wmLabel = TextView(context).apply {
-            text = "🔄 Background Automation"
-            textSize = 15f
+        // ============ (3) 🔊 Talking Voice ============
+        content.addView(sectionTitle("🔊 Talking Voice (बोलने वाली आवाज़)"))
+        content.addView(TextView(context).apply {
+            text = "Agent kis awaaz me bole — server jaisa (English/Hindi × Male/Female)."
+            textSize = 12f
+            setTextColor(Color.parseColor("#80868B"))
+            setPadding(0, 0, 0, dp(4))
+        })
+        voiceLabel.apply {
+            textSize = 14f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#202124"))
-            layoutParams = LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+            setPadding(0, 0, 0, dp(4))
         }
-        val wmSwitch = android.widget.Switch(context).apply {
-            isChecked = WorkingMode.isEnabled(context)
+        content.addView(voiceLabel)
+        val voiceBtn = Button(context).apply {
+            text = "🎙️ Awaaz chuno (आवाज़ चुनें)"
+            textSize = 14f
+            setOnClickListener { showVoicePicker() }
         }
-        wmRow.addView(wmLabel)
-        wmRow.addView(wmSwitch)
-        wmCard.addView(wmRow)
-        val wmDesc = TextView(context).apply {
-            textSize = 12f
-            setTextColor(Color.parseColor("#5F6368"))
-            setPadding(0, dp(6), 0, 0)
+        UiKit.pressFeedback(voiceBtn)
+        content.addView(voiceBtn)
+        val voiceTestBtn = Button(context).apply {
+            text = "🔊 Suno — awaaz parkho (परखें)"
+            textSize = 13f
+            setOnClickListener {
+                VoiceOutput.init(context)
+                VoiceOutput.speak(
+                    context,
+                    if (VoiceOutput.voiceLang(context) == "en")
+                        "Hello! I am your Mitra. This is how I will sound."
+                    else "Namaste! Main aapka Mitra hun. Aise bolunga main."
+                )
+            }
         }
-        fun wmDescText(on: Boolean) = if (on)
-            "ON — app band hone par bhi kaam chalta rahega: push/network/app-open par " +
-                "wake + usi step se resume. Battery-friendly intervals."
-        else
-            "OFF — background automation band. Naya background kaam shuru nahi hoga " +
-                "(jo run chal raha hai wo poora hokar rukega)."
-        wmDesc.text = wmDescText(wmSwitch.isChecked)
-        wmCard.addView(wmDesc)
-        wmSwitch.setOnCheckedChangeListener { _, on ->
-            WorkingMode.setEnabled(context, on)
-            wmDesc.text = wmDescText(on)
-            android.widget.Toast.makeText(
-                context,
-                if (on) "Working Mode ON ✅" else "Working Mode OFF",
-                android.widget.Toast.LENGTH_SHORT
-            ).show()
-            // G6: ON karte hi battery-optimization guide (ek baar, force nahi).
-            if (on) promptBatteryGuide()
-        }
-        content.addView(
-            wmCard,
-            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
-                .apply { setMargins(0, dp(4), 0, 0) }
-        )
+        UiKit.pressFeedback(voiceTestBtn)
+        content.addView(voiceTestBtn.apply {
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(6), 0, 0) }
+        })
+        refreshVoiceLabel()
 
-        // (b4) K5: Notification settings — kaunsi categories ON.
-        // OFF category ki notification bilkul nahi aati (na shade, na inbox).
-        content.addView(sectionTitle("🔔 Notifications"))
-        val notifCard = LinearLayout(context).apply {
-            orientation = VERTICAL
-            background = cardBg()
-            setPadding(pad, dp(10), pad, dp(10))
+        // ============ (4) ⚙️ Account ============
+        content.addView(sectionTitle("⚙️ Account (खाता)"))
+        // Working Mode (automation stack — hataya nahi ja sakta)
+        val wmRow = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = with(UiKit) { context.cardBg() }
+            setPadding(dp(12), dp(8), dp(12), dp(8))
         }
-        val notifSwitches = ArrayList<android.widget.Switch>()
-        for ((cat, label) in NotifSettings.categories()) {
-            val row = LinearLayout(context).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = android.view.Gravity.CENTER_VERTICAL
-                setPadding(0, dp(4), 0, dp(4))
+        wmRow.addView(TextView(context).apply {
+            text = "🤖 Working Mode (कार्य मोड)\nBackground automation ON/OFF"
+            textSize = 13f
+            setTextColor(Color.parseColor("#202124"))
+            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+        })
+        val wmSwitch = Switch(context).apply {
+            isChecked = try { WorkingMode.isEnabled(context) } catch (_: Exception) { false }
+            setOnCheckedChangeListener { _, on ->
+                try {
+                    WorkingMode.setEnabled(context, on)
+                    toast(if (on) "Working Mode ON ✅" else "Working Mode OFF ⏸️")
+                } catch (_: Exception) { }
             }
-            row.addView(TextView(context).apply {
-                text = label
-                textSize = 14f
-                setTextColor(Color.parseColor("#202124"))
-                layoutParams = LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
-            })
-            val sw = android.widget.Switch(context).apply {
-                isChecked = NotifSettings.isEnabled(context, cat)
-                setOnCheckedChangeListener { _, on ->
-                    NotifSettings.setEnabled(context, cat, on)
-                    toast(if (on) "✓ $label ON" else "$label OFF")
-                }
-            }
-            notifSwitches.add(sw)
-            row.addView(sw)
-            notifCard.addView(row)
         }
-        // L4: agent ki awaaz (TTS) on/off — mute par bhi text announcements
-        // (notifications/inbox) hamesha dikhte hain.
-        run {
-            val row = LinearLayout(context).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = android.view.Gravity.CENTER_VERTICAL
-                setPadding(0, dp(4), 0, dp(4))
-            }
-            row.addView(TextView(context).apply {
-                text = "🔊 Agent ki awaaz (voice)"
-                textSize = 14f
-                setTextColor(Color.parseColor("#202124"))
-                layoutParams = LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
-            })
-            val sw = android.widget.Switch(context).apply {
-                isChecked = VoiceOutput.isEnabled(context)
-                setOnCheckedChangeListener { _, on ->
-                    VoiceOutput.setEnabled(context, on)
-                    toast(if (on) "✓ Agent ki awaaz ON" else "Agent ki awaaz OFF — text rahega")
-                }
-            }
-            row.addView(sw)
-            notifCard.addView(row)
+        wmRow.addView(wmSwitch)
+        content.addView(wmRow.apply {
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, 0, 0, dp(6)) }
+        })
+        // Agent voice master toggle
+        val voiceRow = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = with(UiKit) { context.cardBg() }
+            setPadding(dp(12), dp(8), dp(12), dp(8))
         }
-        content.addView(
-            notifCard,
-            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
-                .apply { setMargins(0, dp(4), 0, 0) }
-        )
-        // (b5) K5: Notification inbox — purani notifications ka tray.
+        voiceRow.addView(TextView(context).apply {
+            text = "🔊 Agent ki awaaz (एजेंट की आवाज़)"
+            textSize = 13f
+            setTextColor(Color.parseColor("#202124"))
+            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+        })
+        val voiceSwitch = Switch(context).apply {
+            isChecked = VoiceOutput.isEnabled(context)
+            setOnCheckedChangeListener { _, on ->
+                VoiceOutput.setEnabled(context, on)
+                toast(if (on) "Awaaz ON 🔊" else "Awaaz OFF 🔇")
+            }
+        }
+        voiceRow.addView(voiceSwitch)
+        content.addView(voiceRow.apply {
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, 0, 0, dp(6)) }
+        })
+        // Notifications
+        val notifBtn = Button(context).apply {
+            text = "🔔 Notifications (सूचनाएं)"
+            textSize = 14f
+            setOnClickListener { showNotifSettings() }
+        }
+        UiKit.pressFeedback(notifBtn)
+        content.addView(notifBtn)
+        // Inbox
         inboxBtn = Button(context).apply {
-            text = "📥 Notification Inbox"
+            text = "📥 Notification Inbox (इनबॉक्स)"
             textSize = 14f
             setOnClickListener {
                 NotifInboxView.show(context) { refreshInboxBtn() }
             }
         }
         UiKit.pressFeedback(inboxBtn)
-        content.addView(
-            inboxBtn,
-            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
-                .apply { setMargins(0, dp(8), 0, 0) }
-        )
-
-        // (c) Document Vault
-        vaultSection.orientation = VERTICAL
-        vaultSection.addView(sectionTitle("📁 Document Vault"))
-        vaultSection.addView(TextView(context).apply {
-            text = "Vault ke docs agent tasks me auto-available rehte hain.\n" +
-                "Filenames sirf is phone par rehte hain — server ko kabhi nahi bheje jate."
-            textSize = 12f
-            setTextColor(Color.parseColor("#80868B"))
-            setPadding(0, 0, 0, dp(6))
+        content.addView(inboxBtn.apply {
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(6), 0, 0) }
         })
-        vaultList = LinearLayout(context).apply {
-            orientation = VERTICAL
-        }
-        vaultSection.addView(vaultList)
-        vaultSection.addView(Button(context).apply {
-            text = "➕ Add Document"
+        // Saved logins (automation)
+        content.addView(TextView(context).apply {
+            text = "🔑 Saved Logins (सहेजे लॉगिन) — automation ke liye"
             textSize = 14f
-            setOnClickListener { pickDoc() }
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#202124"))
+            setPadding(0, dp(10), 0, dp(4))
         })
-        content.addView(vaultSection)
-
-        // (c2) L1-UPGRADE: Saved logins — site credentials (device-encrypted).
-        // Yahan se dekh/saaf kar sakte ho. Delete par confirm (L3c).
-        val loginSection = LinearLayout(context).apply { orientation = VERTICAL }
-        loginSection.addView(sectionTitle("🔑 Saved Logins"))
-        loginSection.addView(TextView(context).apply {
-            text = "In sites par agent apne aap login karta hai. " +
-                "Credentials sirf is phone me encrypted hain."
-            textSize = 12f
-            setTextColor(Color.parseColor("#80868B"))
-            setPadding(0, 0, 0, dp(6))
-        })
-        val loginList = LinearLayout(context).apply { orientation = VERTICAL }
-        loginSection.addView(loginList)
-        fun refreshLogins() {
-            loginList.removeAllViews()
-            val domains = try { SiteCredentialStore.domains(context) }
-            catch (_: Exception) { emptyList() }
-            if (domains.isEmpty()) {
-                loginList.addView(TextView(context).apply {
-                    text = "Koi saved login nahi"
-                    textSize = 13f
-                    setTextColor(Color.parseColor("#80868B"))
-                })
-            }
-            for (d in domains) {
-                val row = LinearLayout(context).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = android.view.Gravity.CENTER_VERTICAL
-                    setPadding(0, dp(4), 0, dp(4))
-                }
-                row.addView(TextView(context).apply {
-                    text = "🌐 $d"
-                    textSize = 14f
-                    setTextColor(Color.parseColor("#202124"))
-                    layoutParams = LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
-                })
-                row.addView(Button(context).apply {
-                    text = "🗑️"
-                    textSize = 13f
-                    setOnClickListener {
-                        val act = context as? Activity ?: return@setOnClickListener
-                        AlertDialog.Builder(act)
-                            .setTitle("Login hatao?")
-                            .setMessage("$d ka saved login hata diya jayega — " +
-                                "agli baar manually dena hoga.")
-                            .setPositiveButton("🗑️ Hatao") { dd, _ ->
-                                try { SiteCredentialStore.clear(context, d) }
-                                catch (_: Exception) { }
-                                toast("Login hata diya: $d")
-                                refreshLogins()
-                                dd.dismiss()
-                            }
-                            .setNegativeButton("Rehne do", null)
-                            .show()
-                    }
-                })
-                loginList.addView(row)
-            }
-        }
-        refreshLogins()
-        content.addView(
-            loginSection,
-            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
-                .apply { setMargins(0, dp(12), 0, 0) }
-        )
-
-        // (d) Admin entry — owner ko hi dikhega
+        loginsList.orientation = VERTICAL
+        content.addView(loginsList)
+        // Admin (owner only)
         adminBtn = Button(context).apply {
-            text = "🔧 Admin Panel"
+            text = "🔐 Admin"
             textSize = 14f
             visibility = View.GONE
             setOnClickListener { onOpenAdmin() }
         }
-        content.addView(
-            adminBtn,
-            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
-                .apply { setMargins(0, dp(16), 0, 0) }
-        )
-
-        // (e) Logout
-        logoutBtn = Button(context).apply {
-            text = "🚪 Logout"
+        content.addView(adminBtn.apply {
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(8), 0, 0) }
+        })
+        // Logout
+        val logoutBtn = Button(context).apply {
+            text = "🚪 Logout (लॉगआउट)"
             textSize = 14f
+            setTextColor(Color.parseColor("#C5221F"))
             setOnClickListener { confirmLogout() }
         }
-        content.addView(
-            logoutBtn,
-            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
-                .apply { setMargins(0, dp(8), 0, 0) }
-        )
+        UiKit.pressFeedback(logoutBtn)
+        content.addView(logoutBtn.apply {
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(8), 0, 0) }
+        })
 
-        scroll.addView(
+        mainScroll.addView(
             content,
             android.view.ViewGroup.LayoutParams(
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT,
@@ -370,556 +301,447 @@ class ProfileView(
             )
         )
         addView(
-            scroll,
+            mainScroll,
             LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
         )
     }
 
-    /** Tab khulne par refresh: details + vault + owner check. */
+    // ============ tab lifecycle ============
+
     fun onTabShown() {
-        loadDetails()
-        refreshVault()
-        checkOwnerHttp()
+        // Card detail khula ho to wahi rahe.
+        if (cardDetailView != null) return
+        loadCards()
+        loadProfileDetail()
         refreshInboxBtn()
+        refreshLogins()
+        checkOwner()
+        refreshVoiceLabel()
     }
 
-    /** Inbox button par unread count (badge jaisa). */
-    private fun refreshInboxBtn() {
-        try {
-            val n = NotifStore.unreadCount(context)
-            post {
-                inboxBtn.text =
-                    if (n > 0) "📥 Notification Inbox ($n nayi)" else "📥 Notification Inbox"
-            }
-        } catch (_: Exception) { }
-    }
-
-    /** Home ke "Document Vault" card se — seedha vault section par scroll. */
-    fun jumpToVault() {
+    /** Logout ke baad cached state saaf. */
+    fun onLoggedOut() {
+        cachedCards.clear()
+        CardStore.setSelectedCardId(context, null)
         post {
-            try {
-                scroll.smoothScrollTo(0, vaultSection.top)
-            } catch (_: Exception) { }
+            renderCards()
+            profileText.text = "⚠️ Login nahi hai — website me login karke dobara kholo."
+            refreshLogins()
         }
     }
 
-    /** Owner confirm hua (MainActivity ya apne HTTP check se). */
     fun setOwner(b: Boolean) {
         owner = b
         post { adminBtn.visibility = if (b) View.VISIBLE else View.GONE }
     }
 
-    /** Logout ke baad cached state saaf. */
-    fun onLoggedOut() {
-        cachedProfile.clear()
-        post {
-            detailsText.text = "⚠️ Login nahi hai — website me login karke dobara kholo."
-            refreshVault()
-        }
-    }
+    /** MainActivity.onActivityResult se forward (card doc picker). */
+    fun handleActivityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean =
+        try {
+            cardDetailView?.handleActivityResult(requestCode, resultCode, data)
+                ?: false
+        } catch (_: Exception) { false }
 
-    /** MainActivity.onActivityResult se forward. */
-    fun handleActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        if (requestCode != REQ_VAULT_PICK) return
-        if (resultCode != Activity.RESULT_OK) return
-        val uri = try { data?.data } catch (_: Exception) { null } ?: return
+    // ============ (1) cards ============
+
+    private fun loadCards() {
+        cardsCount.text = "La raha hun…"
         Thread({
-            val saved = try { DocsStore.saveDoc(context, uri) }
-            catch (_: Exception) { null }
+            val res = try { AgentApi.cards(context) }
+            catch (_: Exception) { AgentApi.ApiResult(-1, null) }
             post {
-                if (!saved.isNullOrEmpty()) {
-                    toast("✓ Document save ho gaya")
-                    // K1: document ready — vault me doc jod diya (DOC channel).
-                    try {
-                        NotifCenter.notify(
-                            context, NotifCenter.Cat.DOC,
-                            "📄 Document vault me jod diya",
-                            "Agent tasks me ye document auto-available rahega.",
-                            deepTab = "/profile"
-                        )
-                    } catch (_: Exception) { }
-                    // v20 Task 3: "Kaun sa document hai?" — type device-local
-                    // save hota hai, server ko kabhi nahi jata (doc-privacy).
-                    val act = context as? Activity
-                    if (act != null) {
-                        UiKit.askDocType(act) { type ->
-                            DocsStore.setDocType(context, saved, type)
-                            toast("🏷️ $type ke roop me save hua")
-                            refreshVault()
-                        }
-                    } else {
-                        refreshVault()
+                when {
+                    res.code == 401 -> {
+                        cardsCount.text = "🔑 Login nahi hai — pehle login karo"
+                        cachedCards.clear()
+                        renderCards()
                     }
-                } else {
-                    toast("⚠️ Save nahi hua — dobara try karo")
+                    res.code == -1 -> {
+                        cardsCount.text = "📡 Internet nahi — cards nahi dikhe"
+                    }
+                    res.code !in 200..299 -> {
+                        cardsCount.text = "⚠️ Cards nahi mile — 🔄 dabakar dobara try karo"
+                    }
+                    else -> {
+                        cachedCards = mutableListOf()
+                        val arr = res.json?.optJSONArray("cards")
+                        if (arr != null) {
+                            for (i in 0 until arr.length()) {
+                                arr.optJSONObject(i)?.let { cachedCards.add(it) }
+                            }
+                        }
+                        renderCards()
+                    }
                 }
             }
-        }, "fm-vaultsave").start()
+        }, "fm-profile-cards").start()
     }
 
-    // ---------- (a) My Details ----------
-
-    private fun loadDetails() {
-        detailsText.text = "Details la raha hun…"
-        Thread({
-            val profile = try { AgentApi.profile(context) }
-            catch (_: Exception) { null }
-            post { renderDetails(profile) }
-        }, "fm-profileload").start()
-    }
-
-    private fun renderDetails(p: org.json.JSONObject?) {
-        cachedProfile.clear()
-        if (p == null) {
-            detailsText.text =
-                "⚠️ Login nahi hai ya server se dikkat — website me login karke dobara kholo."
+    private fun renderCards() {
+        cardsList.removeAllViews()
+        val n = cachedCards.size
+        cardsCount.text = when {
+            n == 0 -> "Koi card nahi — ➕ Naya Card se banao (max 4)"
+            else -> "$n card${if (n > 1) "s" else ""} (max 4) — kholne ke liye tap karo 🔒"
+        }
+        if (n == 0) {
+            cardsList.addView(TextView(context).apply {
+                text = "🪪 Abhi koi card nahi hai.\nKaam shuru karne se pehle card banana zaroori hai."
+                textSize = 13f
+                setTextColor(Color.parseColor("#80868B"))
+                setPadding(0, dp(4), 0, dp(4))
+            })
             return
         }
-        val sb = StringBuilder()
-        for (k in DetailExtractor.orderedKeys()) {
-            val v = p.optString(k, "").trim()
-            if (v.isNotEmpty() && v != "null") {
-                cachedProfile[k] = v
-                sb.append(DetailExtractor.label(k)).append(": ").append(v).append("\n")
-            }
+        val sel = CardStore.selectedCardId(context)
+        for (c in cachedCards) {
+            val id = c.optString("id")
+            val name = c.optString("name", "Card")
+            val fid = c.optString("formmitra_id", "")
+            val dk = c.optJSONArray("details_keys")?.length() ?: 0
+            val dc = c.optInt("docs_count", 0)
+            val isSel = id == sel
+            cardsList.addView(LinearLayout(context).apply {
+                orientation = HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = with(UiKit) { context.cardBg() }
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                isClickable = true
+                isFocusable = true
+                addView(TextView(context).apply {
+                    text = "🪪"
+                    textSize = 26f
+                    setPadding(0, 0, dp(8), 0)
+                })
+                addView(LinearLayout(context).apply {
+                    orientation = VERTICAL
+                    layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+                    addView(TextView(context).apply {
+                        text = name + (if (isSel) "  ✅ (chuna hua)" else "")
+                        textSize = 15f
+                        setTypeface(null, Typeface.BOLD)
+                        setTextColor(Color.parseColor("#202124"))
+                    })
+                    addView(TextView(context).apply {
+                        text = "$fid • $dk details • $dc docs"
+                        textSize = 12f
+                        setTextColor(Color.parseColor("#80868B"))
+                    })
+                })
+                addView(TextView(context).apply {
+                    text = "🔒"
+                    textSize = 18f
+                })
+                setOnClickListener { openCard(c) }
+                UiKit.pressFeedback(this)
+                layoutParams = LayoutParams(
+                    LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+                ).apply { setMargins(0, 0, 0, dp(6)) }
+            })
         }
-        // unknown extra fields bhi dikhao
-        val it = p.keys()
-        while (it.hasNext()) {
-            val k = it.next()
-            if (cachedProfile.containsKey(k) || k == "confirmed") continue
-            val v = p.optString(k, "").trim()
-            if (v.isNotEmpty() && v != "null") {
-                cachedProfile[k] = v
-                sb.append(DetailExtractor.label(k)).append(": ").append(v).append("\n")
-            }
-        }
-        detailsText.text = if (sb.isEmpty())
-            "Koi details nahi — Edit Profile se jodo."
-        else sb.toString().trim()
     }
 
-    // ---------- (b) Edit Profile ----------
-
-    private fun showEditDialog() {
+    private fun onNewCardClicked() {
         val act = context as? Activity ?: return
+        if (cachedCards.size >= 4) {
+            AlertDialog.Builder(act)
+                .setTitle("4 Cards ho gaye")
+                .setMessage("Ek user max 4 cards bana sakta hai. Naya chahiye to purana hatao.")
+                .setPositiveButton("Samajh gaya", null)
+                .show()
+            return
+        }
+        CardFlow.showCreateChooser(
+            act,
+            emptyMap(),
+            onAgentCreate = { prefill -> startAgentCreate(prefill) },
+            onCreated = { _, id, name, _ ->
+                CardStore.setSelectedCardId(context, id)
+                loadCards()
+            }
+        )
+    }
+
+    /** Through Agent — chat kholo card_create mode me (caller: MainActivity). */
+    var onAgentCreateRequest: ((prefill: Map<String, String>) -> Unit)? = null
+
+    private fun startAgentCreate(prefill: Map<String, String>) {
+        // Through-Agent flow ke dauraan bane naye card ko dhoondhne ke liye
+        // current ids note karo.
+        agentKnownIds = cachedCards.map { it.optString("id") }.toSet()
+        onAgentCreateRequest?.invoke(prefill)
+    }
+
+    private var agentKnownIds: Set<String> = emptySet()
+
+    /**
+     * Agent se wapas aane par naya card aaya ho to pakdo (best-effort) —
+     * phir PIN unlock → kholo.
+     */
+    fun checkAgentCreatedCard() {
+        val act = context as? Activity ?: return
+        if (agentKnownIds.isEmpty()) return
+        CardFlow.checkNewCardAfterAgent(act, agentKnownIds) { id, name ->
+            agentKnownIds = emptySet()
+            toast("✅ Naya card mila: $name — PIN se kholo")
+            loadCards()
+        }
+    }
+
+    private fun openCard(card: JSONObject) {
+        val act = context as? Activity ?: return
+        CardFlow.askPinAndUnlock(
+            act, card,
+            onUnlocked = { _, id, name, token ->
+                val fid = card.optString("formmitra_id", "")
+                showCardDetail(id, name, fid, token)
+            }
+        )
+    }
+
+    private fun showCardDetail(
+        cardId: String,
+        cardName: String,
+        formmitraId: String,
+        token: String
+    ) {
+        val detail = CardDetailView(
+            context, cardId, cardName, formmitraId, token,
+            onBack = { closeCardDetail() },
+            onCardDeleted = {
+                closeCardDetail()
+                loadCards()
+            }
+        )
+        cardDetailView = detail
+        removeView(mainScroll)
+        addView(
+            detail,
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
+        )
+    }
+
+    private fun closeCardDetail() {
+        cardDetailView?.let { removeView(it) }
+        cardDetailView = null
+        addView(
+            mainScroll,
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
+        )
+        loadCards()
+    }
+
+    // ============ (2) profile detail (read-only) ============
+
+    private fun loadProfileDetail() {
+        profileText.text = "La raha hun…"
+        Thread({
+            val p = try { AgentApi.profile(context) } catch (_: Exception) { null }
+            post {
+                if (p == null) {
+                    profileText.text = "⚠️ Profile nahi mila — login karke dobara kholo."
+                    return@post
+                }
+                val name = p.optString("name", p.optString("full_name", "")).trim()
+                val mobile = p.optString("mobile", p.optString("phone", "")).trim()
+                val state = p.optString("state", "").trim()
+                val email = p.optString("email", "").trim()
+                val sb = StringBuilder()
+                if (name.isNotEmpty()) sb.append("👤 Naam (नाम): ").append(name).append("\n")
+                if (mobile.isNotEmpty()) sb.append("📱 Mobile (मोबाइल): ").append(mobile).append("\n")
+                if (state.isNotEmpty()) sb.append("📍 State (राज्य): ").append(state).append("\n")
+                if (email.isNotEmpty()) sb.append("📧 Email: ").append(email).append("\n")
+                if (sb.isEmpty()) {
+                    sb.append("Profile khaali hai — website par login complete karo.")
+                }
+                profileText.text = sb.toString().trim()
+                // owner check (fail-closed)
+                if (!owner && email.isNotEmpty() &&
+                    email.equals(ownerEmail, ignoreCase = true)
+                ) {
+                    onOwnerConfirmed()
+                }
+            }
+        }, "fm-profile-detail").start()
+    }
+
+    private fun checkOwner() {
+        // loadProfileDetail me email milne par onOwnerConfirmed call hota hai.
+    }
+
+    // ============ (3) talking voice ============
+
+    private fun refreshVoiceLabel() {
+        try {
+            voiceLabel.text = "Abhi: " + VoiceOutput.voiceLabel(context)
+        } catch (_: Exception) { }
+    }
+
+    private fun showVoicePicker() {
+        val act = context as? Activity ?: return
+        val opts = arrayOf(
+            "Hindi (हिंदी) × Female (महिला)",
+            "Hindi (हिंदी) × Male (पुरुष)",
+            "English (अंग्रेज़ी) × Female (महिला)",
+            "English (अंग्रेज़ी) × Male (पुरुष)"
+        )
+        val vals = arrayOf("hi|female", "hi|male", "en|female", "en|male")
+        val cur = VoiceOutput.voiceLang(context) + "|" + VoiceOutput.voiceGender(context)
+        var checked = vals.indexOf(cur).takeIf { it >= 0 } ?: 0
+        AlertDialog.Builder(act)
+            .setTitle("🔊 Talking Voice chuno (आवाज़ चुनें)")
+            .setSingleChoiceItems(opts, checked) { _, w -> checked = w }
+            .setPositiveButton("✅ Lagao") { d, _ ->
+                d.dismiss()
+                val parts = vals[checked].split("|")
+                VoiceOutput.setVoicePref(context, parts[0], parts[1])
+                VoiceOutput.init(context)
+                refreshVoiceLabel()
+                toast("✓ Awaaz set: ${opts[checked]}")
+                // turant parakh
+                VoiceOutput.speak(
+                    context,
+                    if (parts[0] == "en") "This is my new voice."
+                    else "Ye meri nayi awaaz hai."
+                )
+            }
+            .setNegativeButton("Radd karo", null)
+            .show()
+    }
+
+    // ============ (4) account ============
+
+    private fun showNotifSettings() {
+        val act = context as? Activity ?: return
+        val cats = try { NotifSettings.categories() } catch (_: Exception) { emptyList() }
+        if (cats.isEmpty()) {
+            toast("Notification settings uplabdh nahi")
+            return
+        }
         val layout = LinearLayout(act).apply {
             orientation = VERTICAL
-            setPadding(48, 16, 48, 8)
+            setPadding(dp(24), dp(8), dp(24), dp(8))
         }
-        val edits = LinkedHashMap<String, EditText>()
-        for (k in DetailExtractor.orderedKeys()) {
-            layout.addView(TextView(act).apply {
-                text = DetailExtractor.label(k)
-                textSize = 13f
-                setTextColor(Color.parseColor("#80868B"))
-                setPadding(0, dp(6), 0, 0)
-            })
-            val et = EditText(act).apply {
-                setText(cachedProfile[k] ?: "")
-                textSize = 16f
-                setTextColor(Color.parseColor("#202124"))
+        for ((cat, label) in cats) {
+            val row = LinearLayout(act).apply {
+                orientation = HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(6), 0, dp(6))
             }
-            layout.addView(et)
-            edits[k] = et
+            row.addView(TextView(act).apply {
+                text = label
+                textSize = 14f
+                setTextColor(Color.parseColor("#202124"))
+                layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+            })
+            row.addView(Switch(act).apply {
+                isChecked = try { NotifSettings.isEnabled(act, cat) }
+                catch (_: Exception) { true }
+                setOnCheckedChangeListener { _, on ->
+                    try { NotifSettings.setEnabled(act, cat, on) }
+                    catch (_: Exception) { }
+                }
+            })
+            layout.addView(row)
         }
         AlertDialog.Builder(act)
-            .setTitle("✏️ Edit Profile")
+            .setTitle("🔔 Notifications (सूचनाएं)")
             .setView(ScrollView(act).apply { addView(layout) })
-            .setPositiveButton("Save") { dlg, _ ->
-                val vals = LinkedHashMap<String, String>()
-                edits.forEach { (k, et) ->
-                    val v = et.text.toString().trim()
-                    if (v.isNotEmpty()) vals[k] = v
-                }
-                dlg.dismiss()
-                showSaveConfirm(act, vals)
-            }
-            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Ho gaya", null)
             .show()
     }
 
-    /**
-     * Verify-before-save spirit: save se PEHLE values dikhao, Proceed par
-     * hi PUT /api/agent/profile jaye (confirmed:true).
-     */
-    private fun showSaveConfirm(act: Activity, vals: Map<String, String>) {
-        if (vals.isEmpty()) {
-            toast("Kuch likha hi nahi — save cancel")
+    private fun refreshInboxBtn() {
+        try {
+            val n = NotifStore.unreadCount(context)
+            post {
+                inboxBtn.text = if (n > 0) "📥 Notification Inbox (इनबॉक्स) — $n nayi"
+                else "📥 Notification Inbox (इनबॉक्स)"
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun refreshLogins() {
+        loginsList.removeAllViews()
+        val domains = try { SiteCredentialStore.domains(context) }
+        catch (_: Exception) { emptyList<String>() }
+        if (domains.isEmpty()) {
+            loginsList.addView(TextView(context).apply {
+                text = "Koi saved login nahi"
+                textSize = 12f
+                setTextColor(Color.parseColor("#80868B"))
+            })
             return
         }
-        val sb = StringBuilder()
-        for ((k, v) in vals) {
-            sb.append(DetailExtractor.label(k)).append(": ").append(v).append("\n")
-        }
-        AlertDialog.Builder(act)
-            .setTitle("Confirm karo")
-            .setMessage(
-                "Ye details save hongi:\n\n${sb.toString().trim()}\n\n" +
-                    "Sahi hain to Proceed dabao."
-            )
-            .setPositiveButton("✅ Sahi hai — save karo") { dlg, _ ->
-                dlg.dismiss()
-                Thread({
-                    val ok = try {
-                        AgentApi.saveProfile(context, vals)
-                    } catch (_: Exception) { false }
-                    post {
-                        toast(
-                            if (ok) "✓ Details save ho gayi"
-                            else "⚠️ Save me dikkat — baad me try karo"
-                        )
-                        if (ok) loadDetails()
-                    }
-                }, "fm-profilesave").start()
-            }
-            .setNegativeButton("❌ Mat karo", null)
-            .setCancelable(false)
-            .show()
-    }
-
-    // ---------- (b2) v20 Task 4: A-to-Z profile form ----------
-
-    /**
-     * Poora profile form — EXACT server field keys (spelling mat badalna):
-     * full_name, father_name, mother_name, dob, gender, phone, email,
-     * village, post, district, state, pincode, address, qualification,
-     * occupation, category_caste, id_numbers.
-     * Sab OPTIONAL — partial save hota hai. PUT /api/agent/profile par
-     * `confirmed` field BHEJA HI NAHI jata (absent = server save karta hai).
-     * Yehi details agent document bharne me use karega.
-     */
-    private fun showFullProfileForm() {
-        val act = context as? Activity ?: return
-        with(UiKit) {
-            val layout = LinearLayout(act).apply {
-                orientation = VERTICAL
-                setPadding(act.dp(16), act.dp(8), act.dp(16), act.dp(8))
-            }
-            layout.addView(TextView(act).apply {
-                text = "Sab optional hai — jo pata ho bhar do. " +
-                    "Yehi details agent document bharne me use karega."
-                textSize = 13f
-                setTextColor(Color.parseColor("#80868B"))
-                setPadding(0, 0, 0, act.dp(6))
-            })
-            val sections = listOf(
-                "👤 Personal" to listOf(
-                    "full_name", "father_name", "mother_name", "dob",
-                    "gender", "phone", "email"
-                ),
-                "🏠 Address" to listOf(
-                    "village", "post", "district", "state", "pincode", "address"
-                ),
-                "📚 Other" to listOf(
-                    "qualification", "occupation", "category_caste", "id_numbers"
-                )
-            )
-            val edits = LinkedHashMap<String, EditText>()
-            for ((secTitle, keys) in sections) {
-                layout.addView(act.sectionTitle(secTitle).apply {
-                    setPadding(0, act.dp(10), 0, act.dp(2))
-                })
-                for (k in keys) {
-                    layout.addView(act.fieldLabel(DetailExtractor.label(k)))
-                    val et = act.formInput(hintFor(k), cachedProfile[k] ?: "")
-                    layout.addView(et)
-                    edits[k] = et
-                }
-            }
-            val dlg = AlertDialog.Builder(act)
-                .setTitle("📝 Poora Profile Form")
-                .setView(ScrollView(act).apply { addView(layout) })
-                .setPositiveButton("💾 Save karo", null)
-                .setNegativeButton("Band karo", null)
-                .create()
-            dlg.setOnShowListener {
-                dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                    val vals = LinkedHashMap<String, String>()
-                    edits.forEach { (k, et) ->
-                        val v = et.text.toString().trim()
-                        if (v.isNotEmpty()) vals[k] = v
-                    }
-                    if (vals.isEmpty()) {
-                        toast("Kuch bhara hi nahi — save cancel")
-                        return@setOnClickListener
-                    }
-                    dlg.dismiss()
-                    saveFullProfileWithRetry(vals)
-                }
-            }
-            dlg.show()
-        }
-    }
-
-    /**
-     * L2: profile save — fail ho to user ko pata chale + retry mile.
-     * Vals dialog me hi rehte hain, dobara bharna nahi padta.
-     */
-    private fun saveFullProfileWithRetry(vals: Map<String, String>) {
-        val act = context as? Activity ?: return
-        toast("Save ho raha hai…")
-        Thread({
-            val ok = try {
-                AgentApi.saveProfileForm(context, vals)
-            } catch (_: Exception) { false }
-            post {
-                if (ok) {
-                    toast("✓ Poora profile save ho gaya")
-                    loadDetails()
-                } else {
-                    AlertDialog.Builder(act)
-                        .setTitle("⚠️ Save nahi hua")
-                        .setMessage(
-                            "Internet ya server me dikkat hai. " +
-                                "Tumhari bhari hui details surakshit hain — " +
-                                "dobara try karo."
-                        )
-                        .setPositiveButton("🔁 Dobara try karo") { d, _ ->
-                            d.dismiss()
-                            saveFullProfileWithRetry(vals)
-                        }
-                        .setNegativeButton("Band karo", null)
-                        .show()
-                }
-            }
-        }, "fm-fullformsave").start()
-    }
-
-    private fun hintFor(key: String): String = when (key) {
-        "full_name" -> "Apna poora naam"
-        "father_name" -> "Pita ka naam"
-        "mother_name" -> "Mata ka naam"
-        "dob" -> "DD/MM/YYYY"
-        "gender" -> "Male / Female / Other"
-        "phone" -> "10-digit mobile"
-        "email" -> "Email address"
-        "village" -> "Gaon"
-        "post" -> "Post office"
-        "district" -> "Zila"
-        "state" -> "Rajya"
-        "pincode" -> "6-digit pincode"
-        "address" -> "Poora pata"
-        "qualification" -> "Padhai (10th/12th/Graduate…)"
-        "occupation" -> "Kaam (kisan/mazdoor…)"
-        "category_caste" -> "SC / ST / OBC / General"
-        "id_numbers" -> "Aadhaar/PAN no. (zaroorat par)"
-        else -> ""
-    }
-
-    // ---------- (c) Document Vault ----------
-
-    private fun refreshVault() {
-        post {
-            vaultList.removeAllViews()
-            val docs = try { DocsStore.listDocs(context) }
-            catch (_: Exception) { emptyList<String>() }
-            if (docs.isEmpty()) {
-                vaultList.addView(TextView(context).apply {
-                    text = "Koi document nahi — Add Document se jodo."
-                    textSize = 13f
-                    setTextColor(Color.parseColor("#80868B"))
-                    setPadding(0, dp(4), 0, dp(4))
-                })
-                return@post
-            }
-            for (name in docs) {
-                val row = LinearLayout(context).apply {
-                    orientation = HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    background = cardBg()
-                    setPadding(dp(10), dp(8), dp(10), dp(8))
-                }
-                // v20 Task 3: doc type badge (device-local metadata)
-                val dtype = try { DocsStore.getDocType(context, name) }
-                catch (_: Exception) { "" }
-                val tv = TextView(context).apply {
-                    text = "📄 $name" +
-                        (if (dtype.isNotEmpty()) "\n🏷️ $dtype" else "") +
-                        "\nagent tasks me auto-available rahega"
+        for (d in domains) {
+            loginsList.addView(LinearLayout(context).apply {
+                orientation = HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = with(UiKit) { context.cardBg() }
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+                addView(TextView(context).apply {
+                    text = "🔑 $d"
                     textSize = 13f
                     setTextColor(Color.parseColor("#202124"))
                     layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
-                }
-                row.addView(tv)
-                val del = Button(context).apply {
+                })
+                addView(Button(context).apply {
                     text = "🗑️"
-                    textSize = 16f
-                    setOnClickListener { confirmRemove(name) }
-                }
-                row.addView(del)
-                vaultList.addView(
-                    row,
-                    LayoutParams(
-                        LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
-                    ).apply { setMargins(0, 0, 0, dp(6)) }
-                )
-                UiKit.appear(row)
-            }
+                    textSize = 13f
+                    setOnClickListener { confirmDeleteLogin(d) }
+                })
+                layoutParams = LayoutParams(
+                    LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+                ).apply { setMargins(0, 0, 0, dp(6)) }
+            })
         }
     }
 
-    private fun confirmRemove(name: String) {
+    /** D18: saved login delete par confirmation. */
+    private fun confirmDeleteLogin(domain: String) {
         val act = context as? Activity ?: return
         AlertDialog.Builder(act)
-            .setTitle("Document hatao?")
+            .setTitle("🗑️ Login hatao? (हटाएं?)")
             .setMessage(
-                "\"$name\" vault se hat jayega.\n" +
-                    "Agent tasks me ye file phir use nahi hogi."
+                "\"$domain\" ka saved login hat jayega.\n" +
+                    "Agli baar automation par tumhe khud login karna padega."
             )
-            .setPositiveButton("🗑️ Hatao") { dlg, _ ->
-                dlg.dismiss()
-                val ok = try { DocsStore.deleteDoc(context, name) }
-                catch (_: Exception) { false }
-                toast(if (ok) "✓ Hata diya" else "⚠️ Hataya nahi gaya")
-                if (ok) refreshVault()
+            .setPositiveButton("🗑️ Hatao (हटाएं)") { d, _ ->
+                d.dismiss()
+                try {
+                    SiteCredentialStore.clear(context, domain)
+                    toast("✓ Hata diya")
+                } catch (_: Exception) {
+                    toast("⚠️ Hataya nahi gaya")
+                }
+                refreshLogins()
             }
-            .setNegativeButton("Rakho", null)
+            .setNegativeButton("Rakho (रखें)", null)
             .show()
     }
 
-    private fun pickDoc() {
-        val act = context as? Activity ?: return
-        try {
-            act.startActivityForResult(
-                Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                    addCategory(Intent.CATEGORY_OPENABLE)
-                    type = "*/*" // koi bhi type
-                },
-                REQ_VAULT_PICK
-            )
-        } catch (_: Exception) {
-            toast("Picker nahi khula")
-        }
-    }
-
-    // ---------- (d) Owner check ----------
-
-    /**
-     * Website ka /profile page session cookie ke saath lao — text me
-     * ownerEmail dikhe to owner (fail-closed: na dikhe to admin nahi).
-     * MainActivity ka purana WebView wala checkOwner bhi rakha hai
-     * (defense-in-depth); ye native tab ka apna check hai.
-     */
-    private fun checkOwnerHttp() {
-        if (owner) return
-        Thread({
-            try {
-                val url = URL(BuildConfig.SITE_URL.trimEnd('/') + "/profile")
-                val conn = (url.openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 20000
-                    readTimeout = 20000
-                }
-                AgentApi.sessionCookie()?.let {
-                    conn.setRequestProperty("Cookie", it)
-                }
-                if (conn.responseCode == 200) {
-                    val text = conn.inputStream.bufferedReader()
-                        .use { r -> r.readText() }
-                    if (text.contains(ownerEmail)) {
-                        post { onOwnerConfirmed() }
-                    }
-                }
-                conn.disconnect()
-            } catch (_: Exception) { }
-        }, "fm-ownercheck").start()
-    }
-
-    // ---------- (e) Logout ----------
-
+    /** D18: logout par confirmation. */
     private fun confirmLogout() {
         val act = context as? Activity ?: return
         AlertDialog.Builder(act)
-            .setTitle("Logout?")
-            .setMessage("Website session khatm ho jayega. Phone ka vault data (details/docs) safe rahega.")
-            .setPositiveButton("🚪 Logout") { dlg, _ ->
-                dlg.dismiss()
+            .setTitle("🚪 Logout? (लॉगआउट?)")
+            .setMessage("Website se logout ho jayega. Cards server par surakshit rahenge.")
+            .setPositiveButton("🚪 Haan, logout") { d, _ ->
+                d.dismiss()
                 onLogout()
             }
-            .setNegativeButton("Raho", null)
+            .setNegativeButton("Rehne do", null)
             .show()
     }
 
-    /**
-     * G6: Battery-optimization guide — Working Mode ON par ek baar.
-     * Force nahi karte: samjhate hain + Settings kholne ka button dete hain.
-     * (Doze/battery-optimization background workers ko rok sakti hai.)
-     */
-    private fun promptBatteryGuide() {
-        val act = context as? Activity ?: return
-        try {
-            val pm = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
-            if (pm != null && pm.isIgnoringBatteryOptimizations(context.packageName)) return
-        } catch (_: Exception) { }
-        try {
-            val prefs = context.getSharedPreferences("formmitra_working", Context.MODE_PRIVATE)
-            if (prefs.getBoolean("battery_guide_shown", false)) return
-            prefs.edit().putBoolean("battery_guide_shown", true).apply()
-        } catch (_: Exception) { }
-        AlertDialog.Builder(act)
-            .setTitle("🔋 Background ke liye ek setting")
-            .setMessage(
-                "Phone ki battery-optimization FormMitra ke background kaam ko rok sakti hai.\n\n" +
-                    "\"Settings kholo\" dabao → \"Allow\" / \"Don't optimize\" chuno — " +
-                    "uske baad Working Mode poori tarah kaam karega.\n\n" +
-                    "(Ye zaroori nahi — bina iske bhi app khulne par kaam resume hoga.)"
-            )
-            .setPositiveButton("⚙️ Settings kholo") { dlg, _ ->
-                dlg.dismiss()
-                openBatterySettings()
-            }
-            .setNegativeButton("Baad me", null)
-            .show()
-    }
-
-    private fun openBatterySettings() {
-        try {
-            val pkg = context.packageName
-            val intents = listOf(
-                Intent(
-                    android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                    android.net.Uri.parse("package:$pkg")
-                ),
-                Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
-            )
-            for (i in intents) {
-                try {
-                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    context.startActivity(i)
-                    return
-                } catch (_: Exception) { }
-            }
-            toast("Settings → Battery → FormMitra → Don't optimize")
-        } catch (_: Exception) {
-            toast("Settings → Battery → FormMitra → Don't optimize")
-        }
-    }
-
-    // ---------- helpers ----------
+    // ============ helpers ============
 
     private fun sectionTitle(t: String): TextView =
         TextView(context).apply {
             text = t
-            textSize = 16f
+            textSize = 17f
             setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.parseColor("#202124"))
-            setPadding(0, dp(10), 0, dp(6))
+            setTextColor(Color.parseColor("#1A73E8"))
+            setPadding(0, dp(12), 0, dp(6))
         }
-
-    private fun cardBg(): GradientDrawable =
-        GradientDrawable().apply {
-            setColor(Color.parseColor("#F8F9FA"))
-            setStroke(dp(1), Color.parseColor("#DADCE0"))
-            cornerRadius = dp(10).toFloat()
-        }
-
-    private fun toast(msg: String) {
-        try {
-            android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_SHORT)
-                .show()
-        } catch (_: Exception) { }
-    }
-
-    private fun dp(v: Int): Int =
-        (v * resources.displayMetrics.density).toInt()
 }

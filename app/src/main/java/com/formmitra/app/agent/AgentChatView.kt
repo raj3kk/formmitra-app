@@ -68,6 +68,69 @@ class AgentChatView(
     private var autoPlanArmed = false
     private lateinit var categoryChip: TextView
 
+    // v24: active FormMitra Card — chat + automation dono me bind hota hai.
+    // Token memory-only (CardStore); PIN kabhi persist nahi hota.
+    private var activeCardId: String? = null
+    private var activeCardName: String? = null
+    private var activeCardToken: String? = null
+
+    /** "Through Agent" card-create chuna → MainActivity chat kholta hai. */
+    var onAgentCreateRequest: ((prefill: Map<String, String>) -> Unit)? = null
+
+    /** Card select/unlock hua — chat + aage ke automation dono me bind karo. */
+    fun setActiveCard(cardId: String?, cardName: String?, cardToken: String?) {
+        activeCardId = cardId
+        activeCardName = cardName
+        activeCardToken = cardToken
+        try {
+            AgentApi.setAutomationCard(cardId, cardToken)
+        } catch (_: Exception) { }
+    }
+
+    /** Home ke 💬 Mitra header se — chat input par focus. */
+    fun focusInput() {
+        try {
+            input.requestFocus()
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE)
+                as? android.view.inputmethod.InputMethodManager
+            imm?.showSoftInput(input, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+        } catch (_: Exception) { }
+    }
+
+    /**
+     * v24 #2: Through Agent card-create — agent ek-ek karke poochhega
+     * (voice Q&A). Saaf Hinglish intro; server agent validate + samjhaye.
+     */
+    fun startAgentCardCreate(prefill: Map<String, String>) {
+        autoPlanArmed = false
+        activeCategory = null
+        post {
+            try { categoryChip.visibility = View.GONE } catch (_: Exception) { }
+            addAssistantBubble(
+                "🪪 Chalo, tumhara FormMitra Card banate hain!\n\n" +
+                    "Main ek-ek karke poochhunga — tum mic 🎤 se bolo ya likhkar do.\n" +
+                    "Kuch galat bhar diya to main tokunga AUR samjhaunga kahan se sahi bharna hai, " +
+                    "phir se bharwaunga. Ghabrao mat! 😊"
+            )
+            VoiceOutput.speak(
+                context,
+                "Chalo tumhara FormMitra Card banate hain. Main ek ek karke poochhunga."
+            )
+        }
+        val sb = StringBuilder(
+            "🪪 Naya FormMitra Card banana hai (card_create mode). " +
+                "Ek-ek karke sawaal poochho: pehle card ka naam, phir basic details. " +
+                "Har jawab validate karo; galat ho to toko, samjhao kahan se sahi bharna hai, phir se bharwao."
+        )
+        if (prefill.isNotEmpty()) {
+            sb.append("\nPehle se mili details:")
+            for ((k, v) in prefill) {
+                sb.append("\n• ").append(DetailExtractor.label(k)).append(": ").append(v)
+            }
+        }
+        sendMessage(sb.toString())
+    }
+
     // send watchdog + retry
     private val sendWatchdog = Handler(Looper.getMainLooper())
     private var sendToken = 0
@@ -378,6 +441,44 @@ class AgentChatView(
             maxWidth = (resources.displayMetrics.widthPixels * 0.82).toInt()
         }
         wrap.addView(tv)
+        // v24 (C16): agent ki awaaz par HAR JAGAH repeat + mute.
+        if (!isUser) {
+            // bubble ka message text (neeche apply receivers `text` ko
+            // shadow karte hain — isliye pehle capture).
+            val msgText = text
+            val vrow = LinearLayout(context).apply {
+                orientation = HORIZONTAL
+                gravity = Gravity.START
+            }
+            val repeatBtn = Button(context).apply {
+                // NOTE: addBubble ka `text` param val hai — button label ke
+                // liye explicit `this.text`.
+                this.text = "🔁 Dobara suno (फिर सुनें)"
+                textSize = 11f
+                setOnClickListener {
+                    VoiceOutput.init(context)
+                    VoiceOutput.repeat(context, msgText)
+                }
+            }
+            val muteBtn = Button(context).apply {
+                this.text = if (VoiceOutput.isEnabled(context)) "🔇 Band karo (बंद)" else "🔊 Chalao (चालू)"
+                textSize = 11f
+                setOnClickListener {
+                    val on = !VoiceOutput.isEnabled(context)
+                    VoiceOutput.setEnabled(context, on)
+                    this.text = if (on) "🔇 Band karo (बंद)" else "🔊 Chalao (चालू)"
+                    toast(if (on) "Awaaz ON 🔊" else "Awaaz OFF 🔇")
+                }
+            }
+            vrow.addView(repeatBtn)
+            vrow.addView(
+                muteBtn,
+                LayoutParams(
+                    LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT
+                ).apply { setMargins(dp(6), 0, 0, 0) }
+            )
+            wrap.addView(vrow)
+        }
         messageList.addView(wrap)
         scrollToBottom()
     }
@@ -605,6 +706,26 @@ class AgentChatView(
         val fresh = candidates.filterKeys { !sessionDetails.containsKey(it) }
         if (fresh.isNotEmpty()) {
             sessionDetails.putAll(fresh)
+            // v24 #4: user ne details di par koi active/selected card nahi —
+            // details PendingDetails me SAFE (prefs, app kill par bhi), phir
+            // create-card par redirect offer. Koi detail beech me ghumti nahi.
+            if (activeCardId == null) {
+                val tag = activeCategory ?: "chat"
+                CardStore.pendingAddAll(context, fresh, tag)
+                (context as? Activity)?.let { act ->
+                    post {
+                        CardFlow.offerCreateCardForDetails(
+                            act, CardStore.pendingCount(context),
+                            onAgentCreate = { prefill ->
+                                onAgentCreateRequest?.invoke(prefill)
+                            },
+                            onCreated = { _, id, name, token ->
+                                setActiveCard(id, name, token)
+                            }
+                        )
+                    }
+                }
+            }
         }
         doSend(text)
     }
@@ -659,7 +780,11 @@ class AgentChatView(
         Thread {
             val res = try {
                 // v20 Task 5: active category ho to body me `category` bhejo
-                AgentApi.chat(context, history.toList(), activeCategory)
+                // v24: active card ho to body me `card_id` + X-Card-Token
+                AgentApi.chat(
+                    context, history.toList(), activeCategory,
+                    activeCardId, activeCardToken
+                )
             } catch (_: Exception) {
                 AgentApi.ApiResult(-1, null)
             }
@@ -729,10 +854,14 @@ class AgentChatView(
                                 "🔁 Dobara bhejo"
                             ) { lastFailedText?.let { doSend(it) } }
                         }
-                        // PERMANENT FULL APPROVAL (2026-09-25): server ka
-                        // draft_profile + needs_confirmation ab AUTO-CONFIRM —
-                        // koi verify/Proceed dialog nahi. PUT /api/agent/profile
-                        // (confirmed:true) seedha save karo.
+                        // v24: work details CARD me jayengi — purane profile store
+                        // (AgentApi.saveProfile) me NAHI. Rules:
+                        //  - active unlocked card ho → PATCH /api/cards/[id]
+                        //    (tag = category, fail ho to bhi details chat
+                        //    session me surakshit — khoyengi nahi).
+                        //  - koi card nahi → pending me rakho + create-card
+                        //    par bhejo (#4). Card system down (503) ho tab
+                        //    bhi chat nahi rukegi — details pending me safe.
                         val draftObj = json?.optJSONObject("draft_profile")
                         if (json?.optBoolean("needs_confirmation", false) == true &&
                             draftObj != null && draftObj.length() > 0
@@ -752,14 +881,63 @@ class AgentChatView(
                             }
                             if (draftMap.isNotEmpty()) {
                                 sessionDetails.putAll(draftMap)
-                                Thread {
-                                    val ok = try {
-                                        AgentApi.saveProfile(context, draftMap)
-                                    } catch (_: Exception) { false }
+                                val tag = activeCategory ?: "chat"
+                                val cid = activeCardId
+                                val tok = activeCardToken
+                                    ?: cid?.let { CardStore.token(it) }
+                                if (cid != null && !tok.isNullOrEmpty()) {
+                                    Thread {
+                                        val details = JSONObject()
+                                        for ((k, v) in draftMap) {
+                                            details.put(
+                                                k,
+                                                JSONObject().put("value", v)
+                                                    .put("tag", tag)
+                                            )
+                                        }
+                                        val r = try {
+                                            AgentApi.patchCard(context, cid, tok, details)
+                                        } catch (_: Exception) {
+                                            AgentApi.ApiResult(-1, null)
+                                        }
+                                        post {
+                                            toast(
+                                                if (r.code in 200..299)
+                                                    "✓ Details card me save ho gayi"
+                                                else "⚠️ Save me dikkat — details surakshit hain, baad me try karo"
+                                            )
+                                        }
+                                    }.start()
+                                } else {
+                                    // #4: card nahi → pending (khoyengi nahi)
+                                    // + create-card redirect.
+                                    CardStore.pendingAddAll(context, draftMap, tag)
                                     post {
-                                        toast(if (ok) "✓ Details save ho gayi" else "⚠️ Save me dikkat — baad me try karo")
+                                        val act = context as? Activity
+                                        if (act != null) {
+                                            CardFlow.offerCreateCardForDetails(
+                                                act, draftMap.size,
+                                                onAgentCreate = { prefill ->
+                                                    onAgentCreateRequest?.invoke(prefill)
+                                                },
+                                                onCreated = { _, id, name, token ->
+                                                    setActiveCard(id, name, token)
+                                                    // Naya card bana → pending
+                                                    // details tag ke saath
+                                                    // isi card me (auto).
+                                                    CardFlow.flushPendingDetails(
+                                                        act, id, token
+                                                    )
+                                                }
+                                            )
+                                        } else {
+                                            toast(
+                                                "🪪 Card banao — ${draftMap.size} " +
+                                                    "details surakshit rakhi hain"
+                                            )
+                                        }
                                     }
-                                }.start()
+                                }
                             }
                         }
                         val savedArr = json?.optJSONArray("saved")
@@ -785,10 +963,14 @@ class AgentChatView(
     fun startCategoryChat(
         category: String,
         label: String,
-        prefill: Map<String, String>
+        prefill: Map<String, String>,
+        cardId: String,
+        cardName: String,
+        cardToken: String
     ) {
         activeCategory = category
-        // B: popup details session me rakho — agent dobara na maange.
+        setActiveCard(cardId, cardName, cardToken)
+        // B: card details session me rakho — agent dobara na maange.
         // Ye intro message ke saath server ko bhi jati hain (history me).
         if (prefill.isNotEmpty()) sessionDetails.putAll(prefill)
         // A: is category message ke jawab me plan aaye to auto-start flow.
@@ -798,12 +980,15 @@ class AgentChatView(
             categoryChip.visibility = View.VISIBLE
         }
         val sb = StringBuilder("🔖 $label — is kaam me meri madad karo.")
+        sb.append("\n🪪 Card: $cardName (is card ki details use karo)")
         if (prefill.isNotEmpty()) {
-            sb.append("\nMeri details:")
+            sb.append("\nCard se mili details:")
             for ((k, v) in prefill) {
-                sb.append("\n• ").append(UiKit.fieldLabelFor(k)).append(": ").append(v)
+                sb.append("\n• ").append(DetailExtractor.label(k)).append(": ").append(v)
             }
         }
+        // v24 #1: three-way coordination — stage tracking shuru.
+        trackRunStage(label, cardName)
         sendMessage(sb.toString())
     }
 
@@ -1193,6 +1378,11 @@ class AgentChatView(
             return
         }
         val status = latest.optString("status", "")
+        // v24 #1: agent + operator + AI three-way coordination — har stage
+        // par user ko saaf Hinglish status (bubble + awaaz). Ye poll har 30s
+        // latest run dekhta hai; tracked category run ka stage badle to
+        // announce karo (repeat + mute bubble buttons se).
+        announceRunStage(latest, status)
         // A+C: stuck / blocker / needs_user — saaf rukho, batao, awaaz me sunao.
         // "failed" bhi blocker hai (pehle chup-chaap gayab ho jata tha).
         if (status == "needs_user" || status == "needs_attention" || status == "failed") {
@@ -1224,6 +1414,116 @@ class AgentChatView(
 
     private fun hideBanner() {
         if (::bannerBox.isInitialized) bannerBox.visibility = View.GONE
+    }
+
+    // ---------- v24 #1: three-way coordination (agent + operator + AI) ----------
+    //
+    // Jab automation operator atke, AI ke saath milkar aage badhe — app me
+    // ye dikhna chahiye: atakne par user ko saaf Hinglish status
+    // ("AI se samajh raha hun..."), phir naya plan execute ho; teeno ka
+    // coordination toote nahi, aur user ko har stage par pata rahe kya ho
+    // raha hai (repeat + mute wali awaaz ke saath).
+    //
+    // Implementation: category kaam shuru hote hi trackRunStage(); har 30s
+    // poll me latest run ka stage badle to chat bubble + voice announce.
+
+    private var trackedLabel: String? = null
+    private var trackedCardName: String? = null
+    private var trackedSinceMs: Long = 0L
+    private var lastStageKey: String? = null
+    private var lastMilestone: Int = 0
+
+    private fun trackRunStage(label: String, cardName: String) {
+        trackedLabel = label
+        trackedCardName = cardName
+        trackedSinceMs = System.currentTimeMillis()
+        lastStageKey = null
+        lastMilestone = 0
+    }
+
+    private fun stopTracking() {
+        trackedLabel = null
+        trackedCardName = null
+        lastStageKey = null
+        lastMilestone = 0
+    }
+
+    private fun announceRunStage(latest: JSONObject, status: String) {
+        val label = trackedLabel ?: return
+        val card = trackedCardName ?: "Card"
+        // 30 min se purana tracking — band karo (stale).
+        if (System.currentTimeMillis() - trackedSinceMs > 30 * 60 * 1000L) {
+            stopTracking()
+            return
+        }
+        // Ye run hamara hai? — tracking shuru hone ke aas-paas bana ho.
+        val createdAt = latest.optString("created_at", "")
+        val ours = try {
+            if (createdAt.isEmpty()) true // field na ho to latest ko apna mano
+            else {
+                val t = java.time.Instant.parse(createdAt).toEpochMilli()
+                t >= trackedSinceMs - 120_000L
+            }
+        } catch (_: Exception) { true }
+        if (!ours) return
+
+        val runId = latest.optString("run_id").ifEmpty { latest.optString("id") }
+        val steps = runFd(latest)?.optInt("steps_taken", 0) ?: 0
+        val key = "$runId|$status"
+        val prevKey = lastStageKey
+
+        // Milestone: har 5 steps par halki khabar (spam nahi).
+        val milestone = (steps / 5) * 5
+        if (status == "running" || status == "in_progress") {
+            if (milestone > lastMilestone && milestone > 0) {
+                lastMilestone = milestone
+                val msg = "⚙️ Step $steps — kaam chal raha hai 🪪 $card"
+                addAssistantBubble(msg)
+                // Milestone par awaaz nahi (zyada bolega) — bubble hi kaafi.
+            }
+        }
+
+        if (key == prevKey) return
+        lastStageKey = key
+        when (status) {
+            "running", "in_progress", "started" -> {
+                if (prevKey == null) {
+                    val msg = "🚀 Kaam shuru — 🪪 $card\n" +
+                        "Main steps chala raha hun, tum dekhte raho. " +
+                        "Atkunga to 🧠 AI se samajhkar naya plan banaunga."
+                    addAssistantBubble(msg)
+                    VoiceOutput.speak(context, "Kaam shuru ho gaya. Main steps chala raha hun.")
+                } else if (prevKey.endsWith("needs_user") ||
+                    prevKey.endsWith("needs_attention")
+                ) {
+                    // Atakne ke baad wapas chala — AI ke saath naya plan.
+                    val msg = "🔄 Naya plan mil gaya — 🧠 AI ke saath milkar phir se try kar raha hun."
+                    addAssistantBubble(msg)
+                    VoiceOutput.speak(context, "Naya plan mil gaya. Phir se try kar raha hun.")
+                }
+            }
+            "needs_user", "needs_attention" -> {
+                // Banner + VoiceHelp pehle se stuck announce karte hain —
+                // yahan sirf coordination bubble (double awaaz nahi).
+                addAssistantBubble(
+                    "😟 Main yahan atak gaya hun — 🧠 AI se dobara samajh raha hun.\n" +
+                        "Upar banner me dekho — tumhari madad chahiye to wahan batao."
+                )
+            }
+            "done", "completed", "success" -> {
+                val msg = "✅ Ho gaya! ($label)\nProof History me dekh sakte ho."
+                addAssistantBubble(msg)
+                VoiceOutput.speak(context, "Ho gaya! Kaam poora ho gaya.")
+                stopTracking()
+            }
+            "failed", "error", "cancelled" -> {
+                addAssistantBubble(
+                    "❌ Ye kaam poora nahi ho paya.\n" +
+                        "Upar banner me wajah dekho — 🔁 se dobara try kar sakte ho."
+                )
+                stopTracking()
+            }
+        }
     }
 
     private fun retryTask() {

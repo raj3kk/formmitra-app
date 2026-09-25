@@ -14,26 +14,28 @@ package com.formmitra.app.agent
  */
 object DetailExtractor {
 
+    // v24 (D17): sab labels English (Hindi) bilingual.
     private val LABELS = linkedMapOf(
-        "full_name" to "Naam",
-        "phone" to "Phone",
-        "email" to "Email",
-        "dob" to "Janm tithi",
-        "pincode" to "Pincode",
-        "address" to "Pata",
-        // v20: A-to-Z vault profile form ke labels (display/order ke liye;
-        // extract() ke patterns nahi badle — sirf label() aur orderedKeys()).
-        "father_name" to "Pita ka naam",
-        "mother_name" to "Mata ka naam",
-        "gender" to "Ling",
-        "village" to "Gaon",
-        "post" to "Post",
-        "district" to "Zila",
-        "state" to "Rajya",
-        "qualification" to "Yogyata",
-        "occupation" to "Pesha",
-        "category_caste" to "Category/Jati",
-        "id_numbers" to "ID numbers"
+        "full_name" to "Naam (नाम)",
+        "phone" to "Phone (फ़ोन)",
+        "email" to "Email (ईमेल)",
+        "dob" to "Janm tithi (जन्म तिथि)",
+        "pincode" to "Pincode (पिनकोड)",
+        "address" to "Pata (पता)",
+        "father_name" to "Pita ka naam (पिता का नाम)",
+        "mother_name" to "Mata ka naam (माता का नाम)",
+        "gender" to "Ling (लिंग)",
+        "village" to "Gaon (गांव)",
+        "post" to "Post (डाकघर)",
+        "district" to "Zila (ज़िला)",
+        "state" to "Rajya (राज्य)",
+        "qualification" to "Yogyata (योग्यता)",
+        "occupation" to "Pesha (पेशा)",
+        "category_caste" to "Category/Jati (श्रेणी/जाति)",
+        "id_numbers" to "ID numbers (पहचान संख्या)",
+        "khata" to "Khata (खाता)",
+        "khesra" to "Khesra (खेसरा)",
+        "mauza" to "Mauza (मौज़ा)"
     )
 
     fun label(key: String): String = LABELS[key] ?: key

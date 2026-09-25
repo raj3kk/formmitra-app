@@ -24,6 +24,9 @@ object AgentResume {
     private const val K_CATEGORY = "pending_category"
     private const val K_STEPS = "pending_steps_taken"
     private const val K_SUMMARY = "pending_summary"
+    // v24 N5: stuck-resume detection ke liye timestamps (ms).
+    private const val K_STARTED_AT = "pending_started_at"
+    private const val K_LAST_PROGRESS_AT = "pending_last_progress_at"
 
     data class PendingRun(
         val goal: String,
@@ -32,7 +35,9 @@ object AgentResume {
         val runId: String,
         val category: String,
         val stepsTaken: Int,
-        val summary: String
+        val summary: String,
+        val startedAt: Long,
+        val lastProgressAt: Long
     )
 
     fun save(
@@ -44,6 +49,7 @@ object AgentResume {
         category: String = ""
     ) {
         try {
+            val now = System.currentTimeMillis()
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .putString(K_GOAL, goal)
                 .putString(K_URL, url)
@@ -52,6 +58,8 @@ object AgentResume {
                 .putString(K_CATEGORY, category)
                 .putInt(K_STEPS, 0)
                 .putString(K_SUMMARY, "")
+                .putLong(K_STARTED_AT, now)
+                .putLong(K_LAST_PROGRESS_AT, now)
                 .commit() // L2: sync — kill/crash par bhi resume state pakki
         } catch (_: Exception) {
         }
@@ -63,6 +71,7 @@ object AgentResume {
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .putInt(K_STEPS, stepsTaken)
                 .putString(K_SUMMARY, summary.take(300))
+                .putLong(K_LAST_PROGRESS_AT, System.currentTimeMillis())
                 .commit() // L2: sync — har step ki progress pakki save
         } catch (_: Exception) {
         }
@@ -81,7 +90,9 @@ object AgentResume {
                 runId = p.getString(K_RUN_ID, "") ?: "",
                 category = p.getString(K_CATEGORY, "") ?: "",
                 stepsTaken = p.getInt(K_STEPS, 0),
-                summary = p.getString(K_SUMMARY, "") ?: ""
+                summary = p.getString(K_SUMMARY, "") ?: "",
+                startedAt = p.getLong(K_STARTED_AT, 0),
+                lastProgressAt = p.getLong(K_LAST_PROGRESS_AT, 0)
             )
         } catch (_: Exception) {
             null
@@ -94,6 +105,7 @@ object AgentResume {
                 .remove(K_GOAL).remove(K_URL).remove(K_TASK_ID)
                 .remove(K_RUN_ID).remove(K_CATEGORY)
                 .remove(K_STEPS).remove(K_SUMMARY)
+                .remove(K_STARTED_AT).remove(K_LAST_PROGRESS_AT)
                 .commit() // L2: sync — clear bhi pakka
         } catch (_: Exception) {
         }

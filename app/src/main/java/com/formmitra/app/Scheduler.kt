@@ -36,12 +36,38 @@ object Scheduler {
     }
 
     /**
-     * WorkingMode OFF: saare scheduled background workers cancel.
-     * (Sirf is app ke WorkManager jobs — OS-level kuch nahi.)
+     * v24 N2: notification polling fallback — har 15 min, background me bhi.
+     * Sirf NOTIFICATIONS (koi execution nahi), isliye Working Mode OFF par
+     * bhi schedule rehta hai — kaam ke updates (task/done/fail/needs_user)
+     * OFF par bhi aate rahenge. FCM primary hai, ye uska fallback.
+     * Idempotent (KEEP) — FmApp + BootReceiver dono se safe.
+     */
+    fun scheduleNotifPoll(ctx: Context) {
+        try {
+            val constraints = Constraints.Builder()
+                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .build()
+            val req = PeriodicWorkRequestBuilder<NotifPollWorker>(15, TimeUnit.MINUTES)
+                .setConstraints(constraints)
+                .build()
+            WorkManager.getInstance(ctx).enqueueUniquePeriodicWork(
+                "formmitra-notif-poll", ExistingPeriodicWorkPolicy.KEEP, req
+            )
+        } catch (_: Exception) { }
+    }
+
+    /**
+     * WorkingMode OFF: background AUTOMATION band — form-task poll + digest
+     * cancel. v24 N2: notification poll ("formmitra-notif-poll") CANCEL NAHI
+     * hota — wo sirf notifications hai, execution nahi; OFF par bhi kaam
+     * ke updates aate rahenge. (Pehle cancelAllWork() sab udata tha —
+     * targeted cancel hi sahi hai.)
      */
     fun cancelAll(ctx: Context) {
         try {
-            WorkManager.getInstance(ctx).cancelAllWork()
+            val wm = WorkManager.getInstance(ctx)
+            wm.cancelUniqueWork("formmitra-form-tasks")
+            wm.cancelUniqueWork("formmitra-digest")
         } catch (_: Exception) { }
     }
 

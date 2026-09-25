@@ -22,13 +22,17 @@ object AgentActions {
         "wait_for_text", "wait_for_element", "wait_for_navigation",
         "back", "forward",
         "upload", "scroll", "screenshot", "captcha_detect", "captcha_solve",
+        // v24 C15: final submit — click se pehle AI image-verification
+        // (POST /api/agent/verify) ke baad hi execute hota hai.
+        "verify_submit",
         "done", "needs_user", "vetoed"
     )
     /** Terminal actions — execute nahi hote, loop finish karte hain. */
     val TERMINAL = setOf("done", "needs_user", "vetoed")
     /** Jin actions ke liye selector.value zaroori hai. */
     val NEEDS_SELECTOR = setOf(
-        "fill", "select", "toggle", "press", "click", "wait_for_element"
+        "fill", "select", "toggle", "press", "click", "wait_for_element",
+        "verify_submit"
     )
     /** FormEngine ke supported selector modes (finderJs wala set). */
     val SELECTOR_MODES = setOf(
@@ -51,8 +55,48 @@ object AgentActions {
         "scroll" to "scroll",
         "screenshot" to "screenshot",
         "captcha_detect" to "captcha_detect",
-        "captcha_solve" to "captcha_solve"
+        "captcha_solve" to "captcha_solve",
+        // v24 C15: verify_submit execute hota hai click ki tarah — par
+        // usse PEHLE AgentLoop me AI image-verification hoti hai.
+        "verify_submit" to "click"
     )
+
+    /**
+     * v24 C15 — SubmitIntent: ye step final submit hai ya nahi?
+     *
+     * Server explicit bhej sakta hai: action="verify_submit".
+     * Safety net: click/press step jiske reason/label/text/selector me
+     * final-submit jaisa strong hint ho (submit application, place order,
+     * pay now...). Akele "submit" shabd par trigger NAHI (search-form
+     * jaise false positive se bachne ke liye) — wahan server ko explicit
+     * verify_submit bhejna chahiye.
+     */
+    object SubmitIntent {
+        private val HINTS = listOf(
+            "final submit", "submit application", "submit form",
+            "place order", "pay now", "confirm payment", "proceed to pay",
+            "make payment", "confirm booking", "confirm and pay",
+            "book now", "apply now", "complete application"
+        )
+
+        @Suppress("UNCHECKED_CAST")
+        fun shouldVerify(step: Map<String, Any?>): Boolean {
+            val action = (step["action"] as? String)?.trim() ?: ""
+            if (action == "verify_submit") return true
+            if (action != "click" && action != "press") return false
+            val sel = step["selector"] as? Map<String, Any?>
+            val blob = buildString {
+                append((step["reason"] as? String) ?: "")
+                append(' ')
+                append((step["label"] as? String) ?: "")
+                append(' ')
+                append((step["text"] as? String) ?: "")
+                append(' ')
+                append((sel?.get("value") as? String) ?: "")
+            }.lowercase()
+            return HINTS.any { it in blob }
+        }
+    }
     /** Confidence isse kam ho to step reject (andha action nahi chalega). */
     const val MIN_CONFIDENCE = 0.55
     /** Lagatar itne repeat signatures = stuck. */
@@ -98,8 +142,7 @@ fun validateAgentStep(step: Map<String, Any?>): String? {
     return null
 }
 
-/** Stuck detection ke liye step signature: action|mode:value|value|option|url */
-@Suppress("UNCHECKED_CAST")
+/** Stuck detection ke liye step signature: action|mode:value|value|option|url */@Suppress("UNCHECKED_CAST")
 fun agentStepSig(step: Map<String, Any?>): String {
     val sel = step["selector"] as? Map<String, Any?>
     val mode = (sel?.get("mode") as? String) ?: ""

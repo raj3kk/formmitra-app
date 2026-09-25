@@ -79,6 +79,8 @@ object StepParser {
         "goto", "fill", "select", "toggle", "press", "click",
         "wait_for_element", "wait_for_text", "wait_for_navigation",
         "screenshot", "captcha_detect", "captcha_solve", "back", "forward",
+        // v24 C15: explicit final-submit (click se pehle AI verification).
+        "verify_submit",
         "upload", "scroll"
     )
 

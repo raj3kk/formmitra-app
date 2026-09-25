@@ -21,6 +21,13 @@ class BootReceiver : BroadcastReceiver() {
             } catch (t: Throwable) {
                 Log.e("BootReceiver", "WorkingMode.apply failed (non-fatal)", t)
             }
+            // v24 N2: notification polling fallback reboot par bhi lagao —
+            // Working Mode se independent (OFF par bhi updates aayenge).
+            try {
+                com.formmitra.app.Scheduler.scheduleNotifPoll(context)
+            } catch (t: Throwable) {
+                Log.e("BootReceiver", "scheduleNotifPoll failed (non-fatal)", t)
+            }
             // Standalone (offline) tasks: reboot par dobara uthao — ye poori
             // tarah local hain, isliye auto-resume safe hai.
             try {

@@ -43,6 +43,12 @@
             android:name=".engine.FormRunService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <!-- v24 N1: Working Mode ON par persistent notification (foreground
+             service). FOREGROUND_SERVICE permission upar declared hai. -->
+        <service
+            android:name=".agent.WorkingModeService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
         <!-- J1: FCM push receive (Firebase project clip-flow-685a5 reuse).
              FCM configured na ho to ye service kabhi trigger nahi hoti —
              polling fallback tab bhi kaam karta hai. -->

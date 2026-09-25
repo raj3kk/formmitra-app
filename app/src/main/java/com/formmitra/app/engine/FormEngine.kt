@@ -394,6 +394,9 @@ class FormEngine(private val appContext: Context) {
             "toggle" -> toggleCheck(s)
             "press" -> pressKey(s)
             "click" -> clickEl(s)
+            // v24 C15: engine-level par verify_submit = click (AI
+            // verification gate AgentLoop me lagta hai, yahan nahi).
+            "verify_submit" -> clickEl(s)
             "wait_for_element" -> {
                 waitForElement(s); JSONObject().put("waited_for", "element")
             }

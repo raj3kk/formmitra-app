@@ -94,7 +94,14 @@ class FormRunService : Service() {
         }
         val name = task.optString("name", "form")
         ensureChannel()
-        startForeground(NOTIF_ID, buildNotif("Form bhar raha hai: $name", "Kaam chal raha hai…"))
+        // v24 N3: live work status — "working, don't close (बंद मत करो)".
+        startForeground(
+            NOTIF_ID,
+            buildNotif(
+                "Form bhar raha hai: $name",
+                "Kaam chal raha hai — band mat karo (don't close)"
+            )
+        )
         notifySimple(NOTIF_ID + 10, "Form bharna shuru: $name", "FormMitra automation kaam kar raha hai")
         // L4: flow milestone — TTS + notification
         try {
@@ -114,11 +121,24 @@ class FormRunService : Service() {
             stopSelf(startId)
             return START_NOT_STICKY
         }
+        // v24 N3: claim jeeta — persistent notification me live status.
+        try {
+            com.formmitra.app.agent.WorkingModeService.updateLiveStatus(
+                this,
+                "Form bhar raha hai: $name",
+                "Shuru ho raha hai… — working, don't close (बंद मत करो)"
+            )
+        } catch (_: Exception) { }
         runThread = Thread({
             try {
                 runTask(task, name)
             } finally {
                 releaseClaim(claimId)
+                // v24 N3: kaam khatam — persistent notification wapas
+                // welcome text par.
+                try {
+                    com.formmitra.app.agent.WorkingModeService.clearLiveStatus(this)
+                } catch (_: Exception) { }
             }
             stopSelf(startId)
         }, "formmitra-run").also { it.start() }
@@ -350,7 +370,14 @@ class FormRunService : Service() {
 
     private fun updateOngoing(title: String, text: String) {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(NOTIF_ID, buildNotif(title, text))
+        // v24 N3: live status — dono notifications me "don't close".
+        val live = "$text — band mat karo (don't close)"
+        nm.notify(NOTIF_ID, buildNotif(title, live))
+        try {
+            com.formmitra.app.agent.WorkingModeService.updateLiveStatus(
+                this, title, "$text — working, don't close (बंद मत करो)"
+            )
+        } catch (_: Exception) { }
     }
 
     private fun notifySimple(id: Int, title: String, text: String) {

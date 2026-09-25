@@ -38,7 +38,20 @@ object AgentApi {
         null
     }
 
-    private fun open(path: String, method: String, ctx: Context): HttpURLConnection {
+    private fun open(path: String, method: String, ctx: Context): HttpURLConnection =
+        open(path, method, ctx, null)
+
+    /**
+     * v24: card-scoped calls ke liye X-Card-Token header (unlock ke baad
+     * milta hai, ~30 min valid). Header naam contract me "x-card-token"
+     * (HTTP headers case-insensitive hain).
+     */
+    private fun open(
+        path: String,
+        method: String,
+        ctx: Context,
+        cardToken: String?
+    ): HttpURLConnection {
         val url = URL(BuildConfig.SITE_URL.trimEnd('/') + path)
         val conn = (url.openConnection() as HttpURLConnection).apply {
             connectTimeout = TIMEOUT_MS
@@ -47,6 +60,9 @@ object AgentApi {
             setRequestProperty("X-Device-Id", FormApi.deviceId(ctx))
             setRequestProperty("Accept", "application/json")
             sessionCookie()?.let { setRequestProperty("Cookie", it) }
+            if (!cardToken.isNullOrEmpty()) {
+                setRequestProperty("X-Card-Token", cardToken)
+            }
         }
         return conn
     }
@@ -63,8 +79,17 @@ object AgentApi {
         ctx: Context,
         body: JSONObject,
         timeoutMs: Int
+    ): ApiResult = postWithTimeout(path, ctx, body, timeoutMs, null)
+
+    /** v24: cardToken diya to X-Card-Token header jayega. */
+    private fun postWithTimeout(
+        path: String,
+        ctx: Context,
+        body: JSONObject,
+        timeoutMs: Int,
+        cardToken: String?
     ): ApiResult {
-        val conn = open(path, "POST", ctx)
+        val conn = open(path, "POST", ctx, cardToken)
         conn.connectTimeout = timeoutMs
         conn.readTimeout = timeoutMs
         return try {
@@ -96,7 +121,7 @@ object AgentApi {
      * backoff) — 401/429/4xx par kabhi retry nahi.
      */
     fun act(ctx: Context, body: JSONObject): ApiResult =
-        postTransientRetry("/api/agent/act", ctx, body, 60_000)
+        postTransientRetry("/api/agent/act", ctx, body, 60_000, automationCardToken)
 
     /**
      * POST /api/agent/captcha — CAPTCHA protocol (AI sirf analyze karta hai).
@@ -105,7 +130,29 @@ object AgentApi {
      * Timeout 60s. Transient-only retry act() jaisa.
      */
     fun captcha(ctx: Context, body: JSONObject): ApiResult =
-        postTransientRetry("/api/agent/captcha", ctx, body, 60_000)
+        postTransientRetry("/api/agent/captcha", ctx, body, 60_000, automationCardToken)
+
+    /**
+     * v24: card-bound automation ke liye token. AgentChatView card select
+     * karke kaam shuru kare to set karta hai (unlock ke baad mila token);
+     * act()/captcha() calls me X-Card-Token jata hai taaki server brain
+     * card ka data fetch karke form bhar sake (C15). Category hatane par
+     * AgentChatView ise null karta hai.
+     */
+    @Volatile var automationCardToken: String? = null
+
+    /**
+     * v24: card-bound automation bind/unbind. Card select + unlock ke baad
+     * AgentChatView.setActiveCard() se call hota hai; act()/captcha() me
+     * X-Card-Token jata hai taaki server brain card ka data fetch karke
+     * form bhar sake. null = unbind.
+     */
+    fun setAutomationCard(cardId: String?, cardToken: String?) {
+        automationCardId = cardId
+        automationCardToken = cardToken
+    }
+
+    @Volatile var automationCardId: String? = null
 
     /**
      * Transient-only bounded retry: network fail (-1) ya HTTP 5xx par ek
@@ -116,24 +163,37 @@ object AgentApi {
         ctx: Context,
         body: JSONObject,
         timeoutMs: Int
+    ): ApiResult = postTransientRetry(path, ctx, body, timeoutMs, null)
+
+    /** v24: cardToken diya to X-Card-Token header ke saath retry. */
+    private fun postTransientRetry(
+        path: String,
+        ctx: Context,
+        body: JSONObject,
+        timeoutMs: Int,
+        cardToken: String?
     ): ApiResult {
-        val first = postWithTimeout(path, ctx, body, timeoutMs)
+        val first = postWithTimeout(path, ctx, body, timeoutMs, cardToken)
         val transient = first.code == -1 || first.code in 500..599
         if (!transient) return first
         try {
             Thread.sleep(2000)
         } catch (_: Exception) { }
-        return postWithTimeout(path, ctx, body, timeoutMs)
+        return postWithTimeout(path, ctx, body, timeoutMs, cardToken)
     }
 
     /** POST /api/agent/chat — poora history bhejo, reply + plan|null + missing_docs wapas.
      * v20: category optional — work-wise category context (apply_track,
      * zamin_track, resume_create, job_find, scholarship). Server isi field
-     * se category-wise sawaal puchhta hai. null = purana flow (unchanged). */
+     * se category-wise sawaal puchhta hai. null = purana flow (unchanged).
+     * v24: cardId/cardToken — card-bound chat (C14): body me card_id jata
+     * hai + X-Card-Token header, taaki server card ka data use kare. */
     fun chat(
         ctx: Context,
         messages: List<Pair<String, String>>,
-        category: String? = null
+        category: String? = null,
+        cardId: String? = null,
+        cardToken: String? = null
     ): ApiResult {
         val arr = JSONArray()
         for ((role, content) in messages) {
@@ -141,7 +201,8 @@ object AgentApi {
         }
         val body = JSONObject().put("messages", arr)
         if (!category.isNullOrEmpty()) body.put("category", category)
-        return post("/api/agent/chat", ctx, body)
+        if (!cardId.isNullOrEmpty()) body.put("card_id", cardId)
+        return postWithTimeout("/api/agent/chat", ctx, body, TIMEOUT_MS, cardToken)
     }
 
     /** POST /api/app/form-tasks — sirf goto step; returns (code, taskId).
@@ -386,5 +447,224 @@ object AgentApi {
             .put("payment", payment)
         val res = patch("/api/agent/runs", ctx, body)
         return res.code in 200..299
+    }
+
+    // ---------------- v24: FormMitra Cards (frozen contract) ----------------
+    //
+    //  GET    /api/cards → {cards:[{id, formmitra_id, name, created_at,
+    //                             details_keys, docs_count}]}
+    //  POST   /api/cards {name, pin(4-8 digits), via:"manual"|"agent",
+    //                     details?} → 201 {card:{id, formmitra_id, name,
+    //                     created_at}} ; 4 cards par 400 {error:"card_limit"}
+    //  POST   /api/cards/[id]/unlock {pin} → 200 {ok:true, card_token,
+    //                     expires_at} / 403
+    //  GET    /api/cards/[id] (x-card-token) → full card + details
+    //                     {field:{value,tag,updated_at}}
+    //  PATCH  /api/cards/[id] (x-card-token) {details:{field:value|{value,tag}}}
+    //  DELETE /api/cards/[id] {confirm:true}
+    //  GET    /api/cards/[id]/documents (x-card-token)
+    //  POST   /api/cards/[id]/documents (x-card-token) — multipart file + tag
+    //  DELETE /api/cards/[id]/documents/[docId] (x-card-token) {confirm:true}
+    // Session-auth: bina login 401.
+
+    /** GET /api/cards — apne cards ki list (FormMitra ID ke saath). */
+    fun cards(ctx: Context): ApiResult = get("/api/cards", ctx)
+
+    /**
+     * POST /api/cards — naya card.
+     * @return ApiResult (201 → json.card; 400 error:"card_limit" → 4 ho gaye)
+     */
+    fun createCard(
+        ctx: Context,
+        name: String,
+        pin: String,
+        via: String,
+        details: Map<String, String> = emptyMap()
+    ): ApiResult {
+        val body = JSONObject()
+            .put("name", name)
+            .put("pin", pin)
+            .put("via", via)
+        if (details.isNotEmpty()) {
+            val d = JSONObject()
+            for ((k, v) in details) d.put(k, v)
+            body.put("details", d)
+        }
+        return post("/api/cards", ctx, body)
+    }
+
+    /** POST /api/cards/[id]/unlock {pin} → 200 {ok, card_token, expires_at}. */
+    fun unlockCard(ctx: Context, cardId: String, pin: String): ApiResult =
+        post("/api/cards/$cardId/unlock", ctx, JSONObject().put("pin", pin))
+
+    /** GET /api/cards/[id] — full card + details (x-card-token). */
+    fun cardDetail(ctx: Context, cardId: String, token: String): ApiResult =
+        getWithToken("/api/cards/$cardId", ctx, token)
+
+    /**
+     * PATCH /api/cards/[id] — details merge (x-card-token).
+     * details: JSONObject {field: value | {value, tag}}.
+     */
+    fun patchCard(ctx: Context, cardId: String, token: String, details: JSONObject): ApiResult =
+        patchWithToken(
+            "/api/cards/$cardId", ctx,
+            JSONObject().put("details", details), token
+        )
+
+    /** DELETE /api/cards/[id] {confirm:true}. */
+    fun deleteCard(ctx: Context, cardId: String): ApiResult =
+        delete("/api/cards/$cardId", ctx, JSONObject().put("confirm", true))
+
+    /** GET /api/cards/[id]/documents (x-card-token). */
+    fun cardDocs(ctx: Context, cardId: String, token: String): ApiResult =
+        getWithToken("/api/cards/$cardId/documents", ctx, token)
+
+    /**
+     * POST /api/cards/[id]/documents — file upload (x-card-token).
+     * multipart/form-data: file (binary) + tag (text). Server isi ko
+     * accept kare (frozen contract me body format nahi tha — ye standard
+     * file-upload format hai; conformance check me verify hoga).
+     */
+    fun uploadCardDoc(
+        ctx: Context,
+        cardId: String,
+        token: String,
+        fileName: String,
+        mime: String,
+        bytes: ByteArray,
+        tag: String
+    ): ApiResult {
+        val boundary = "fm${System.currentTimeMillis()}"
+        val conn = open("/api/cards/$cardId/documents", "POST", ctx, token)
+        return try {
+            conn.doOutput = true
+            conn.connectTimeout = 60_000
+            conn.readTimeout = 60_000
+            conn.setRequestProperty(
+                "Content-Type", "multipart/form-data; boundary=$boundary"
+            )
+            conn.outputStream.use { out ->
+                fun w(s: String) = out.write(s.toByteArray(Charsets.UTF_8))
+                w("--$boundary\r\n")
+                w("Content-Disposition: form-data; name=\"tag\"\r\n\r\n")
+                w("$tag\r\n")
+                w("--$boundary\r\n")
+                w("Content-Disposition: form-data; name=\"file\"; filename=\"$fileName\"\r\n")
+                w("Content-Type: ${mime.ifEmpty { "application/octet-stream" }}\r\n\r\n")
+                out.write(bytes)
+                w("\r\n--$boundary--\r\n")
+                out.flush()
+            }
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            val json = try { if (text.isNotBlank()) JSONObject(text) else null }
+            catch (_: Exception) { null }
+            ApiResult(code, json)
+        } catch (_: Exception) {
+            ApiResult(-1, null)
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    /** DELETE /api/cards/[id]/documents/[docId] {confirm:true} (x-card-token). */
+    fun deleteCardDoc(
+        ctx: Context,
+        cardId: String,
+        docId: String,
+        token: String
+    ): ApiResult = deleteWithToken(
+        "/api/cards/$cardId/documents/$docId", ctx,
+        JSONObject().put("confirm", true), token
+    )
+
+    /**
+     * POST /api/agent/verify — final submit se pehle AI image-verification
+     * (C15). Req {run_id, screenshot_b64, note} → {ok, verdict?, reason?}.
+     * 401 bina login. Server deploy na hua ho to 404 — caller fail-soft
+     * rakhe (verify na ho to bhi automation na ruke, bas log).
+     */
+    fun verifySubmit(
+        ctx: Context,
+        runId: String,
+        screenshotB64: String,
+        note: String
+    ): ApiResult = postWithTimeout(
+        "/api/agent/verify", ctx,
+        JSONObject()
+            .put("run_id", runId)
+            .put("screenshot_b64", screenshotB64)
+            .put("note", note.take(500)),
+        60_000, automationCardToken
+    )
+
+    // ---------- v24 token-aware helpers ----------
+
+    private fun getWithToken(path: String, ctx: Context, token: String): ApiResult {
+        val conn = open(path, "GET", ctx, token)
+        return try {
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            val json = try { if (text.isNotBlank()) JSONObject(text) else null }
+            catch (_: Exception) { null }
+            ApiResult(code, json)
+        } catch (_: Exception) {
+            ApiResult(-1, null)
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun patchWithToken(
+        path: String,
+        ctx: Context,
+        body: JSONObject,
+        token: String
+    ): ApiResult {
+        val conn = open(path, "PATCH", ctx, token)
+        return try {
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            val json = try { if (text.isNotBlank()) JSONObject(text) else null }
+            catch (_: Exception) { null }
+            ApiResult(code, json)
+        } catch (_: Exception) {
+            ApiResult(-1, null)
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun delete(path: String, ctx: Context, body: JSONObject): ApiResult =
+        deleteWithToken(path, ctx, body, null)
+
+    private fun deleteWithToken(
+        path: String,
+        ctx: Context,
+        body: JSONObject,
+        token: String?
+    ): ApiResult {
+        val conn = open(path, "DELETE", ctx, token)
+        return try {
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            val json = try { if (text.isNotBlank()) JSONObject(text) else null }
+            catch (_: Exception) { null }
+            ApiResult(code, json)
+        } catch (_: Exception) {
+            ApiResult(-1, null)
+        } finally {
+            conn.disconnect()
+        }
     }
 }

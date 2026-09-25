@@ -119,6 +119,20 @@ class FmApp : Application(), Configuration.Provider {
         } catch (t: Throwable) {
             Log.e("FmApp", "FcmPush.ensureInit failed (non-fatal)", t)
         }
+        // v24 N2: notification polling fallback — Working Mode se independent
+        // (OFF par bhi kaam ke updates aate rahenge; koi execution nahi).
+        try {
+            com.formmitra.app.Scheduler.scheduleNotifPoll(this)
+        } catch (t: Throwable) {
+            Log.e("FmApp", "scheduleNotifPoll failed (non-fatal)", t)
+        }
+        // v24 A3: TTS warm-init — app khulte hi background me engine ready,
+        // taaki pehla agent jawab der se na bole (FIFO queue khoye nahi).
+        try {
+            com.formmitra.app.agent.VoiceOutput.warmup(this)
+        } catch (t: Throwable) {
+            Log.e("FmApp", "VoiceOutput.warmup failed (non-fatal)", t)
+        }
     }
 
     override val workManagerConfiguration: Configuration

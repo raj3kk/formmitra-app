@@ -76,6 +76,12 @@ class MainActivity : Activity() {
     private var activePath = "/"
     private var isOwner = false
 
+    // v24 #2: "Through Agent" card-create ke dauraan yaad rakhi category —
+    // card banne ke baad kaam auto-continue ho.
+    private var pendingCatKey: String? = null
+    private var pendingCatLabel: String? = null
+    private var pendingCatKnownIds: Set<String> = emptySet()
+
     private val ownerEmail = "priyadarshirajindia@gmail.com"
 
     private val baseTabs = listOf(
@@ -159,27 +165,31 @@ class MainActivity : Activity() {
             webViewOk = false
         }
 
-        // Home: native — services strip + live button + Mitra chat
+        // Home: native — work categories (card-first) + live button + Mitra chat
         agentChatView = AgentChatView(
             this,
             { url -> openLinkInWebView(url) },
             { selectTab("/profile") }
         )
+        // v24 #2: chat se "Through Agent" card-create → yahin chat khulta hai.
+        agentChatView.onAgentCreateRequest = { prefill ->
+            onAgentCreateCard(null, null, prefill)
+        }
         homeView = HomeView(
             this,
             agentChatView,
-            onOpenService = { path -> selectTab(path) },
-            onOpenTab = { target ->
-                if (target == "vault") openProfileVault()
-                else selectTab(target)
+            // v24 B8/C14: category card → card-first flow complete hone par
+            // card bind + category chat start (prefill card se).
+            onStartCategory = { category, label, prefill, cardId, cardName, cardToken ->
+                startCategoryWork(category, label, prefill, cardId, cardName, cardToken)
             },
-            // v20 Task 5: work-category card → pehle Home dikhao, phir chat
-            // usi category context me kholo (body me `category` jayega)
-            onStartCategory = { category, label, prefill ->
-                if (!homeVisible) selectTab("/")
-                agentChatView.startCategoryChat(category, label, prefill)
-            },
-            onShowMirror = { showMirror() }
+            onShowMirror = { showMirror() },
+            onOpenProfile = { selectTab("/profile") },
+            // v24 #2: "Through Agent" chuna — category yaad rakho taaki
+            // card banne ke baad kaam auto-continue ho sake.
+            onAgentCreateCard = { catKey, catLabel, prefill ->
+                onAgentCreateCard(catKey, catLabel, prefill)
+            }
         ).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
@@ -209,6 +219,11 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
             )
             visibility = View.GONE
+        }
+        // v24 #2: Profile ke "Through Agent" se card-create → chat kholo.
+        profileView.onAgentCreateRequest = { prefill ->
+            selectTab("/")
+            agentChatView.startAgentCardCreate(prefill)
         }
         root.addView(profileView)
 
@@ -369,6 +384,11 @@ class MainActivity : Activity() {
         // App-wide prompt poller: user kisi bhi tab me ho, agent ka sawal
         // (OTP/input/choice/payment) popup me aayega.
         promptHandler.post(promptPollRunnable)
+        // v24 N5 (opportunistic): app khulne par bhi stuck-resume check —
+        // background poll (15 min) ke alawa turant pata chale.
+        try {
+            com.formmitra.app.agent.NudgeCenter.checkStuckResume(this)
+        } catch (_: Exception) { }
         if (homeVisible) {
             try { homeView.refreshLiveButton() } catch (_: Exception) { }
         }
@@ -377,6 +397,18 @@ class MainActivity : Activity() {
     override fun onPause() {
         promptHandler.removeCallbacks(promptPollRunnable)
         super.onPause()
+    }
+
+    /**
+     * v24 N4: app background me gayi + Working Mode OFF + pending kaam →
+     * nudge notification ("Kaam ruk gaya hai — app me jao / Working Mode
+     * on karo"). NudgeCenter khud dedupe + guards sambhalta hai.
+     */
+    override fun onStop() {
+        try {
+            com.formmitra.app.agent.NudgeCenter.onAppBackground(this)
+        } catch (_: Exception) { }
+        super.onStop()
     }
 
     /** Kisi bhi tab se pending agent prompt ko popup me dikhao. */
@@ -428,6 +460,9 @@ class MainActivity : Activity() {
                 homeVisible = true
                 agentChatView.onTabShown()
                 try { homeView.refreshLiveButton() } catch (_: Exception) { }
+                // v24 #2: agent se card ban gaya ho to pending category
+                // auto-continue (coordination toote nahi).
+                try { resumePendingCategory() } catch (_: Exception) { }
             }
             path == "/history" -> {
                 historyView.visibility = View.VISIBLE
@@ -485,10 +520,118 @@ class MainActivity : Activity() {
         updateNavHighlight(activePath)
     }
 
-    /** Home ke "📁 Document Vault" card se — Profile kholo + vault par scroll. */
-    private fun openProfileVault() {
-        selectTab("/profile")
-        try { profileView.jumpToVault() } catch (_: Exception) { }
+    /**
+     * v24 B8/C14: category kaam shuru — card-first flow complete hone ke
+     * baad: card chat + automation me bind, category chat start.
+     */
+    private fun startCategoryWork(
+        category: String,
+        label: String,
+        prefill: Map<String, String>,
+        cardId: String,
+        cardName: String,
+        cardToken: String
+    ) {
+        if (!homeVisible) selectTab("/")
+        agentChatView.startCategoryChat(
+            category, label, prefill, cardId, cardName, cardToken
+        )
+    }
+
+    /**
+     * v24 #2: "Through Agent" card-create chuna — category yaad rakho
+     * (card banne ke baad auto-continue), chat card_create mode me kholo.
+     */
+    private fun onAgentCreateCard(
+        catKey: String?,
+        catLabel: String?,
+        prefill: Map<String, String>
+    ) {
+        pendingCatKey = catKey
+        pendingCatLabel = catLabel
+        pendingCatKnownIds = emptySet()
+        Thread({
+            try {
+                pendingCatKnownIds =
+                    com.formmitra.app.agent.CardFlow.knownCardIds(this)
+            } catch (_: Exception) { }
+        }, "fm-known-cards").start()
+        if (!homeVisible) selectTab("/")
+        agentChatView.startAgentCardCreate(prefill)
+    }
+
+    /**
+     * v24 #2: Home par wapas aane par — agent se naya card ban gaya ho to
+     * PIN unlock karwao → pending category auto-continue. Teeno
+     * (agent + operator + AI) ka coordination toote nahi.
+     *
+     * v24 #4: category ke BINA bhi (chat se "Through Agent" card-create)
+     * naya card mile to: PIN unlock → pending details tag ke saath isi
+     * card me flush → chat me card bind. Tab koi detail nahi khoyegi.
+     */
+    private fun resumePendingCategory() {
+        if (pendingCatKnownIds.isEmpty()) return
+        val key = pendingCatKey
+        val label = pendingCatLabel ?: key ?: "kaam"
+        com.formmitra.app.agent.CardFlow.checkNewCardAfterAgent(
+            this, pendingCatKnownIds
+        ) { id, name ->
+            pendingCatKnownIds = emptySet()
+            Thread({
+                val res = try { com.formmitra.app.agent.AgentApi.cards(this) }
+                catch (_: Exception) {
+                    com.formmitra.app.agent.AgentApi.ApiResult(-1, null)
+                }
+                var cardJson: org.json.JSONObject? = null
+                val arr = res.json?.optJSONArray("cards")
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        val c = arr.optJSONObject(i)
+                        if (c != null && c.optString("id") == id) {
+                            cardJson = c
+                            break
+                        }
+                    }
+                }
+                val cj = cardJson
+                runOnUiThread {
+                    if (cj == null) return@runOnUiThread
+                    pendingCatKey = null
+                    pendingCatLabel = null
+                    Toast.makeText(
+                        this,
+                        "✅ Naya card: $name — PIN dalo, phir aage badhenge",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    com.formmitra.app.agent.CardFlow.askPinAndUnlock(
+                        this, cj,
+                        onUnlocked = { prefill, cid, cname, token ->
+                            com.formmitra.app.agent.CardStore.setSelectedCardId(
+                                this, cid
+                            )
+                            // v24 #4: naya card — pending details auto-flush
+                            // (tag ke saath isi card me).
+                            com.formmitra.app.agent.CardFlow.flushPendingDetails(
+                                this, cid, token
+                            )
+                            if (key != null) {
+                                startCategoryWork(
+                                    key, label, prefill, cid, cname, token
+                                )
+                            } else {
+                                // Chat se card bana tha — chat me bind karo.
+                                agentChatView.setActiveCard(cid, cname, token)
+                                Toast.makeText(
+                                    this,
+                                    "✅ Card tayyar — details save ho gayi",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        }
+                    )
+                }
+            }, "fm-resume-cat").start()
+        }
     }
 
     /** ProfileView ka owner check (ya purana WebView check) confirm hua. */
@@ -664,6 +807,10 @@ class MainActivity : Activity() {
             selectTab("/")
         } else if (homeVisible || historyVisible || profileVisible) {
             super.onBackPressed()
+        } else if (activePath == "/wallet") {
+            // v24 A5 ROOT CAUSE: Wallet khula ho to Back = Home tab par wapas
+            // (selectTab), WebView history ya website home par NAHI.
+            selectTab("/")
         } else if (webView?.canGoBack() == true) webView?.goBack() else super.onBackPressed()
     }
 
@@ -769,14 +916,6 @@ class MainActivity : Activity() {
             val granted = grantResults.isNotEmpty() &&
                 grantResults[0] == PackageManager.PERMISSION_GRANTED
             com.formmitra.app.agent.PromptDialog.onVoicePermissionResult(this, granted)
-        }
-        // v20-B: category details popup ke mic ka permission result.
-        if (requestCode == HomeView.REQ_POPUP_VOICE_PERM &&
-            ::homeView.isInitialized
-        ) {
-            val granted = grantResults.isNotEmpty() &&
-                grantResults[0] == PackageManager.PERMISSION_GRANTED
-            homeView.onPopupVoicePermissionResult(granted)
         }
     }
 

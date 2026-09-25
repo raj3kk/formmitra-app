@@ -508,6 +508,70 @@ object AgentLoop {
                 }
 
                 // (h) execute (veto + timeout runAgentStep ke andar)
+                // (g2) v24 C15: FINAL SUBMIT se pehle AI image-verification.
+                // Submit intent: server ka explicit "verify_submit" action, ya
+                // click/press jisme strong final-submit hint ho (SubmitIntent).
+                // FAIL CLOSED: reject ya error → submit NAHI hoga.
+                // 404 = /api/agent/verify server par abhi deploy nahi →
+                // soft proceed + log (purana behavior, warning ke saath).
+                if (AgentActions.SubmitIntent.shouldVerify(stepMap)) {
+                    val vshot = try { engine.capturePngBase64() }
+                    catch (_: Exception) { "" }
+                    val note =
+                        "Final submit check — action=$action goal=${goal.take(120)}"
+                    val vres = try {
+                        AgentApi.verifySubmit(
+                            ctx, agentRunId ?: effectiveRunId,
+                            downscaleShot(vshot), note
+                        )
+                    } catch (_: Exception) { AgentApi.ApiResult(-1, null) }
+                    val vok = when {
+                        vres.code == 404 -> {
+                            logStep(
+                                i, "verify_submit", true,
+                                "verify endpoint 404 (server par abhi nahi) — soft proceed"
+                            )
+                            pushHistory(
+                                action, stepMap, "ok",
+                                "verify 404 → soft proceed (server deploy pending)"
+                            )
+                            true
+                        }
+                        vres.code == -1 -> {
+                            logStep(
+                                i, "verify_submit", false,
+                                "verify network fail — FAIL CLOSED, submit nahi kiya"
+                            )
+                            pushHistory(
+                                action, stepMap, "error",
+                                "verify network fail — submit nahi kiya"
+                            )
+                            false
+                        }
+                        else -> {
+                            val ok = vres.json?.optBoolean("ok", false) == true
+                            val verdict = vres.json?.optString("verdict", "").orEmpty()
+                            val reason = vres.json?.optString("reason", "")
+                                .orEmpty().take(200)
+                            logStep(
+                                i, "verify_submit", ok,
+                                "verdict=$verdict reason=$reason"
+                            )
+                            pushHistory(
+                                action, stepMap, if (ok) "ok" else "rejected",
+                                "verdict=$verdict $reason"
+                            )
+                            ok
+                        }
+                    }
+                    if (!vok) {
+                        return finish(
+                            "needs_user",
+                            "Submit se pehle AI verification pass nahi hui — " +
+                                "maine submit NAHI kiya. Aap dekh lein."
+                        )
+                    }
+                }
                 try {
                     val specMap = agentStepToSpec(stepMap)
                     val detail = engine.runAgentStep(mapToJson(specMap))
@@ -609,6 +673,39 @@ object AgentLoop {
     // Loop BLOCK karke user ka jawab wait karta hai; jawab mile to kaam
     // aage badhta hai. Timeout/cancel → false → caller needs_user finish.
     // =====================================================================
+
+    /**
+     * v24 C15: verify ke liye screenshot chhota karo (720px, JPEG-70) —
+     * POST halka rahe. Fail ho to original b64 (verify wala waise bhi
+     * fail-closed hai).
+     */
+    private fun downscaleShot(b64: String, maxW: Int = 720): String {
+        if (b64.isEmpty()) return ""
+        return try {
+            val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+            val opts = android.graphics.BitmapFactory.Options()
+                .apply { inSampleSize = 2 }
+            var bmp = android.graphics.BitmapFactory.decodeByteArray(
+                bytes, 0, bytes.size, opts
+            ) ?: return b64
+            if (bmp.width > maxW) {
+                val h = (bmp.height * maxW / bmp.width).coerceAtLeast(1)
+                val scaled = android.graphics.Bitmap.createScaledBitmap(
+                    bmp, maxW, h, true
+                )
+                if (scaled != bmp) bmp.recycle()
+                bmp = scaled
+            }
+            val out = java.io.ByteArrayOutputStream()
+            bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, out)
+            bmp.recycle()
+            android.util.Base64.encodeToString(
+                out.toByteArray(), android.util.Base64.NO_WRAP
+            )
+        } catch (_: Exception) {
+            b64
+        }
+    }
 
     /**
      * Server ke structured user_prompt ko popup me badlo.

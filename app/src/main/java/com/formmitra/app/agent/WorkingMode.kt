@@ -42,7 +42,7 @@ object WorkingMode {
         apply(ctx)
     }
 
-    /** Workers + network wake ko toggle ke hisaab se chalao/band karo. */
+    /** Workers + network wake + persistent notification ko toggle ke hisaab se chalao/band karo. */
     fun apply(ctx: Context) {
         val appCtx = ctx.applicationContext
         try {
@@ -50,10 +50,16 @@ object WorkingMode {
                 Scheduler.scheduleFormTasks(appCtx)
                 Scheduler.scheduleDigest(appCtx)
                 NetWake.register(appCtx)
+                // v24 N1: persistent notification — user ke kill karne
+                // tak rahe (koi foreground service pehle start nahi hoti
+                // thi — N0 root cause).
+                WorkingModeService.start(appCtx)
                 Log.i("WorkingMode", "ON — background automation active")
             } else {
                 Scheduler.cancelAll(appCtx)
                 NetWake.unregister(appCtx)
+                // v24 N1: OFF par notification hatao.
+                WorkingModeService.stop(appCtx)
                 Log.i("WorkingMode", "OFF — background automation band")
             }
         } catch (t: Throwable) {
