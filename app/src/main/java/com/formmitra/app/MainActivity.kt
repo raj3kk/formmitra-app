@@ -44,7 +44,11 @@ import java.net.URL
  */
 class MainActivity : Activity() {
 
-    private lateinit var webView: WebView
+    private var webView: WebView? = null
+    // v22: kuch devices par WebView provider toota/missing hota hai — tab
+    // `WebView(this)` constructor hi throw karta hai ("khulte hi band").
+    // Isliye WebView nullable + guarded: na bana to app Home par chalta rahe.
+    private var webViewOk: Boolean = false
     private lateinit var homeView: HomeView
     private lateinit var agentChatView: AgentChatView
     private var homeVisible = false
@@ -96,51 +100,64 @@ class MainActivity : Activity() {
             )
         }
 
-        webView = WebView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-            )
-        }
-        with(webView.settings) {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            databaseEnabled = true
-            mediaPlaybackRequiresUserGesture = false
-        }
-        // v14 audit: third-party cookies ON (form automation ke embedded
-        // widgets — payment/SSO iframes — inke bina toot jate hain; ye
-        // single-user ka apna automation WebView hai).
-        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
-        webView.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(
-                view: WebView, request: WebResourceRequest
-            ): Boolean {
-                val u = try { request.url?.toString() }
-                catch (_: Exception) { null } ?: return false
-                // v19 BUG 2: same-origin in-page navigation (website ke Link
-                // clicks) par app=1 jod do taaki param khoye nahi. Bahar ke
-                // official links ko chhedo mat — WebView khud handle kare.
-                if (isSameOrigin(u)) {
-                    val withParam = appUrl(u)
-                    if (withParam != u) {
-                        view.loadUrl(withParam)
-                        return true
+        // v22: WebView constructor kuch devices par throw karta hai (toota/
+        // missing WebView provider) — yehi "khulte hi band" ka sabse likely
+        // naya cause tha. Guard karo: na bana to app Home (native) par chale.
+        try {
+            val wv = WebView(this).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+                )
+            }
+            with(wv.settings) {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                databaseEnabled = true
+                mediaPlaybackRequiresUserGesture = false
+            }
+            // v14 audit: third-party cookies ON (form automation ke embedded
+            // widgets — payment/SSO iframes — inke bina toot jate hain; ye
+            // single-user ka apna automation WebView hai).
+            CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+            wv.webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(
+                    view: WebView, request: WebResourceRequest
+                ): Boolean {
+                    val u = try { request.url?.toString() }
+                    catch (_: Exception) { null } ?: return false
+                    // v19 BUG 2: same-origin in-page navigation (website ke Link
+                    // clicks) par app=1 jod do taaki param khoye nahi. Bahar ke
+                    // official links ko chhedo mat — WebView khud handle kare.
+                    if (isSameOrigin(u)) {
+                        val withParam = appUrl(u)
+                        if (withParam != u) {
+                            view.loadUrl(withParam)
+                            return true
+                        }
+                    }
+                    return false
+                }
+
+                override fun onPageFinished(view: WebView, url: String) {
+                    super.onPageFinished(view, url)
+                    // Owner check: /profile page ke text me owner email dikhe
+                    // to Admin tab dikhao (fail-closed: na dikhe to tab nahi).
+                    // Query strip karke compare (app=1 lagne ke baad bhi match).
+                    if (!isOwner && stripQuery(url) == baseUrl() + "/profile") {
+                        checkOwner(view)
                     }
                 }
-                return false
             }
-
-            override fun onPageFinished(view: WebView, url: String) {
-                super.onPageFinished(view, url)
-                // Owner check: /profile page ke text me owner email dikhe
-                // to Admin tab dikhao (fail-closed: na dikhe to tab nahi).
-                // Query strip karke compare (app=1 lagne ke baad bhi match).
-                if (!isOwner && stripQuery(url) == baseUrl() + "/profile") {
-                    checkOwner(view)
-                }
-            }
+            root.addView(wv)
+            webView = wv
+            webViewOk = true
+        } catch (t: Throwable) {
+            android.util.Log.e(
+                "MainActivity", "WebView nahi bana (device WebView toota?)", t
+            )
+            webView = null
+            webViewOk = false
         }
-        root.addView(webView)
 
         // Home: native — services strip + live button + Mitra chat
         agentChatView = AgentChatView(
@@ -402,7 +419,7 @@ class MainActivity : Activity() {
         historyView.visibility = View.GONE
         profileView.visibility = View.GONE
         browserMirrorView.visibility = View.GONE
-        webView.visibility = View.GONE
+        webView?.visibility = View.GONE
         if (wasHome && path != "/") agentChatView.onTabHidden()
         val tabPaths = currentTabs().map { it.second }.toSet()
         when {
@@ -425,16 +442,42 @@ class MainActivity : Activity() {
             }
             tabPaths.contains(path) -> {
                 // Wallet / Admin — website WebView me (?app=1 ke saath)
-                webView.visibility = View.VISIBLE
-                webView.loadUrl(appUrl(baseUrl() + path))
+                val wv = webView
+                if (wv == null) {
+                    // v22: WebView nahi bana — Home par raho, user ko batao
+                    homeView.visibility = View.VISIBLE
+                    homeVisible = true
+                    try { agentChatView.onTabShown() } catch (_: Exception) { }
+                    Toast.makeText(
+                        this,
+                        "Is phone par WebView uplabdh nahi — ye tab nahi khul sakta",
+                        Toast.LENGTH_LONG
+                    ).show()
+                } else {
+                    wv.visibility = View.VISIBLE
+                    wv.loadUrl(appUrl(baseUrl() + path))
+                }
             }
             else -> {
                 // Service paths (/tracking, /jobs, /scholarships, /resume)
                 // WebView me, nav me Home highlight
-                webView.visibility = View.VISIBLE
-                val full = appUrl(baseUrl() + path)
-                if (stripQuery(webView.url ?: "") != stripQuery(full)) {
-                    webView.loadUrl(full)
+                val wv = webView
+                if (wv == null) {
+                    // v22: WebView nahi bana — Home par raho
+                    homeView.visibility = View.VISIBLE
+                    homeVisible = true
+                    try { agentChatView.onTabShown() } catch (_: Exception) { }
+                    Toast.makeText(
+                        this,
+                        "Is phone par WebView uplabdh nahi — ye page nahi khul sakta",
+                        Toast.LENGTH_LONG
+                    ).show()
+                } else {
+                    wv.visibility = View.VISIBLE
+                    val full = appUrl(baseUrl() + path)
+                    if (stripQuery(wv.url ?: "") != stripQuery(full)) {
+                        wv.loadUrl(full)
+                    }
                 }
             }
         }
@@ -509,7 +552,7 @@ class MainActivity : Activity() {
         homeView.visibility = View.GONE
         historyView.visibility = View.GONE
         profileView.visibility = View.GONE
-        webView.visibility = View.GONE
+        webView?.visibility = View.GONE
         agentChatView.onTabHidden()
         browserMirrorView.visibility = View.VISIBLE
         mirrorVisible = true
@@ -530,9 +573,22 @@ class MainActivity : Activity() {
         historyView.visibility = View.GONE
         profileView.visibility = View.GONE
         browserMirrorView.visibility = View.GONE
-        webView.visibility = View.VISIBLE
+        val wv = webView
+        if (wv == null) {
+            // v22: WebView nahi bana — Home par raho
+            homeView.visibility = View.VISIBLE
+            homeVisible = true
+            try { agentChatView.onTabShown() } catch (_: Exception) { }
+            Toast.makeText(
+                this,
+                "Is phone par WebView uplabdh nahi — ye link nahi khul sakta",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        wv.visibility = View.VISIBLE
         // v19 BUG 2: apne domain par ?app=1 — bahar ke official links jaisi hain waisi
-        webView.loadUrl(appUrl(url))
+        wv.loadUrl(appUrl(url))
         activePath = "/"
         updateNavHighlight("/")
     }
@@ -554,8 +610,21 @@ class MainActivity : Activity() {
             historyView.visibility = View.GONE
             profileView.visibility = View.GONE
             browserMirrorView.visibility = View.GONE
-            webView.visibility = View.VISIBLE
-            webView.loadUrl(appUrl(fullUrl))
+            val wv = webView
+            if (wv == null) {
+                // v22: WebView nahi bana — Home par raho
+                homeView.visibility = View.VISIBLE
+                homeVisible = true
+                try { agentChatView.onTabShown() } catch (_: Exception) { }
+                Toast.makeText(
+                    this,
+                    "Is phone par WebView uplabdh nahi — ye page nahi khul sakta",
+                    Toast.LENGTH_LONG
+                ).show()
+                return
+            }
+            wv.visibility = View.VISIBLE
+            wv.loadUrl(appUrl(fullUrl))
             activePath = "/"
             updateNavHighlight("/")
         }
@@ -595,7 +664,7 @@ class MainActivity : Activity() {
             selectTab("/")
         } else if (homeVisible || historyVisible || profileVisible) {
             super.onBackPressed()
-        } else if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
+        } else if (webView?.canGoBack() == true) webView?.goBack() else super.onBackPressed()
     }
 
     // ---------- browser mirror ----------

@@ -29,6 +29,11 @@ import com.formmitra.app.engine.UserPrompt
 class FmApp : Application(), Configuration.Provider {
 
     override fun onCreate() {
+        // v22: SABSE PEHLE crash-catcher — iske baad jo bhi uncaught
+        // exception aaye, user ko exact wajah dikhegi (CrashReportActivity).
+        try {
+            CrashCatcher.install(this)
+        } catch (_: Throwable) { }
         super.onCreate()
         try {
             // Pehle se initialized ho (dobara call) to IllegalStateException
