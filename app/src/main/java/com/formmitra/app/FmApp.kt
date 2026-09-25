@@ -4,6 +4,8 @@ import android.app.Application
 import android.util.Log
 import androidx.work.Configuration
 import androidx.work.WorkManager
+import com.formmitra.app.agent.FcmPush
+import com.formmitra.app.agent.WorkingMode
 
 /**
  * FmApp — FormMitra ka Application class.
@@ -32,6 +34,27 @@ class FmApp : Application(), Configuration.Provider {
             Log.i("FmApp", "WorkManager initialized")
         } catch (t: Throwable) {
             Log.e("FmApp", "WorkManager init failed (workers baad me retry karenge)", t)
+        }
+        // G1: app khulne par Working Mode apply (reboot ke baad bhi yaad rehta hai).
+        // ON ho to workers + NetWake lagte hain; OFF ho to kuch schedule nahi hota.
+        try {
+            WorkingMode.apply(this)
+        } catch (t: Throwable) {
+            Log.e("FmApp", "WorkingMode.apply failed (non-fatal)", t)
+        }
+        // G2: app-open wake — Working Mode ON ho aur koi pending run ho to
+        // WakeWorker usi step se resume karega (duplicate-run guard andar hai).
+        try {
+            if (WorkingMode.isEnabled(this)) WakeWorker.enqueue(this)
+        } catch (t: Throwable) {
+            Log.e("FmApp", "WakeWorker enqueue failed (non-fatal)", t)
+        }
+        // J1: FCM init (best-effort). google-services.json me com.formmitra.app
+        // client na ho to skip — polling fallback tab bhi zinda rehta hai.
+        try {
+            FcmPush.ensureInit(this)
+        } catch (t: Throwable) {
+            Log.e("FmApp", "FcmPush.ensureInit failed (non-fatal)", t)
         }
     }
 

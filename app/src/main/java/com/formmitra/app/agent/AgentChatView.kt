@@ -62,6 +62,13 @@ class AgentChatView(
     private var typingView: View? = null
     private var waiting = false
 
+    // v20 Task 5: work-wise category context (chat body me `category` jayega)
+    private var activeCategory: String? = null
+    /** Category flow me plan aate hi verify+start khud khule (ek Proceed tap
+     *  bachta hai; verify dialog ka Proceed phir bhi user hi dabata hai). */
+    private var autoPlanArmed = false
+    private lateinit var categoryChip: TextView
+
     // send watchdog + retry
     private val sendWatchdog = Handler(Looper.getMainLooper())
     private var sendToken = 0
@@ -76,6 +83,7 @@ class AgentChatView(
     private lateinit var retryBtn: Button
     private var bannerGoal = ""
     private var bannerUrl = ""
+    private var bannerCategory = ""
 
     // voice input
     private var recognizer: SpeechRecognizer? = null
@@ -134,6 +142,22 @@ class AgentChatView(
         })
         addView(header)
 
+        // v20 Task 5: active category chip — ✕ dabao to category context hate
+        categoryChip = TextView(context).apply {
+            visibility = View.GONE
+            textSize = 13f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#1A73E8"))
+            background = with(UiKit) { context.chipBg() }
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            setOnClickListener { clearCategory() }
+        }
+        addView(
+            categoryChip,
+            LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT)
+                .apply { setMargins(pad, dp(2), pad, dp(2)) }
+        )
+
         // v14: CAPTCHA auto-solve consent toggle (default ON, persisted)
         addView(LinearLayout(context).apply {
             orientation = HORIZONTAL
@@ -191,6 +215,9 @@ class AgentChatView(
             layoutParams = LayoutParams(
                 LayoutParams.MATCH_PARENT, 0, 1f
             )
+            // v20 Task 1: messages kam hon to bhi area bhara rahe — input
+            // row hamesha neeche apni jagah par rahe
+            isFillViewport = true
         }
         messageList = LinearLayout(context).apply {
             orientation = VERTICAL
@@ -200,10 +227,18 @@ class AgentChatView(
         addView(scroll)
 
         // Input row: [📎] [text] [🎤] [🔊] [➤]
+        // v20 Task 1 BULLETPROOF: explicit MATCH_PARENT x WRAP_CONTENT +
+        // minimumHeight — ye row kabhi collapse nahi hogi, hamesha dikhegi.
+        // Manifest me windowSoftInputMode="adjustResize" hai, isliye keyboard
+        // khulne par window shrink hogi aur ye row keyboard ke upar rahegi.
         val inputRow = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(pad, dp(6), pad, pad)
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            )
+            minimumHeight = dp(56)
         }
         val attachBtn = Button(context).apply {
             text = "📎"
@@ -226,6 +261,11 @@ class AgentChatView(
                     sendMessage((v as TextView).text.toString())
                     true
                 } else false
+            }
+            // v20 Task 1: focus milte hi messages neeche scroll — input
+            // keyboard ke upar saaf dikhe
+            setOnFocusChangeListener { _, hasFocus ->
+                if (hasFocus) post { scrollToBottom() }
             }
         }
         inputRow.addView(input)
@@ -263,6 +303,12 @@ class AgentChatView(
         }
         inputRow.addView(sendBtn)
         addView(inputRow)
+
+        // v20 Task 2: button press feedback (tasteful, halka scale)
+        UiKit.pressFeedback(attachBtn)
+        UiKit.pressFeedback(micBtn)
+        UiKit.pressFeedback(speakBtn)
+        UiKit.pressFeedback(sendBtn)
 
         // Greeting (v19): product ab tracking assistant hai — form-filling
         // direction user ne cancel kar di thi, isliye copy badli.
@@ -496,67 +542,76 @@ class AgentChatView(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
             ).apply { setMargins(0, dp(10), 0, 0) }
         }
-        startBtn.setOnClickListener {
-            startBtn.isEnabled = false
-            startBtn.text = "⏳ Details la raha hun…"
-            Thread {
-                // Vault profile + session details merge karke verify card
-                val merged = LinkedHashMap<String, String>()
-                try {
-                    val vault = AgentApi.profile(context)
-                    if (vault != null) {
-                        for (k in DetailExtractor.orderedKeys()) {
-                            val v = vault.optString(k, "").trim()
-                            if (v.isNotEmpty() && v != "null") merged[k] = v
-                        }
-                    }
-                } catch (_: Exception) { }
-                for ((k, v) in sessionDetails) merged[k] = v
-                post {
-                    if (merged.isEmpty()) {
-                        beginEnqueue(plan, link, startBtn)
-                    } else {
-                        showVerifyDialog(
-                            merged,
-                            title = "✔️ Aage badhne se pehle verify karo",
-                            subtitle = "Agent inhi details se kaam karega. " +
-                                "Proceed dabane par hi task banega.",
-                            positiveLabel = "✅ Proceed",
-                            onProceed = { verified ->
-                                // User ne theek kiya ho to server ko correction bhejo
-                                val diffs = verified.filter { (k, v) -> merged[k] != v }
-                                if (diffs.isNotEmpty()) {
-                                    sessionDetails.putAll(verified)
-                                    doSend(
-                                        "Meri in details ko theek kar do: " +
-                                            diffs.entries.joinToString(", ") {
-                                                "${DetailExtractor.label(it.key)}: ${it.value}"
-                                            }
-                                    )
-                                }
-                                beginEnqueue(plan, link, startBtn)
-                            },
-                            onCancel = {
-                                startBtn.text = "▶ Shuru karo"
-                                startBtn.isEnabled = true
-                            }
-                        )
-                    }
-                }
-            }.start()
-        }
+        startBtn.setOnClickListener { onStartPlanClicked(plan, link, startBtn) }
         card.addView(startBtn)
 
         messageList.addView(card, lp)
         scrollToBottom()
     }
 
-    private fun beginEnqueue(plan: JSONObject, link: String, startBtn: Button) {
-        startBtn.text = "⏳ Task ban raha hai…"
+    /**
+     * Plan ka "Shuru karo" flow — button tap ya category auto-start, dono
+     * yahi aate hain. startBtn null = auto path (button state skip hota hai).
+     * Verify dialog ka Proceed hamesha user dabata hai (guard barkarar).
+     */
+    private fun onStartPlanClicked(plan: JSONObject, link: String, startBtn: Button?) {
+        startBtn?.isEnabled = false
+        startBtn?.text = "⏳ Details la raha hun…"
+        Thread {
+            // Vault profile + session details merge karke verify card
+            val merged = LinkedHashMap<String, String>()
+            try {
+                val vault = AgentApi.profile(context)
+                if (vault != null) {
+                    for (k in DetailExtractor.orderedKeys()) {
+                        val v = vault.optString(k, "").trim()
+                        if (v.isNotEmpty() && v != "null") merged[k] = v
+                    }
+                }
+            } catch (_: Exception) { }
+            for ((k, v) in sessionDetails) merged[k] = v
+            post {
+                if (merged.isEmpty()) {
+                    beginEnqueue(plan, link, startBtn)
+                } else {
+                    showVerifyDialog(
+                        merged,
+                        title = "✔️ Aage badhne se pehle verify karo",
+                        subtitle = "Agent inhi details se kaam karega. " +
+                            "Proceed dabane par hi task banega.",
+                        positiveLabel = "✅ Proceed",
+                        onProceed = { verified ->
+                            // User ne theek kiya ho to server ko correction bhejo
+                            val diffs = verified.filter { (k, v) -> merged[k] != v }
+                            if (diffs.isNotEmpty()) {
+                                sessionDetails.putAll(verified)
+                                doSend(
+                                    "Meri in details ko theek kar do: " +
+                                        diffs.entries.joinToString(", ") {
+                                            "${DetailExtractor.label(it.key)}: ${it.value}"
+                                        }
+                                )
+                            }
+                            beginEnqueue(plan, link, startBtn)
+                        },
+                        onCancel = {
+                            startBtn?.text = "▶ Shuru karo"
+                            startBtn?.isEnabled = true
+                        }
+                    )
+                }
+            }
+        }.start()
+    }
+
+    private fun beginEnqueue(plan: JSONObject, link: String, startBtn: Button?) {
+        startBtn?.text = "⏳ Task ban raha hai…"
         enqueueTask(
             title = plan.optString("title", "Form"),
             url = link,
-            onDone = { post { startBtn.text = "▶ Shuru karo"; startBtn.isEnabled = true } }
+            // A: category task me jayegi → AgentLoop ke har act() me
+            category = activeCategory.orEmpty(),
+            onDone = { post { startBtn?.text = "▶ Shuru karo"; startBtn?.isEnabled = true } }
         )
     }
 
@@ -623,7 +678,8 @@ class AgentChatView(
         }, 75_000)
         Thread {
             val res = try {
-                AgentApi.chat(context, history.toList())
+                // v20 Task 5: active category ho to body me `category` bhejo
+                AgentApi.chat(context, history.toList(), activeCategory)
             } catch (_: Exception) {
                 AgentApi.ApiResult(-1, null)
             }
@@ -653,7 +709,18 @@ class AgentChatView(
                             VoiceOutput.speak(context, reply)
                         }
                         val plan = json?.optJSONObject("plan")
-                        if (plan != null) addPlanCard(plan)
+                        if (plan != null) {
+                            addPlanCard(plan)
+                            // A: category flow — plan aate hi verify+start
+                            // flow khud kholo (Proceed user dabayega; guard
+                            // barkarar). Normal chat me nahi.
+                            if (autoPlanArmed) {
+                                autoPlanArmed = false
+                                onStartPlanClicked(
+                                    plan, plan.optString("official_link", ""), null
+                                )
+                            }
+                        }
                         val missing = json?.optJSONArray("missing_docs")
                         if (missing != null && missing.length() > 0) {
                             val names = (0 until missing.length())
@@ -729,6 +796,45 @@ class AgentChatView(
                 }
             }
         }.start()
+    }
+
+    // ---------- v20 Task 5: category context ----------
+
+    /**
+     * Home ke work-category card se: category context set karo + intro
+     * message bhejo. sendMessage() ke verify gate se guzarta hai — popup
+     * ki details server ko bina user-verify ke nahi jayengi.
+     */
+    fun startCategoryChat(
+        category: String,
+        label: String,
+        prefill: Map<String, String>
+    ) {
+        activeCategory = category
+        // B: popup details session me rakho — agent dobara na maange.
+        // Ye intro message ke saath server ko bhi jati hain (history me).
+        if (prefill.isNotEmpty()) sessionDetails.putAll(prefill)
+        // A: is category message ke jawab me plan aaye to auto-start flow.
+        autoPlanArmed = true
+        post {
+            categoryChip.text = "🔖 $label  ✕"
+            categoryChip.visibility = View.VISIBLE
+        }
+        val sb = StringBuilder("🔖 $label — is kaam me meri madad karo.")
+        if (prefill.isNotEmpty()) {
+            sb.append("\nMeri details:")
+            for ((k, v) in prefill) {
+                sb.append("\n• ").append(UiKit.fieldLabelFor(k)).append(": ").append(v)
+            }
+        }
+        sendMessage(sb.toString())
+    }
+
+    /** Chip ka ✕ — category context hatao, aam chat par wapas. */
+    fun clearCategory() {
+        activeCategory = null
+        post { categoryChip.visibility = View.GONE }
+        toast("Category hatayi — ab aam chat")
     }
 
     // ---------- verify dialog ----------
@@ -896,7 +1002,12 @@ class AgentChatView(
         }.start()
     }
 
-    private fun enqueueTask(title: String, url: String, onDone: () -> Unit) {
+    private fun enqueueTask(
+        title: String,
+        url: String,
+        category: String = "",
+        onDone: () -> Unit
+    ) {
         Thread {
             var msg: String
             if (url.isEmpty()) {
@@ -921,7 +1032,10 @@ class AgentChatView(
                         VoiceOutput.speak(context, vt.take(300))
                     }
                 }
-                val (code, taskId) = AgentApi.createTask(context, title, url)
+                val (code, taskId) = AgentApi.createTask(context, title, url, category)
+                // A: category → task threading (device-local backup bhi;
+                // step JSON me bhi gayi — FormRunService wahan se uthayega)
+                if (!taskId.isNullOrEmpty()) CategoryStore.saveForTask(context, taskId, category)
                 msg = if (taskId.isNullOrEmpty()) {
                     val offline = code == -1 || code >= 500
                     when {
@@ -935,8 +1049,11 @@ class AgentChatView(
                 } else {
                     val runCode = AgentApi.runNow(context, taskId)
                     if (runCode in 200..299) {
-                        "Background me shuru ho gaya ✅ — 30 min ke andar " +
-                            "phone uthayega. History tab me progress dekho."
+                        // I3 (app-first): 30-min periodic ka wait nahi — turant
+                        // claim ke liye one-time poll kick karo.
+                        com.formmitra.app.Scheduler.kickNow(context)
+                        "Background me shuru ho gaya ✅ — phone turant uthayega. " +
+                            "History tab me progress dekho."
                     } else if (runCode == -1) {
                         "Internet nahi hai 📡"
                     } else {
@@ -1086,9 +1203,12 @@ class AgentChatView(
             return
         }
         val status = latest.optString("status", "")
-        if (status == "needs_user" || status == "needs_attention") {
+        // A+C: stuck / blocker / needs_user — saaf rukho, batao, awaaz me sunao.
+        // "failed" bhi blocker hai (pehle chup-chaap gayab ho jata tha).
+        if (status == "needs_user" || status == "needs_attention" || status == "failed") {
             bannerGoal = runGoal(latest)
             bannerUrl = runUrl(latest)
+            bannerCategory = runFd(latest)?.optString("category", "").orEmpty()
             val reason = runSummary(latest).ifEmpty { "Agent ko aapki madad chahiye" }
             val low = reason.lowercase()
             bannerText.text =
@@ -1100,6 +1220,12 @@ class AgentChatView(
             if (bannerBox.visibility != View.VISIBLE) {
                 bannerBox.visibility = View.VISIBLE
                 scrollToBottom()
+            }
+            // C: voice help mode — sirf stuck par trigger hota hai, normal
+            // flow me nahi. TTS mute ho to sirf banner text, awaaz nahi.
+            val runId = latest.optString("run_id").ifEmpty { latest.optString("id") }
+            VoiceHelp.announceStuck(context, runId, status, bannerGoal, reason) {
+                bannerText.text = it
             }
         } else {
             hideBanner()
@@ -1128,7 +1254,8 @@ class AgentChatView(
                 }
                 return@Thread
             }
-            val (code, taskId) = AgentApi.createTask(context, bannerGoal, bannerUrl)
+            val (code, taskId) = AgentApi.createTask(context, bannerGoal, bannerUrl, bannerCategory)
+            if (!taskId.isNullOrEmpty()) CategoryStore.saveForTask(context, taskId, bannerCategory)
             msg = if (taskId.isNullOrEmpty()) {
                 when (code) {
                     -1 -> "Internet nahi hai 📡"
@@ -1138,6 +1265,8 @@ class AgentChatView(
             } else {
                 val runCode = AgentApi.runNow(context, taskId)
                 if (runCode in 200..299) {
+                    // I3 (app-first): turant claim ke liye one-time poll kick.
+                    com.formmitra.app.Scheduler.kickNow(context)
                     "Dobara shuru ho gaya ✅ — agent ab kaam karega."
                 } else if (runCode == -1) {
                     "Internet nahi hai 📡"
@@ -1312,10 +1441,20 @@ class AgentChatView(
         if (resultCode != Activity.RESULT_OK) return
         val uri = data?.data ?: return
         Thread {
-            val ok = DocsStore.saveDoc(context, uri) != null
+            val savedName = try { DocsStore.saveDoc(context, uri) }
+            catch (_: Exception) { null }
             post {
-                if (ok) {
+                if (!savedName.isNullOrEmpty()) {
                     toast("Document save ho gaya ✅ — agent upload step me istemaal hoga")
+                    // v20 Task 3: "Kaun sa document hai?" — type device-local
+                    // save hota hai, server ko kabhi nahi jata (doc-privacy).
+                    val act = context as? Activity
+                    if (act != null) {
+                        UiKit.askDocType(act) { type ->
+                            DocsStore.setDocType(context, savedName, type)
+                            toast("🏷️ $type ke roop me save hua")
+                        }
+                    }
                 } else {
                     toast("File save nahi hui — dobara try karo")
                 }

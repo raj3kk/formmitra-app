@@ -10,6 +10,7 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import com.formmitra.app.MainActivity
+import com.formmitra.app.agent.CategoryStore
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -39,6 +40,15 @@ class FormRunService : Service() {
         private const val NOTIF_ID = 4101
         private const val DONE_NOTIF_ID = 4102
 
+        /**
+         * Duplicate-run guard (G2/J1): koi run chal raha ho to WakeWorker /
+         * FormTaskWorker naya handoff na kare. Service start par set,
+         * runTask khatam par clear (finally me).
+         */
+        @Volatile
+        var activeTaskId: String? = null
+            private set
+
         fun startWithTask(ctx: Context, task: JSONObject) {
             val intent = Intent(ctx, FormRunService::class.java).apply {
                 putExtra(EXTRA_TASK_JSON, task.toString())
@@ -66,8 +76,15 @@ class FormRunService : Service() {
         startForeground(NOTIF_ID, buildNotif("Form bhar raha hai: $name", "Kaam chal raha hai…"))
         notifySimple(NOTIF_ID + 10, "Form bharna shuru: $name", "FormMitra automation kaam kar raha hai")
 
+        // Duplicate-run guard: doosra handoff aaye to ye run pehle se active hai.
+        val claimId = task.optString("run_id").ifEmpty { task.optString("id") }
+        activeTaskId = claimId
         runThread = Thread({
-            runTask(task, name)
+            try {
+                runTask(task, name)
+            } finally {
+                if (activeTaskId == claimId) activeTaskId = null
+            }
             stopSelf(startId)
         }, "formmitra-run").also { it.start() }
 
@@ -90,8 +107,21 @@ class FormRunService : Service() {
                 // AI agent mode — AgentLoop har step khud decide karta hai
                 val goal = firstStep.optString("goal", name).ifEmpty { name }
                 val url = firstStep.optString("url", task.optString("target_url", ""))
+                // Category-wise full automation: step/task/device-local se
+                // category nikaalo → AgentLoop ke har act() call me jayegi
+                val category = firstStep.optString("category", "")
+                    .ifEmpty { task.optString("category", "") }
+                    .ifEmpty {
+                        CategoryStore.takeForTask(
+                            this,
+                            task.optString("id"), runId, task.optString("task_id")
+                        )
+                    }
                 var offlineMode = false
                 var standaloneMode = false
+                // G2 resume: WakeWorker synthetic task me start_step bhejta hai —
+                // AgentLoop usi step se continue karega (shuru se nahi).
+                val startStep = firstStep.optInt("start_step", 0).coerceAtLeast(0)
                 AgentLoop.runAgentTask(
                     this, engine, goal, url, runId, 40,
                     onProgress = { aiStep ->
@@ -115,7 +145,9 @@ class FormRunService : Service() {
                     },
                     onOfflineMode = { offlineMode = true },
                     onStandaloneMode = { standaloneMode = true },
-                    forceStandalone = standalone
+                    forceStandalone = standalone,
+                    category = category,
+                    startStep = startStep
                 )
             } else {
                 engine.runTask(task) { step1Based, _ ->

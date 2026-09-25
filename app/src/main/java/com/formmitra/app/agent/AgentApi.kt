@@ -126,29 +126,41 @@ object AgentApi {
         return postWithTimeout(path, ctx, body, timeoutMs)
     }
 
-    /** POST /api/agent/chat — poora history bhejo, reply + plan|null + missing_docs wapas. */
-    fun chat(ctx: Context, messages: List<Pair<String, String>>): ApiResult {
+    /** POST /api/agent/chat — poora history bhejo, reply + plan|null + missing_docs wapas.
+     * v20: category optional — work-wise category context (apply_track,
+     * zamin_track, resume_create, job_find, scholarship). Server isi field
+     * se category-wise sawaal puchhta hai. null = purana flow (unchanged). */
+    fun chat(
+        ctx: Context,
+        messages: List<Pair<String, String>>,
+        category: String? = null
+    ): ApiResult {
         val arr = JSONArray()
         for ((role, content) in messages) {
             arr.put(JSONObject().put("role", role).put("content", content))
         }
-        return post("/api/agent/chat", ctx, JSONObject().put("messages", arr))
+        val body = JSONObject().put("messages", arr)
+        if (!category.isNullOrEmpty()) body.put("category", category)
+        return post("/api/agent/chat", ctx, body)
     }
 
-    /** POST /api/app/form-tasks — sirf goto step; returns (code, taskId). */
-    fun createTask(ctx: Context, name: String, url: String): Pair<Int, String?> {
+    /** POST /api/app/form-tasks — sirf goto step; returns (code, taskId).
+     *  category: agent_run step + top-level me jata hai taaki AgentLoop ke
+     *  har /api/agent/act call me category pahunche (category-wise automation). */
+    fun createTask(ctx: Context, name: String, url: String, category: String = ""): Pair<Int, String?> {
         // AI agent mode: pehla step agent_run — AgentLoop har step khud
         // decide karta hai (Phase 2 brain). Fixed goto nahi.
-        val steps = JSONArray().put(
-            JSONObject()
-                .put("type", "agent_run")
-                .put("goal", name)
-                .put("url", url)
-        )
+        val firstStep = JSONObject()
+            .put("type", "agent_run")
+            .put("goal", name)
+            .put("url", url)
+        if (category.isNotEmpty()) firstStep.put("category", category)
+        val steps = JSONArray().put(firstStep)
         val body = JSONObject()
             .put("name", name)
             .put("target_url", url)
             .put("steps", steps)
+        if (category.isNotEmpty()) body.put("category", category)
         val res = post("/api/app/form-tasks", ctx, body)
         val id = res.json?.let {
             val a = it.optString("id", "")
@@ -214,6 +226,23 @@ object AgentApi {
         val body = JSONObject()
         for ((k, v) in fields) body.put(k, v)
         body.put("confirmed", true)
+        val res = put("/api/agent/profile", ctx, body)
+        return res.code in 200..299
+    }
+
+    /**
+     * PUT /api/agent/profile — A-to-Z vault profile form (v20).
+     * CONTRACT: `confirmed` field BILKUL MAT bhejo — absent par server save
+     * karta hai. Sab fields optional: sirf non-empty fields bhejo
+     * (partial save — khaali fields server ki values ko overwrite nahi karte).
+     * @return true agar 2xx aaya.
+     */
+    fun saveProfileForm(ctx: Context, fields: Map<String, String>): Boolean {
+        val body = JSONObject()
+        for ((k, v) in fields) {
+            val t = v.trim()
+            if (t.isNotEmpty()) body.put(k, t)
+        }
         val res = put("/api/agent/profile", ctx, body)
         return res.code in 200..299
     }

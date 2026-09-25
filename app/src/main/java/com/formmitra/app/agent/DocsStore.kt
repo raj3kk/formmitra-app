@@ -6,6 +6,7 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import com.formmitra.app.engine.CryptoVault
 import java.io.File
+import org.json.JSONObject
 
 /**
  * DocsStore — user ke documents (photo/PDF) filesDir/docs/ me ENCRYPTED save rakhta hai.
@@ -97,7 +98,9 @@ object DocsStore {
             val canonFile = try { f.canonicalPath }
             catch (_: Exception) { return false }
             if (!canonFile.startsWith(canonBase + File.separator)) return false
-            f.isFile && f.delete()
+            val gone = f.isFile && f.delete()
+            if (gone) clearDocType(ctx, name) // type metadata bhi saaf
+            return gone
         } catch (_: Exception) {
             false
         }
@@ -119,6 +122,58 @@ object DocsStore {
             } catch (_: Exception) { /* plaintext → migrate karo */ }
             val plain = file.readBytes()
             CryptoVault.encryptFile(ctx, plain, file)
+        } catch (_: Exception) { }
+    }
+
+    // ---------- document type metadata (v20, Task 3) ----------
+    //
+    // "Kaun sa document hai?" — har doc ke saath uska type device-local
+    // save hota hai (filesDir/docs_meta.json). DOC-PRIVACY: ye metadata
+    // kabhi server ko nahi jata — filename ki tarah sirf is phone par.
+
+    /** Type options — Task 3 ke exact options ("Other" = custom text). */
+    val DOC_TYPES = listOf(
+        "Aadhaar",
+        "PAN",
+        "Voter ID",
+        "Driving License",
+        "Passport",
+        "Marksheet",
+        "Caste Certificate",
+        "Income Certificate",
+        "Domicile",
+        "Photo",
+        "Other"
+    )
+
+    private fun metaFile(ctx: Context): File = File(ctx.filesDir, "docs_meta.json")
+
+    private fun readMeta(ctx: Context): JSONObject = try {
+        val f = metaFile(ctx)
+        if (f.exists()) JSONObject(f.readText()) else JSONObject()
+    } catch (_: Exception) {
+        JSONObject()
+    }
+
+    /** Doc ka saved type, ya "" (pata nahi). */
+    fun getDocType(ctx: Context, name: String): String =
+        try { readMeta(ctx).optString(name, "") } catch (_: Exception) { "" }
+
+    /** Doc ka type save karo (device-local only). */
+    fun setDocType(ctx: Context, name: String, type: String) {
+        try {
+            val m = readMeta(ctx)
+            m.put(name, type)
+            metaFile(ctx).writeText(m.toString())
+        } catch (_: Exception) { }
+    }
+
+    /** Doc ka type metadata hatao. */
+    fun clearDocType(ctx: Context, name: String) {
+        try {
+            val m = readMeta(ctx)
+            m.remove(name)
+            metaFile(ctx).writeText(m.toString())
         } catch (_: Exception) { }
     }
 }

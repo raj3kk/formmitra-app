@@ -20,7 +20,20 @@ object DetailExtractor {
         "email" to "Email",
         "dob" to "Janm tithi",
         "pincode" to "Pincode",
-        "address" to "Pata"
+        "address" to "Pata",
+        // v20: A-to-Z vault profile form ke labels (display/order ke liye;
+        // extract() ke patterns nahi badle — sirf label() aur orderedKeys()).
+        "father_name" to "Pita ka naam",
+        "mother_name" to "Mata ka naam",
+        "gender" to "Ling",
+        "village" to "Gaon",
+        "post" to "Post",
+        "district" to "Zila",
+        "state" to "Rajya",
+        "qualification" to "Yogyata",
+        "occupation" to "Pesha",
+        "category_caste" to "Category/Jati",
+        "id_numbers" to "ID numbers"
     )
 
     fun label(key: String): String = LABELS[key] ?: key

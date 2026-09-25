@@ -18,8 +18,8 @@ rm -rf $OUT && mkdir -p $OUT/{aar,classes,dex,res}
 export JAVA_HOME=$PTOOLS/jdk-17
 export PATH=$JAVA_HOME/bin:$PATH
 APPID="com.formmitra.app"
-VERSION_CODE=19
-VERSION_NAME="1.0.19-v19"
+VERSION_CODE=20
+VERSION_NAME="1.0.20-v20"
 SITE_URL="https://formmitra-git-main-webbuilder1.vercel.app/"
 # Output APK name parameterized — v1 APK (formmitra-v1.apk) untouched rehta hai.
 APK_NAME="formmitra-v${VERSION_CODE}.apk"
@@ -62,6 +62,70 @@ for d in $OUT/aar/*/; do
   fi
 done
 echo "aar res zips: $((${#AAR_RES_ARGS[@]} / 2))"
+
+# == J1: FCM config (google-services.json → fcm_values.xml) ==
+# Firebase project clip-flow-685a5 reuse. User Firebase console me
+# com.formmitra.app add karke updated google-services.json dega.
+# - json me FormMitra client mile to res values generate (build-time only,
+#   $OUT me — repo me COMMIT NAHI hota, koi secret file nahi banti).
+# - na mile to skip: FirebaseApp.initializeApp null dega → FcmPush graceful
+#   degrade, polling fallback (FormTaskWorker 30-min + NetWake + WakeWorker).
+# Firebase options code me hardcode NAHI — sab json se aata hai.
+FCM_RES_ARGS=()
+GSJSON=""
+for cand in "$FA/app/google-services.json" "$HOME/workspace/user/files/google-services.json"; do
+  if [ -f "$cand" ]; then GSJSON="$cand"; break; fi
+done
+if [ -n "$GSJSON" ]; then
+  echo "google-services.json: $GSJSON"
+  mkdir -p $OUT/fcm-res/values
+  if python3 - "$GSJSON" "$OUT/fcm-res/values/fcm_values.xml" <<'PYEOF'
+import json, sys, xml.sax.saxutils as sx
+src, dst = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(src))
+except Exception as e:
+    print('FCM: json parse fail: %s' % e); sys.exit(1)
+proj = d.get('project_info', {}) or {}
+found = None
+for c in d.get('client', []) or []:
+    ci = c.get('client_info') or {}
+    aci = ci.get('android_client_info') or {}
+    if aci.get('package_name') == 'com.formmitra.app':
+        found = c; break
+if not found:
+    print('FCM: com.formmitra.app client json me nahi — polling fallback')
+    sys.exit(1)
+api_key = ''
+for k in found.get('api_key') or []:
+    if k.get('current_key'):
+        api_key = k['current_key']; break
+vals = {
+    'google_app_id': (found.get('client_info') or {}).get('mobilesdk_app_id', ''),
+    'gcm_defaultSenderId': str(proj.get('project_number', '')),
+    'google_api_key': api_key,
+    'google_project_id': proj.get('project_id', ''),
+    'google_storage_bucket': proj.get('storage_bucket', ''),
+}
+for req in ('google_app_id', 'gcm_defaultSenderId', 'google_api_key', 'google_project_id'):
+    if not vals[req]:
+        print('FCM: missing ' + req); sys.exit(1)
+xml = '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+for k, v in vals.items():
+    if v:
+        xml += '    <string name="%s" translatable="false">%s</string>\n' % (k, sx.escape(v))
+xml += '</resources>\n'
+open(dst, 'w').write(xml)
+print('FCM: fcm_values.xml OK (project=%s)' % vals['google_project_id'])
+PYEOF
+  then
+    $BT/aapt2 compile --dir $OUT/fcm-res -o $OUT/fcm-res.zip
+    FCM_RES_ARGS=(-R $OUT/fcm-res.zip)
+  fi
+else
+  echo "FCM: google-services.json nahi mila — polling fallback (build nahi tootega)"
+fi
+
 $BT/aapt2 link -o $OUT/base.apk \
   -I $SDK/platforms/android-34/android.jar \
   --manifest $OUT/AndroidManifest.xml \
@@ -71,6 +135,7 @@ $BT/aapt2 link -o $OUT/base.apk \
   --auto-add-overlay \
   --java $OUT/gen \
   "${AAR_RES_ARGS[@]}" \
+  "${FCM_RES_ARGS[@]}" \
   $OUT/res.zip
 # R.java bani ya nahi — nahi bani to aage badhne ka matlab nahi
 test -f $OUT/gen/com/formmitra/app/R.java

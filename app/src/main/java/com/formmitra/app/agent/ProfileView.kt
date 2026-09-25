@@ -101,6 +101,77 @@ class ProfileView(
             LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
                 .apply { setMargins(0, dp(8), 0, 0) }
         )
+        // (b2) v20 Task 4: A-to-Z vault profile form (sab optional)
+        val fullFormBtn = Button(context).apply {
+            text = "📝 Poora Profile Form (A–Z)"
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            background = with(UiKit) { context.primaryBtnBg() }
+            setOnClickListener { showFullProfileForm() }
+        }
+        UiKit.pressFeedback(fullFormBtn)
+        content.addView(
+            fullFormBtn,
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
+                .apply { setMargins(0, dp(8), 0, 0) }
+        )
+
+        // (b3) G1: Working Mode toggle — background automation ON/OFF.
+        // ON: WorkManager (form-tasks 30-min, digest 6h) + NetWake active;
+        //     FCM push / network-wake / app-open par WakeWorker resume karega.
+        // OFF: workers cancel, wake callback hatao (chalta run poora hoga).
+        content.addView(sectionTitle("⚙️ Working Mode"))
+        val wmCard = LinearLayout(context).apply {
+            orientation = VERTICAL
+            background = cardBg()
+            setPadding(pad, dp(10), pad, dp(10))
+        }
+        val wmRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        val wmLabel = TextView(context).apply {
+            text = "🔄 Background Automation"
+            textSize = 15f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#202124"))
+            layoutParams = LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val wmSwitch = android.widget.Switch(context).apply {
+            isChecked = WorkingMode.isEnabled(context)
+        }
+        wmRow.addView(wmLabel)
+        wmRow.addView(wmSwitch)
+        wmCard.addView(wmRow)
+        val wmDesc = TextView(context).apply {
+            textSize = 12f
+            setTextColor(Color.parseColor("#5F6368"))
+            setPadding(0, dp(6), 0, 0)
+        }
+        fun wmDescText(on: Boolean) = if (on)
+            "ON — app band hone par bhi kaam chalta rahega: push/network/app-open par " +
+                "wake + usi step se resume. Battery-friendly intervals."
+        else
+            "OFF — background automation band. Naya background kaam shuru nahi hoga " +
+                "(jo run chal raha hai wo poora hokar rukega)."
+        wmDesc.text = wmDescText(wmSwitch.isChecked)
+        wmCard.addView(wmDesc)
+        wmSwitch.setOnCheckedChangeListener { _, on ->
+            WorkingMode.setEnabled(context, on)
+            wmDesc.text = wmDescText(on)
+            android.widget.Toast.makeText(
+                context,
+                if (on) "Working Mode ON ✅" else "Working Mode OFF",
+                android.widget.Toast.LENGTH_SHORT
+            ).show()
+            // G6: ON karte hi battery-optimization guide (ek baar, force nahi).
+            if (on) promptBatteryGuide()
+        }
+        content.addView(
+            wmCard,
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
+                .apply { setMargins(0, dp(4), 0, 0) }
+        )
 
         // (c) Document Vault
         vaultSection.orientation = VERTICAL
@@ -201,11 +272,23 @@ class ProfileView(
             val saved = try { DocsStore.saveDoc(context, uri) }
             catch (_: Exception) { null }
             post {
-                toast(
-                    if (!saved.isNullOrEmpty()) "✓ Document save ho gaya"
-                    else "⚠️ Save nahi hua — dobara try karo"
-                )
-                if (!saved.isNullOrEmpty()) refreshVault()
+                if (!saved.isNullOrEmpty()) {
+                    toast("✓ Document save ho gaya")
+                    // v20 Task 3: "Kaun sa document hai?" — type device-local
+                    // save hota hai, server ko kabhi nahi jata (doc-privacy).
+                    val act = context as? Activity
+                    if (act != null) {
+                        UiKit.askDocType(act) { type ->
+                            DocsStore.setDocType(context, saved, type)
+                            toast("🏷️ $type ke roop me save hua")
+                            refreshVault()
+                        }
+                    } else {
+                        refreshVault()
+                    }
+                } else {
+                    toast("⚠️ Save nahi hua — dobara try karo")
+                }
             }
         }, "fm-vaultsave").start()
     }
@@ -331,6 +414,113 @@ class ProfileView(
             .show()
     }
 
+    // ---------- (b2) v20 Task 4: A-to-Z profile form ----------
+
+    /**
+     * Poora profile form — EXACT server field keys (spelling mat badalna):
+     * full_name, father_name, mother_name, dob, gender, phone, email,
+     * village, post, district, state, pincode, address, qualification,
+     * occupation, category_caste, id_numbers.
+     * Sab OPTIONAL — partial save hota hai. PUT /api/agent/profile par
+     * `confirmed` field BHEJA HI NAHI jata (absent = server save karta hai).
+     * Yehi details agent document bharne me use karega.
+     */
+    private fun showFullProfileForm() {
+        val act = context as? Activity ?: return
+        with(UiKit) {
+            val layout = LinearLayout(act).apply {
+                orientation = VERTICAL
+                setPadding(act.dp(16), act.dp(8), act.dp(16), act.dp(8))
+            }
+            layout.addView(TextView(act).apply {
+                text = "Sab optional hai — jo pata ho bhar do. " +
+                    "Yehi details agent document bharne me use karega."
+                textSize = 13f
+                setTextColor(Color.parseColor("#80868B"))
+                setPadding(0, 0, 0, act.dp(6))
+            })
+            val sections = listOf(
+                "👤 Personal" to listOf(
+                    "full_name", "father_name", "mother_name", "dob",
+                    "gender", "phone", "email"
+                ),
+                "🏠 Address" to listOf(
+                    "village", "post", "district", "state", "pincode", "address"
+                ),
+                "📚 Other" to listOf(
+                    "qualification", "occupation", "category_caste", "id_numbers"
+                )
+            )
+            val edits = LinkedHashMap<String, EditText>()
+            for ((secTitle, keys) in sections) {
+                layout.addView(act.sectionTitle(secTitle).apply {
+                    setPadding(0, act.dp(10), 0, act.dp(2))
+                })
+                for (k in keys) {
+                    layout.addView(act.fieldLabel(DetailExtractor.label(k)))
+                    val et = act.formInput(hintFor(k), cachedProfile[k] ?: "")
+                    layout.addView(et)
+                    edits[k] = et
+                }
+            }
+            val dlg = AlertDialog.Builder(act)
+                .setTitle("📝 Poora Profile Form")
+                .setView(ScrollView(act).apply { addView(layout) })
+                .setPositiveButton("💾 Save karo", null)
+                .setNegativeButton("Band karo", null)
+                .create()
+            dlg.setOnShowListener {
+                dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                    val vals = LinkedHashMap<String, String>()
+                    edits.forEach { (k, et) ->
+                        val v = et.text.toString().trim()
+                        if (v.isNotEmpty()) vals[k] = v
+                    }
+                    if (vals.isEmpty()) {
+                        toast("Kuch bhara hi nahi — save cancel")
+                        return@setOnClickListener
+                    }
+                    dlg.dismiss()
+                    toast("Save ho raha hai…")
+                    Thread({
+                        val ok = try {
+                            AgentApi.saveProfileForm(context, vals)
+                        } catch (_: Exception) { false }
+                        post {
+                            toast(
+                                if (ok) "✓ Poora profile save ho gaya"
+                                else "⚠️ Save me dikkat — baad me try karo"
+                            )
+                            if (ok) loadDetails()
+                        }
+                    }, "fm-fullformsave").start()
+                }
+            }
+            dlg.show()
+        }
+    }
+
+    private fun hintFor(key: String): String = when (key) {
+        "full_name" -> "Apna poora naam"
+        "father_name" -> "Pita ka naam"
+        "mother_name" -> "Mata ka naam"
+        "dob" -> "DD/MM/YYYY"
+        "gender" -> "Male / Female / Other"
+        "phone" -> "10-digit mobile"
+        "email" -> "Email address"
+        "village" -> "Gaon"
+        "post" -> "Post office"
+        "district" -> "Zila"
+        "state" -> "Rajya"
+        "pincode" -> "6-digit pincode"
+        "address" -> "Poora pata"
+        "qualification" -> "Padhai (10th/12th/Graduate…)"
+        "occupation" -> "Kaam (kisan/mazdoor…)"
+        "category_caste" -> "SC / ST / OBC / General"
+        "id_numbers" -> "Aadhaar/PAN no. (zaroorat par)"
+        else -> ""
+    }
+
     // ---------- (c) Document Vault ----------
 
     private fun refreshVault() {
@@ -354,8 +544,13 @@ class ProfileView(
                     background = cardBg()
                     setPadding(dp(10), dp(8), dp(10), dp(8))
                 }
+                // v20 Task 3: doc type badge (device-local metadata)
+                val dtype = try { DocsStore.getDocType(context, name) }
+                catch (_: Exception) { "" }
                 val tv = TextView(context).apply {
-                    text = "📄 $name\nagent tasks me auto-available rahega"
+                    text = "📄 $name" +
+                        (if (dtype.isNotEmpty()) "\n🏷️ $dtype" else "") +
+                        "\nagent tasks me auto-available rahega"
                     textSize = 13f
                     setTextColor(Color.parseColor("#202124"))
                     layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
@@ -373,6 +568,7 @@ class ProfileView(
                         LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
                     ).apply { setMargins(0, 0, 0, dp(6)) }
                 )
+                UiKit.appear(row)
             }
         }
     }
@@ -456,6 +652,61 @@ class ProfileView(
             }
             .setNegativeButton("Raho", null)
             .show()
+    }
+
+    /**
+     * G6: Battery-optimization guide — Working Mode ON par ek baar.
+     * Force nahi karte: samjhate hain + Settings kholne ka button dete hain.
+     * (Doze/battery-optimization background workers ko rok sakti hai.)
+     */
+    private fun promptBatteryGuide() {
+        val act = context as? Activity ?: return
+        try {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+            if (pm != null && pm.isIgnoringBatteryOptimizations(context.packageName)) return
+        } catch (_: Exception) { }
+        try {
+            val prefs = context.getSharedPreferences("formmitra_working", Context.MODE_PRIVATE)
+            if (prefs.getBoolean("battery_guide_shown", false)) return
+            prefs.edit().putBoolean("battery_guide_shown", true).apply()
+        } catch (_: Exception) { }
+        AlertDialog.Builder(act)
+            .setTitle("🔋 Background ke liye ek setting")
+            .setMessage(
+                "Phone ki battery-optimization FormMitra ke background kaam ko rok sakti hai.\n\n" +
+                    "\"Settings kholo\" dabao → \"Allow\" / \"Don't optimize\" chuno — " +
+                    "uske baad Working Mode poori tarah kaam karega.\n\n" +
+                    "(Ye zaroori nahi — bina iske bhi app khulne par kaam resume hoga.)"
+            )
+            .setPositiveButton("⚙️ Settings kholo") { dlg, _ ->
+                dlg.dismiss()
+                openBatterySettings()
+            }
+            .setNegativeButton("Baad me", null)
+            .show()
+    }
+
+    private fun openBatterySettings() {
+        try {
+            val pkg = context.packageName
+            val intents = listOf(
+                Intent(
+                    android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    android.net.Uri.parse("package:$pkg")
+                ),
+                Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+            )
+            for (i in intents) {
+                try {
+                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(i)
+                    return
+                } catch (_: Exception) { }
+            }
+            toast("Settings → Battery → FormMitra → Don't optimize")
+        } catch (_: Exception) {
+            toast("Settings → Battery → FormMitra → Don't optimize")
+        }
     }
 
     // ---------- helpers ----------

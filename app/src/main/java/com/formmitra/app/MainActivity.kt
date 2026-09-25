@@ -156,6 +156,12 @@ class MainActivity : Activity() {
                 if (target == "vault") openProfileVault()
                 else selectTab(target)
             },
+            // v20 Task 5: work-category card → pehle Home dikhao, phir chat
+            // usi category context me kholo (body me `category` jayega)
+            onStartCategory = { category, label, prefill ->
+                if (!homeVisible) selectTab("/")
+                agentChatView.startCategoryChat(category, label, prefill)
+            },
             onShowMirror = { showMirror() }
         ).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -233,6 +239,9 @@ class MainActivity : Activity() {
             )
             isHorizontalScrollBarEnabled = false
             addView(navInner)
+            // v20 Task 2: halki top divider + shadow — nav alag dikhe
+            setBackgroundColor(Color.parseColor("#FFFFFF"))
+            try { elevation = 6f } catch (_: Exception) { }
         }
         root.addView(navScroll)
         setContentView(root)
@@ -329,6 +338,13 @@ class MainActivity : Activity() {
                 if (req != null &&
                     !com.formmitra.app.agent.PromptDialog.isShowing(req.runId)
                 ) {
+                    // v20-C: voice help mode — agent atka, user ka action
+                    // chahiye → TTS se sunao (mute ho to sirf popup).
+                    try {
+                        com.formmitra.app.agent.VoiceHelp.announcePrompt(
+                            this@MainActivity, req
+                        )
+                    } catch (_: Exception) { }
                     com.formmitra.app.agent.PromptDialog.show(
                         this@MainActivity, req
                     )
@@ -579,41 +595,32 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    // ---------- agent resume ----------
+    // ---------- agent resume (G2) ----------
 
-    /** Engine ka AgentResume object — direct call (class hamesha present hai). */
-    private fun checkAgentResume(): Triple<String, String, String?>? {
-        return try {
+    private fun maybeShowResumeDialog() {
+        val pending = try {
             com.formmitra.app.engine.AgentResume.checkPending(this)
         } catch (_: Exception) {
             null
-        }
-    }
-
-    private fun clearAgentResume() {
-        try {
-            com.formmitra.app.engine.AgentResume.clear(this)
-        } catch (_: Exception) { }
-    }
-
-    private fun maybeShowResumeDialog() {
-        val pending = checkAgentResume() ?: return
-        val (goal, url) = pending
+        } ?: return
         AlertDialog.Builder(this)
             .setTitle("Adhura kaam")
-            .setMessage("Pichhla kaam adhura reh gaya tha:\n$goal\nDobara chalau?")
+            .setMessage(
+                "Pichhla kaam adhura reh gaya tha:\n${pending.goal}\n" +
+                    "(step ${pending.stepsTaken} tak hua tha)\nUsi step se continue karu?"
+            )
             .setPositiveButton("Chalao") { _, _ ->
-                clearAgentResume()
-                Thread {
-                    val (_, taskId) =
-                        com.formmitra.app.agent.AgentApi.createTask(this, goal, url)
-                    if (!taskId.isNullOrEmpty()) {
-                        com.formmitra.app.agent.AgentApi.runNow(this, taskId)
-                    }
-                    runOnUiThread { selectTab("/") }
-                }.start()
+                // Naya task NAHI — WakeWorker pending run ko USI STEP se
+                // resume karega (WorkingMode ON hona chahiye).
+                com.formmitra.app.agent.WorkingMode.setEnabled(this, true)
+                com.formmitra.app.WakeWorker.enqueue(this)
+                runOnUiThread { selectTab("/") }
             }
-            .setNegativeButton("Chhodo") { _, _ -> clearAgentResume() }
+            .setNegativeButton("Chhodo") { _, _ ->
+                try {
+                    com.formmitra.app.engine.AgentResume.clear(this)
+                } catch (_: Exception) { }
+            }
             .setCancelable(false)
             .show()
     }
@@ -653,6 +660,14 @@ class MainActivity : Activity() {
             val granted = grantResults.isNotEmpty() &&
                 grantResults[0] == PackageManager.PERMISSION_GRANTED
             com.formmitra.app.agent.PromptDialog.onVoicePermissionResult(this, granted)
+        }
+        // v20-B: category details popup ke mic ka permission result.
+        if (requestCode == HomeView.REQ_POPUP_VOICE_PERM &&
+            ::homeView.isInitialized
+        ) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            homeView.onPopupVoicePermissionResult(granted)
         }
     }
 

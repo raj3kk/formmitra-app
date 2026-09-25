@@ -15,6 +15,12 @@ class FormTaskWorker(appContext: Context, params: WorkerParameters) : Worker(app
 
     override fun doWork(): Result {
         return try {
+            // G2/J1 duplicate-run guard: WakeWorker ya pichla poll pehle se
+            // koi run chala raha ho to naya claim mat karo.
+            if (FormRunService.activeTaskId != null) {
+                Log.i("FormTaskWorker", "run already active — skip")
+                return Result.success()
+            }
             val task = FormApi.nextTask(applicationContext) ?: return Result.success()
             val runId = task.optString("run_id").ifEmpty { task.optString("id") }
             // Service me handoff — service khud progress + terminal report karega.

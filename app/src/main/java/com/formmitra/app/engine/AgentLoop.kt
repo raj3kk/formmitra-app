@@ -64,13 +64,22 @@ object AgentLoop {
         onOfflineMode: () -> Unit = {},
         onStandaloneMode: () -> Unit = {},
         /** true = server ko chhodo, har step StandaloneBrain (user ki Groq key) se */
-        forceStandalone: Boolean = false
+        forceStandalone: Boolean = false,
+        /** Category-wise full automation: har act() call me server brain ko
+         *  category pata chale (apply_track / zamin_track / resume_create /
+         *  job_find / scholarship). */
+        category: String = "",
+        /**
+         * G2 (Background Working Mode): resume par ye step already ho chuke
+         * hain — loop (startStep + 1) se continue karega, shuru se nahi.
+         */
+        startStep: Int = 0
     ): FormEngine.RunResult {
         val stepsLog = JSONArray()
         val history = ArrayList<JSONObject>()
         var stuckCount = 0
         var consecErrors = 0
-        var stepsTaken = 0
+        var stepsTaken = startStep.coerceAtLeast(0)
         val recentSigs = ArrayList<String>()
         // User se mile values (otp/email/phone/choice) — agle act() calls me context.
         // DHYAAN: OTP/password kabhi userProvided me NAHI aate (neeche
@@ -89,8 +98,11 @@ object AgentLoop {
         val effectiveRunId = runId.ifEmpty { "local-${System.currentTimeMillis()}" }
 
         // Resume state: agent_run shuru hote hi save (kill/reboot ke baad
-        // UI agent checkPending se resume karega). Terminal par clear.
-        try { AgentResume.save(ctx, goal, startUrl, effectiveRunId) } catch (_: Exception) { }
+        // WakeWorker checkPending se USI STEP se resume karega). Terminal par
+        // clear (finish() me — needs_user/failed par rakha jata hai).
+        try {
+            AgentResume.save(ctx, goal, startUrl, effectiveRunId, effectiveRunId, category)
+        } catch (_: Exception) { }
         // Server-side run record (best-effort — fail ho to bina reporting chalao)
         var agentRunId: String? = null
         try { agentRunId = RunReporter.createRun(ctx, goal, startUrl, effectiveRunId) } catch (_: Exception) { }
@@ -123,8 +135,16 @@ object AgentLoop {
         }
 
         fun finish(status: String, summary: String): FormEngine.RunResult {
-            // terminal state: resume clear + server ko report (dono best-effort)
-            try { AgentResume.clear(ctx) } catch (_: Exception) { }
+            // G2: needs_user / failed / needs_admin par resume state RAKHO —
+            // WakeWorker ya user-jawab par usi step se continue hoga.
+            // Sirf true terminal (done/cancelled/vetoed) par clear.
+            if (status == "done" || status == "cancelled" || status == "vetoed") {
+                try { AgentResume.clear(ctx) } catch (_: Exception) { }
+            } else {
+                try {
+                    AgentResume.updateProgress(ctx, stepsTaken, summary)
+                } catch (_: Exception) { }
+            }
             try {
                 RunReporter.updateRun(
                     ctx, agentRunId ?: "", status, stepsTaken,
@@ -159,6 +179,10 @@ object AgentLoop {
         VetoCheck.find("$goal $startUrl")?.let {
             logStep(0, "precheck", true, "payment keyword '$it' — fee expected, assisted flow ready")
             pushHistory("precheck", mapOf("keyword" to it), "ok", "payment expected")
+        }
+        // Category-wise full automation marker (steps me dikhega)
+        if (category.isNotEmpty()) {
+            logStep(0, "category", true, "category=$category — poora automation, max $maxSteps steps")
         }
 
         try {
@@ -218,7 +242,8 @@ object AgentLoop {
 
             var currentUrl = startUrl
             val captchaAttempts = intArrayOf(0)
-            for (i in 1..maxSteps) {
+            // G2 resume: startStep steps pehle ho chuke — (startStep + 1) se continue.
+            for (i in (stepsTaken + 1)..maxSteps) {
                 onProgress(i)
 
                 // (a)+(c) PARALLEL: DOM snapshot + screenshot ek saath
@@ -279,6 +304,9 @@ object AgentLoop {
                     .put("history", hArr)
                     .put("stuck_count", stuckCount)
                     .put("run_id", runId)
+                    // Category-wise automation: brain har step par jaane kaam
+                    // kis category ka hai (khali ho to field nahi bhejte)
+                    .apply { if (category.isNotEmpty()) put("category", category) }
                     // OTP/password yahan se filtered — AI/server ko kabhi nahi jate
                     .put("user_provided", filteredUserProvided(userProvided, sensitiveKeys))
                 // forceStandalone (offline task): server ko chhodo, seedha user ki
@@ -483,6 +511,11 @@ object AgentLoop {
                     val dStr = detail.toString().take(300)
                     logStep(i, action, true, dStr)
                     pushHistory(action, stepMap, "ok", dStr)
+                    // G2: har successful step par progress persist — kill/reboot
+                    // par WakeWorker usi step se resume karega.
+                    try {
+                        AgentResume.updateProgress(ctx, stepsTaken, dStr)
+                    } catch (_: Exception) { }
                 } catch (e: FormEngine.VetoException) {
                     logStep(i, action, false, "VETO: ${e.message}")
                     // Payment page beech me aaya → user se approval lo (assisted

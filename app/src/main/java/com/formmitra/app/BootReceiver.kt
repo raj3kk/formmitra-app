@@ -14,11 +14,12 @@ class BootReceiver : BroadcastReceiver() {
         if (Intent.ACTION_BOOT_COMPLETED == intent.action) {
             // FmApp.onCreate receiver se pehle chal chuka hai (WorkManager
             // init). Phir bhi guard: boot crash se bura kuch nahi.
+            // G1: WorkingMode toggle ke hisaab se — ON ho to workers+NetWake,
+            // OFF ho to schedule nahi (purani setting reboot par yaad rehti hai).
             try {
-                Scheduler.scheduleDigest(context)
-                Scheduler.scheduleFormTasks(context)
+                com.formmitra.app.agent.WorkingMode.apply(context)
             } catch (t: Throwable) {
-                Log.e("BootReceiver", "Scheduler failed (non-fatal)", t)
+                Log.e("BootReceiver", "WorkingMode.apply failed (non-fatal)", t)
             }
             // Standalone (offline) tasks: reboot par dobara uthao — ye poori
             // tarah local hain, isliye auto-resume safe hai.
