@@ -97,16 +97,6 @@ class AgentChatView(
         } catch (_: Exception) { }
     }
 
-    /** Home ke 💬 Mitra header se — chat input par focus. */
-    fun focusInput() {
-        try {
-            input.requestFocus()
-            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE)
-                as? android.view.inputmethod.InputMethodManager
-            imm?.showSoftInput(input, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
-        } catch (_: Exception) { }
-    }
-
     /**
      * v24 #2: Through Agent card-create — agent ek-ek karke poochhega
      * (voice Q&A). Saaf Hinglish intro; server agent validate + samjhaye.
@@ -382,7 +372,7 @@ class AgentChatView(
         }
         inputRow.addView(speakBtn)
         sendBtn = Button(context).apply {
-            text = "➤"
+            text = "Bhejo ➤"
             textSize = 18f
             layoutParams = LayoutParams(
                 LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT
@@ -859,7 +849,7 @@ class AgentChatView(
                                 context, NotifCenter.Cat.STATUS,
                                 "⏳ Aaj ka limit khatam",
                                 "Agent ka daily limit poora ho gaya — kal phir try karo.",
-                                deepTab = "/"
+                                deepTab = "/agent"
                             )
                         } catch (_: Exception) { }
                     }
@@ -1383,7 +1373,7 @@ class AgentChatView(
         pollHandler.post(pollRunnable)
     }
 
-    /** Home chhupa to polling band. */
+    /** Agent tab chhupa to polling band. */
     fun onTabHidden() {
         polling = false
         pollHandler.removeCallbacks(pollRunnable)
@@ -1760,8 +1750,10 @@ class AgentChatView(
             stopListening()
             if (t.isNotEmpty()) {
                 val cur = voiceBaseText.ifBlank { input.text.toString() }
-                input.setText(if (cur.isBlank()) t else "$cur $t")
-                input.setSelection(input.text.length)
+                val full = if (cur.isBlank()) t else "$cur $t"
+                // RC1 FIX (v26): bola hua seedha agent ko bhejo — pehle
+                // sirf input me text set hota tha, sendMessage kabhi nahi hota tha.
+                sendMessage(full)
             } else {
                 toast("Kuch suna nahi gaya — dobara bolo")
             }

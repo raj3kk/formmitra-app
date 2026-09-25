@@ -14,25 +14,27 @@ import android.widget.TextView
 import java.io.File
 
 /**
- * HomeView — Home tab ka native view (v24).
+ * HomeView — Home tab ka native view (v26).
  *
  * v24 restructure:
  *  - HATA DIYA (B6/B7): top chips strip (Tracking/Jobs/Scholarships/Resume)
  *    aur Quick links section.
- *  - A4: upar ka content PROPER ScrollView me (weight 1) + neeche Mitra
- *    chat (weight 1) — chhoti screen par bhi sab dikhe, kuch kate nahi.
+ *  - A4: upar ka content PROPER ScrollView me (weight 1) — poori jagah lega.
  *  - B8: category card tap → details-fill popup NAHI → card-first flow
  *    (CardFlow): card select (PIN unlock) ya naya card banao, tab kaam shuru.
  *  - D19: sab named sections — tap → open/fill/read.
  *
+ * v26 restructure (user order):
+ *  - HATA DIYA: 💬 Mitra embedded chat (neeche fixed chat block + section header).
+ *    Agent chat ab dedicated full-screen "💬 Agent" tab (/agent) me hai.
+ *    Kaam par click → card-first flow ke baad Agent tab khulta hai.
+ *
  * Sections:
  *  (1) 🎯 Kaam chuno (काम चुनें) — 5 work-category cards
  *  (2) 🔴 Live browser button (automation chal raha ho tabhi)
- *  (3) 💬 Mitra (मित्र) — embedded agent chat (neeche fixed)
  */
 class HomeView(
     context: Context,
-    chatView: AgentChatView,
     private val onStartCategory: (
         category: String, label: String, prefill: Map<String, String>,
         cardId: String, cardName: String, cardToken: String
@@ -44,7 +46,6 @@ class HomeView(
 ) : LinearLayout(context) {
 
     private val liveBtn: Button
-    private val chat: AgentChatView = chatView
 
     // v23 FIX yaad rakho: UiKit.dp Context extension hai — with(UiKit)
     // me bare dp(v) mat bulao (self-recursion). Seedha formula.
@@ -143,34 +144,6 @@ class HomeView(
             ).apply { setMargins(0, dp(8), 0, dp(4)) }
         )
 
-        // (3) 💬 Mitra section header — tap → chat par focus
-        val mitraHead = LinearLayout(context).apply {
-            orientation = VERTICAL
-            background = with(UiKit) { context.cardBg() }
-            setPadding(pad, dp(10), pad, dp(10))
-            isClickable = true
-            isFocusable = true
-            setOnClickListener { chat.focusInput() }
-            UiKit.pressFeedback(this)
-        }
-        mitraHead.addView(TextView(context).apply {
-            text = "💬 Mitra (मित्र) — neeche chat me likho ya 🎤 bolo"
-            textSize = 14f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.parseColor("#202124"))
-        })
-        mitraHead.addView(TextView(context).apply {
-            text = "Tap karo — likhne par focus hoga"
-            textSize = 12f
-            setTextColor(Color.parseColor("#80868B"))
-        })
-        content.addView(
-            mitraHead,
-            LayoutParams(
-                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, dp(8), 0, dp(4)) }
-        )
-
         scroll.addView(
             content,
             android.view.ViewGroup.LayoutParams(
@@ -179,12 +152,6 @@ class HomeView(
             )
         )
         addView(scroll)
-
-        // ---- neeche: Mitra chat (fixed, hamesha dikhe) ----
-        chatView.layoutParams = LayoutParams(
-            LayoutParams.MATCH_PARENT, 0, 1f
-        )
-        addView(chatView)
     }
 
     /** Work-category card: icon + label + desc; tap → CARD-FIRST flow (B8). */

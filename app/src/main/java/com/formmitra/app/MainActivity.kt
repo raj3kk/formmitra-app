@@ -37,7 +37,8 @@ import java.net.URL
  * FormMitra v19 — tabs: Home (Mitra chat embedded), History, Wallet, Profile (native).
  * (+ Admin tab sirf owner email par.)
  *
- * Home = native HomeView (services strip + category cards + live button + agent chat).
+ * Home = native HomeView (services strip + category cards + live button).
+ * Agent = native AgentChatView (dedicated full-screen agent chat tab /agent).
  * History = native HistoryView. Profile = native ProfileView (details/vault/admin/logout).
  * Wallet/Admin = website WebView me (unhi par ?app=1 lagta hai).
  * Purane Agent/Browser/Tracking/Jobs tabs hata diye — services Home strip se khulte hain.
@@ -52,6 +53,7 @@ class MainActivity : Activity() {
     private lateinit var homeView: HomeView
     private lateinit var agentChatView: AgentChatView
     private var homeVisible = false
+    private var agentVisible = false
     private lateinit var historyView: com.formmitra.app.agent.HistoryView
     private var historyVisible = false
     private lateinit var profileView: ProfileView
@@ -86,6 +88,7 @@ class MainActivity : Activity() {
 
     private val baseTabs = listOf(
         "Home" to "/",
+        "💬 Agent" to "/agent",
         "History" to "/history",
         "Wallet" to "/wallet",
         "Profile" to "/profile"
@@ -165,19 +168,26 @@ class MainActivity : Activity() {
             webViewOk = false
         }
 
-        // Home: native — work categories (card-first) + live button + Mitra chat
+        // Home: native — work categories (card-first) + live button
+        // v26: AgentChatView ab Home me embedded NAHI — dedicated full-screen
+        // "💬 Agent" tab (/agent) me hai.
         agentChatView = AgentChatView(
             this,
             { url -> openLinkInWebView(url) },
             { selectTab("/profile") }
-        )
-        // v24 #2: chat se "Through Agent" card-create → yahin chat khulta hai.
+        ).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            )
+            visibility = View.GONE
+        }
+        root.addView(agentChatView)
+        // v24 #2: chat se "Through Agent" card-create → Agent tab khulta hai.
         agentChatView.onAgentCreateRequest = { prefill ->
             onAgentCreateCard(null, null, prefill)
         }
         homeView = HomeView(
             this,
-            agentChatView,
             // v24 B8/C14: category card → card-first flow complete hone par
             // card bind + category chat start (prefill card se).
             onStartCategory = { category, label, prefill, cardId, cardName, cardToken ->
@@ -220,9 +230,9 @@ class MainActivity : Activity() {
             )
             visibility = View.GONE
         }
-        // v24 #2: Profile ke "Through Agent" se card-create → chat kholo.
+        // v24 #2: Profile ke "Through Agent" se card-create → Agent tab kholo.
         profileView.onAgentCreateRequest = { prefill ->
-            selectTab("/")
+            selectTab("/agent")
             agentChatView.startAgentCardCreate(prefill)
         }
         root.addView(profileView)
@@ -314,7 +324,7 @@ class MainActivity : Activity() {
 
     /** Purane tab paths (notification/deep-link) → naye tabs. */
     private fun mapLegacyTab(path: String): String = when (path) {
-        "/agent", "/browser" -> "/"
+        "/browser" -> "/"
         else -> path
     }
 
@@ -353,7 +363,7 @@ class MainActivity : Activity() {
     /**
      * K1: notification tap → seedha sahi screen.
      * Extras (NotifCenter se):
-     *  - fm_deep_tab: "/history" | "/profile" | "/" (wallet/admin = WebView tab)
+     *  - fm_deep_tab: "/history" | "/profile" | "/agent" | "/" (wallet/admin = WebView tab)
      *  - fm_deep_run_id: History me is run ki detail khule
      *  - fm_deep_prompt: is run ka pending prompt (dialog/resume rasta)
      * Purane deep_url/open_tab flow ko nahi chhoota.
@@ -441,28 +451,35 @@ class MainActivity : Activity() {
     private fun baseUrl(): String = BuildConfig.SITE_URL.trimEnd('/')
 
     private fun selectTab(path: String) {
-        val wasHome = homeVisible
+        val wasAgent = agentVisible
         homeVisible = false
+        agentVisible = false
         historyVisible = false
         profileVisible = false
         mirrorVisible = false
         mirrorHandler.removeCallbacks(mirrorRunnable)
         homeView.visibility = View.GONE
+        agentChatView.visibility = View.GONE
         historyView.visibility = View.GONE
         profileView.visibility = View.GONE
         browserMirrorView.visibility = View.GONE
         webView?.visibility = View.GONE
-        if (wasHome && path != "/") agentChatView.onTabHidden()
+        if (wasAgent && path != "/agent") agentChatView.onTabHidden()
         val tabPaths = currentTabs().map { it.second }.toSet()
         when {
             path == "/" -> {
                 homeView.visibility = View.VISIBLE
                 homeVisible = true
-                agentChatView.onTabShown()
                 try { homeView.refreshLiveButton() } catch (_: Exception) { }
                 // v24 #2: agent se card ban gaya ho to pending category
                 // auto-continue (coordination toote nahi).
                 try { resumePendingCategory() } catch (_: Exception) { }
+            }
+            path == "/agent" -> {
+                // v26: dedicated full-screen agent chat tab.
+                agentChatView.visibility = View.VISIBLE
+                agentVisible = true
+                agentChatView.onTabShown()
             }
             path == "/history" -> {
                 historyView.visibility = View.VISIBLE
@@ -482,7 +499,6 @@ class MainActivity : Activity() {
                     // v22: WebView nahi bana — Home par raho, user ko batao
                     homeView.visibility = View.VISIBLE
                     homeVisible = true
-                    try { agentChatView.onTabShown() } catch (_: Exception) { }
                     Toast.makeText(
                         this,
                         "Is phone par WebView uplabdh nahi — ye tab nahi khul sakta",
@@ -501,7 +517,6 @@ class MainActivity : Activity() {
                     // v22: WebView nahi bana — Home par raho
                     homeView.visibility = View.VISIBLE
                     homeVisible = true
-                    try { agentChatView.onTabShown() } catch (_: Exception) { }
                     Toast.makeText(
                         this,
                         "Is phone par WebView uplabdh nahi — ye page nahi khul sakta",
@@ -532,7 +547,7 @@ class MainActivity : Activity() {
         cardName: String,
         cardToken: String
     ) {
-        if (!homeVisible) selectTab("/")
+        if (!agentVisible) selectTab("/agent")
         agentChatView.startCategoryChat(
             category, label, prefill, cardId, cardName, cardToken
         )
@@ -556,7 +571,7 @@ class MainActivity : Activity() {
                     com.formmitra.app.agent.CardFlow.knownCardIds(this)
             } catch (_: Exception) { }
         }, "fm-known-cards").start()
-        if (!homeVisible) selectTab("/")
+        if (!agentVisible) selectTab("/agent")
         agentChatView.startAgentCardCreate(prefill)
     }
 
@@ -688,15 +703,17 @@ class MainActivity : Activity() {
 
     /** Home ke "🔴 Live" button se — agent ka live browser dikhao. */
     private fun showMirror() {
+        if (agentVisible) agentChatView.onTabHidden()
         homeVisible = false
+        agentVisible = false
         historyVisible = false
         profileVisible = false
         mirrorHandler.removeCallbacks(mirrorRunnable)
         homeView.visibility = View.GONE
+        agentChatView.visibility = View.GONE
         historyView.visibility = View.GONE
         profileView.visibility = View.GONE
         webView?.visibility = View.GONE
-        agentChatView.onTabHidden()
         browserMirrorView.visibility = View.VISIBLE
         mirrorVisible = true
         mirrorHandler.post(mirrorRunnable)
@@ -706,13 +723,15 @@ class MainActivity : Activity() {
 
     /** Plan card ke official link ko main WebView me kholo. */
     private fun openLinkInWebView(url: String) {
-        if (homeVisible) agentChatView.onTabHidden()
+        if (agentVisible) agentChatView.onTabHidden()
         homeVisible = false
+        agentVisible = false
         historyVisible = false
         profileVisible = false
         mirrorVisible = false
         mirrorHandler.removeCallbacks(mirrorRunnable)
         homeView.visibility = View.GONE
+        agentChatView.visibility = View.GONE
         historyView.visibility = View.GONE
         profileView.visibility = View.GONE
         browserMirrorView.visibility = View.GONE
@@ -721,7 +740,6 @@ class MainActivity : Activity() {
             // v22: WebView nahi bana — Home par raho
             homeView.visibility = View.VISIBLE
             homeVisible = true
-            try { agentChatView.onTabShown() } catch (_: Exception) { }
             Toast.makeText(
                 this,
                 "Is phone par WebView uplabdh nahi — ye link nahi khul sakta",
@@ -739,17 +757,19 @@ class MainActivity : Activity() {
     private fun loadDeepUrl(fullUrl: String) {
         // v19 BUG 2: query (app=1) hatakar path nikalo — warna tab match toot jayega
         val path = fullUrl.substringBefore("?").removePrefix(baseUrl())
-        val tabPaths = setOf("/", "/history", "/wallet", "/profile", "/admin")
+        val tabPaths = setOf("/", "/agent", "/history", "/wallet", "/profile", "/admin")
         if (path in tabPaths) {
             selectTab(path)
         } else {
-            if (homeVisible) agentChatView.onTabHidden()
+            if (agentVisible) agentChatView.onTabHidden()
             homeVisible = false
+            agentVisible = false
             historyVisible = false
             profileVisible = false
             mirrorVisible = false
             mirrorHandler.removeCallbacks(mirrorRunnable)
             homeView.visibility = View.GONE
+            agentChatView.visibility = View.GONE
             historyView.visibility = View.GONE
             profileView.visibility = View.GONE
             browserMirrorView.visibility = View.GONE
@@ -758,7 +778,6 @@ class MainActivity : Activity() {
                 // v22: WebView nahi bana — Home par raho
                 homeView.visibility = View.VISIBLE
                 homeVisible = true
-                try { agentChatView.onTabShown() } catch (_: Exception) { }
                 Toast.makeText(
                     this,
                     "Is phone par WebView uplabdh nahi — ye page nahi khul sakta",
@@ -805,7 +824,7 @@ class MainActivity : Activity() {
     override fun onBackPressed() {
         if (mirrorVisible) {
             selectTab("/")
-        } else if (homeVisible || historyVisible || profileVisible) {
+        } else if (homeVisible || agentVisible || historyVisible || profileVisible) {
             super.onBackPressed()
         } else if (activePath == "/wallet") {
             // v24 A5 ROOT CAUSE: Wallet khula ho to Back = Home tab par wapas

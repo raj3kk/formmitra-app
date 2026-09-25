@@ -58,7 +58,7 @@ class DigestWorker(appContext: Context, params: WorkerParameters) : Worker(appCo
                         applicationContext,
                         com.formmitra.app.agent.NotifCenter.Cat.STATUS,
                         title, text,
-                        deepTab = "/",
+                        deepTab = "/agent",
                         key = "digest_$id",
                         deepUrl = deep
                     )
