@@ -3822,7 +3822,10 @@ class AgentChatView(
     }
 
     private fun retryTask() {
-        if (bannerUrl.isEmpty()) {
+        // v39: preflight-fail retry — plan bana hi nahi tha to URL khaali
+        // hoga; aise me goal se dobara shuru karo (preflight URL khud
+        // nikalega). Dono khaali hon tabhi "link nahi mila".
+        if (bannerUrl.isEmpty() && bannerGoal.isEmpty()) {
             toast("Link nahi mila — dobara chal nahi sakta")
             return
         }

@@ -49,6 +49,9 @@ class OperatorView : Activity() {
     private lateinit var stopBtn: Button
     private lateinit var webContainer: FrameLayout
     private lateinit var doneBanner: TextView
+    // v39: khaali browser ka empty-state hint — safed blank screen "toota"
+    // nahi lagega; agent idle ho to ye dikhega, kaam shuru hote hi chhupega.
+    private lateinit var emptyHint: TextView
 
     private val uiHandler = Handler(Looper.getMainLooper())
     @Volatile private var destroyed = false
@@ -176,6 +179,21 @@ class OperatorView : Activity() {
             )
         }
         webContainer.addView(doneBanner)
+        // v39: empty-state hint — khaali browser par safed void ki jagah
+        // saaf sandesh (WebView ke UPAR, blocker ke neeche nahi — hint par
+        // touch ki zaroorat nahi, isliye clickable nahi).
+        emptyHint = TextView(this).apply {
+            text = "🌐 Browser taiyaar hai\n\nKaam shuru hote hi yahan live dikhega.\nChat me apna kaam batao."
+            textSize = 16f
+            setTextColor(Color.parseColor("#9E9E9E"))
+            gravity = android.view.Gravity.CENTER
+            setPadding(dp(24), dp(24), dp(24), dp(24))
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        }
+        webContainer.addView(emptyHint)
         root.addView(webContainer)
 
         root.addView(TextView(this).apply {
@@ -241,6 +259,13 @@ class OperatorView : Activity() {
             webContainer.addView(wv, 0)
             webContainer.addView(blocker)
             webContainer.addView(doneBanner)
+            // v39: empty-state hint wapas jodo (removeAllViews ne hataya tha).
+            try {
+                if (::emptyHint.isInitialized) {
+                    (emptyHint.parent as? ViewGroup)?.removeView(emptyHint)
+                    webContainer.addView(emptyHint)
+                }
+            } catch (_: Exception) { }
             attachedWv = wv
             try {
                 LiveWebViewHost.setLiveVisible(true)
@@ -279,6 +304,12 @@ class OperatorView : Activity() {
                 statusText.text = "Live — browser (agent khaali hai)"
                 stopBtn.isEnabled = false
             }
+            // v39: khaali browser par hint dikhao, kaam par chhupao.
+            try {
+                if (::emptyHint.isInitialized) {
+                    emptyHint.visibility = if (active) View.GONE else View.VISIBLE
+                }
+            } catch (_: Exception) { }
         } catch (_: Exception) { }
     }
 

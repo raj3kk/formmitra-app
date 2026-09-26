@@ -25,6 +25,11 @@ object IdempotencyGuard {
     /** Process-level active runs (service restart par prefs backup). */
     private val active = mutableSetOf<String>()
 
+    // v39: runId → goalKey mapping — release() par recent_goals se bhi
+    // hatana hai (nahi to terminal run ke baad 10 min tak repeat block
+    // rehta: "duplicate nahi banaya" ka root cause).
+    private val runGoals = mutableMapOf<String, String>()
+
     /**
      * Pure duplicate check — testable.
      * @param activeRunIds abhi chal rahe runIds
@@ -73,6 +78,8 @@ object IdempotencyGuard {
         val recent = readRecent(ctx)
         if (isDuplicate(active.toSet(), recent, runId, gk, now)) return false
         if (runId.isNotEmpty()) active.add(runId)
+        // v39: release() ke liye mapping yaad rakho.
+        if (runId.isNotEmpty() && gk.isNotEmpty()) runGoals[runId] = gk
         if (gk.isNotEmpty()) writeRecent(ctx, recent + (gk to now))
         return true
     }
@@ -81,6 +88,17 @@ object IdempotencyGuard {
     fun release(ctx: Context, runId: String) {
         try {
             active.remove(runId)
+        } catch (_: Exception) { }
+        // v39: run terminal → goal fingerprint bhi saaf karo taaki wahi
+        // kaam nayi runId se dobara chal sake (10-min block nahi).
+        try {
+            val gk = runGoals.remove(runId)
+            if (!gk.isNullOrEmpty()) {
+                val recent = readRecent(ctx)
+                if (recent.containsKey(gk)) {
+                    writeRecent(ctx, recent - gk)
+                }
+            }
         } catch (_: Exception) { }
     }
 
