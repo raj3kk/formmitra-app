@@ -21,14 +21,14 @@ import org.json.JSONObject
  * Trigger: NetWake (offline→online), app-open, ya FCM push (FmMessagingService).
  * Sirf WorkingMode ON par kaam karta hai.
  *
- * Kaam:
- *  1. Server ping (lightweight): FormApi.nextTask ek hi call me ping +
- *     claim dono karta hai — alag ping call ki zaroorat nahi.
- *  2. Local pending run (AgentResume.checkPending) ho to USI STEP se resume:
- *     synthetic task JSON → FormRunService.startWithTask. AgentLoop ko
- *     startStep milta hai, shuru se nahi chalata.
- *  3. Pending na ho to FormApi.nextTask — naya claimed task mile to handoff.
- *  4. Duplicate-run guard: FormRunService.activeTaskId != null ho to kuch nahi.
+ * Kaam (v41 order — cross-trigger root fix):
+ *  1. FormApi.nextTask — fresh claimed task ho to WAHI chalao; saath me
+ *     koi stale local pending ho to clear (naya kaam purane ko hijack nahi
+ *     hone dega — e.g. scholarship ke saath zamin tracking nahi uthegi).
+ *  2. Fresh task na ho → local pending run (AgentResume.checkPending) ho to
+ *     USI STEP se resume: synthetic task JSON → FormRunService.startWithTask.
+ *     AgentLoop ko startStep milta hai, shuru se nahi chalata.
+ *  3. Duplicate-run guard: FormRunService.activeTaskId != null ho to kuch nahi.
  *
  * Polling fallback (I1/J1): ye worker FCM ke bina bhi chalta hai —
  * NetWake + app-open + 30-min FormTaskWorker chain me.
@@ -48,7 +48,40 @@ class WakeWorker(appContext: Context, params: WorkerParameters) :
                 Log.i("WakeWorker", "run already active — skip")
                 return Result.success()
             }
-            // 1. Pending local run → usi step se resume (G2).
+            // v41 ROOT FIX (cross-trigger): pehle FRESH task claim karo.
+            // Pehle pending-first tha — purana parked run (doosri category ka)
+            // naye kaam ko hijack kar leta tha (e.g. scholarship shuru karo →
+            // purani zamin tracking background me uth jaati thi).
+            // Ab: server par fresh task = user ne NAYA kaam shuru kiya →
+            // purana pending stale hai → clear karke fresh chalao.
+            // Fresh task nahi = crash/reboot case → pending resume (pehle jaisa).
+            val freshTask = try {
+                FormApi.nextTask(ctx)
+            } catch (e: Exception) {
+                Log.e("WakeWorker", "server ping/claim failed — retry", e)
+                return Result.retry()
+            }
+            if (freshTask != null) {
+                val stale = AgentResume.checkPending(ctx)
+                if (stale != null) {
+                    Log.i(
+                        "WakeWorker",
+                        "fresh task aaya — stale pending clear " +
+                            "(goal=${stale.goal.take(40)})"
+                    )
+                    try { AgentResume.clear(ctx) } catch (_: Exception) { }
+                }
+                try {
+                    FormRunService.startWithTask(ctx, freshTask)
+                    Log.i("WakeWorker", "fresh claimed task handed off")
+                } catch (e: Exception) {
+                    Log.e("WakeWorker", "fresh handoff failed — retry", e)
+                    return Result.retry()
+                }
+                return Result.success()
+            }
+            // 2. Koi fresh task nahi → local pending run ho to usi step se
+            // resume (crash/reboot ke baad — G2).
             val pending = AgentResume.checkPending(ctx)
             if (pending != null) {
                 Log.i(
@@ -64,20 +97,7 @@ class WakeWorker(appContext: Context, params: WorkerParameters) :
                 }
                 return Result.success()
             }
-            // 2. Koi pending nahi → naya claimed task lao (server ping + claim).
-            val task = try {
-                FormApi.nextTask(ctx)
-            } catch (e: Exception) {
-                Log.e("WakeWorker", "server ping/claim failed — retry", e)
-                return Result.retry()
-            } ?: return Result.success() // koi task nahi — normal
-            try {
-                FormRunService.startWithTask(ctx, task)
-                Log.i("WakeWorker", "claimed task handed off")
-            } catch (e: Exception) {
-                Log.e("WakeWorker", "claim handoff failed — retry", e)
-                return Result.retry()
-            }
+            // 3. Na fresh, na pending — normal idle.
             Result.success()
         } catch (e: Exception) {
             Log.e("WakeWorker", "wake failed — retry", e)

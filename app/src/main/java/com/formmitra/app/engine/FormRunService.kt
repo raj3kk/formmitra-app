@@ -386,8 +386,30 @@ class FormRunService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // v36 (point 10): [Band karo] action — active run turant band karo,
         // slot free (phir naya kaam shuru ho sakta hai).
+        // v40 FIX (root cause, real-phone crash 2026-09-26): ye branch
+        // startForegroundService() se start hoti hai — Android ka FGS
+        // contract kehta hai startForeground() ~5s me call hona CHAHIYE.
+        // Pehle cancelActiveRun()+stopSelf() bina startForeground ke the →
+        // ForegroundServiceDidNotStartInTimeException → app crash (BAND KARO
+        // tap par). Ab sabse PEHLE startForeground, phir cancel, phir stopSelf.
         if (intent?.action == ACTION_CANCEL_ACTIVE) {
-            cancelActiveRun()
+            ensureChannel()
+            try {
+                startForeground(
+                    NOTIF_ID,
+                    buildNotif(
+                        "Kaam band kar diya ⏹️",
+                        "Active run cancel ho raha hai…"
+                    )
+                )
+            } catch (t: Throwable) {
+                android.util.Log.e("FormRunService", "startForeground FAILED (cancel)", t)
+            }
+            try {
+                cancelActiveRun()
+            } catch (t: Throwable) {
+                android.util.Log.e("FormRunService", "cancelActiveRun FAILED", t)
+            }
             stopSelf(startId)
             return START_NOT_STICKY
         }

@@ -297,6 +297,42 @@ run_test_v38() {
 }
 run_test_v38
 
+# v40: BAND KARO FGS crash contract (FormRunService source-structure pins).
+run_test_v40() {
+  local name="selftest_v40"
+  echo "== $name =="
+  "$KOTLINC" -J-Xmx1g -cp "$ANDR_JAR" \
+    "$APP/tools/selftest/SelfTestV40.kt" \
+    -d "$OUT/$name" >"$OUT/$name.log" 2>&1
+  if [ $? -ne 0 ]; then echo "COMPILE FAILED:"; tail -20 "$OUT/$name.log"; TOTAL_FAIL=$((TOTAL_FAIL+1)); return; fi
+  java -Dfm.app.dir="$APP" -cp "$OUT/$name:$STDLIB" SelfTestV40Kt 2>&1 | tee "$OUT/$name.out" | grep -E "^(PASS|FAIL|SKIP)" | tail -8
+  local fails passes
+  fails=$(grep -cE "^(FAIL|Exception in thread)" "$OUT/$name.out" || true)
+  passes=$(grep -cE "^PASS" "$OUT/$name.out" || true)
+  echo "-> $name PASS: $passes FAIL: $fails"
+  TOTAL_FAIL=$((TOTAL_FAIL+fails))
+  TOTAL_PASS=$((TOTAL_PASS+passes))
+}
+run_test_v40
+
+# v41: history isolation + user delete + agent-choose hatao + category→kaam.
+run_test_v41() {
+  local name="selftest_v41"
+  echo "== $name =="
+  "$KOTLINC" -J-Xmx1g -cp "$ANDR_JAR" \
+    "$APP/tools/selftest/SelfTestV41.kt" \
+    -d "$OUT/$name" >"$OUT/$name.log" 2>&1
+  if [ $? -ne 0 ]; then echo "COMPILE FAILED:"; tail -20 "$OUT/$name.log"; TOTAL_FAIL=$((TOTAL_FAIL+1)); return; fi
+  java -Dfm.app.dir="$APP" -cp "$OUT/$name:$STDLIB" SelfTestV41Kt 2>&1 | tee "$OUT/$name.out" | grep -E "^(PASS|FAIL|SKIP)" | tail -10
+  local fails passes
+  fails=$(grep -cE "^(FAIL|Exception in thread)" "$OUT/$name.out" || true)
+  passes=$(grep -cE "^PASS" "$OUT/$name.out" || true)
+  echo "-> $name PASS: $passes FAIL: $fails"
+  TOTAL_FAIL=$((TOTAL_FAIL+fails))
+  TOTAL_PASS=$((TOTAL_PASS+passes))
+}
+run_test_v41
+
 echo "==============================="
 echo "TOTAL PASS: $TOTAL_PASS"
 echo "TOTAL FAILURES: $TOTAL_FAIL"

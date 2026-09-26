@@ -645,7 +645,6 @@ class ProfileView(
         CardFlow.showCreateChooser(
             act,
             emptyMap(),
-            onAgentCreate = { prefill -> startAgentCreate(prefill) },
             onCreated = { _, id, name, _ ->
                 CardStore.setSelectedCardId(context, id)
                 loadCards()

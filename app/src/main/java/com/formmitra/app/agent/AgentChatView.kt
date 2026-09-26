@@ -351,6 +351,14 @@ class AgentChatView(
             layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
             setOnClickListener { showPastWork() }
         })
+        // v41: user apni chat history khud delete kar sake (is kaam ki).
+        catRow.addView(Button(context).apply {
+            text = "🗑️"
+            textSize = 12f
+            minimumWidth = 0
+            layoutParams = LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT)
+            setOnClickListener { confirmClearChat() }
+        })
         addView(catRow)
 
         // v20 Task 5: active category chip — ✕ dabao to category context hate
@@ -609,16 +617,21 @@ class AgentChatView(
     private fun restoreLastCategory(catKey: String) {
         try {
             activeCategory = catKey
-            activeTrackingType = null
+            // v41: track-type bhi restore — history/memory namespace is par hai.
+            val savedType = draftPrefs().getString("last_tracking_type", null)
+            activeTrackingType = if (catKey == "track") savedType else null
             val label = WorkCategories.labelOf(catKey)
+            val chipText = if (activeTrackingType != null)
+                "🔖 $label › ${WorkCategories.trackLabelOf(activeTrackingType)}  ✕"
+            else "🔖 $label  ✕"
             post {
-                categoryChip.text = "🔖 $label  ✕"
+                categoryChip.text = chipText
                 categoryChip.visibility = View.VISIBLE
             }
-            loadChatHistory(catKey)
+            loadChatHistory(catKey, activeTrackingType)
             // v29 P1c (no-loss): rotation/kill/reopen par is work ki memory
             // wapas — user ko details dobara nahi deni padengi.
-            restoreWorkMemory(catKey)
+            restoreWorkMemory(workKeyFor(catKey, activeTrackingType) ?: catKey)
             // Card bhi wapas bind karo (selected card prefs me rehta hai).
             val selId = CardStore.selectedCardId(context)
             val selTok = selId?.let { CardStore.token(it) }
@@ -644,6 +657,16 @@ class AgentChatView(
             val e = draftPrefs().edit()
             if (catKey == null) e.remove("last_category")
             else e.putString("last_category", catKey)
+            e.apply()
+        } catch (_: Exception) { }
+    }
+
+    /** v41: track-type bhi yaad rakho — history/memory namespace is par hai. */
+    private fun rememberTrackingType(type: String?) {
+        try {
+            val e = draftPrefs().edit()
+            if (type == null) e.remove("last_tracking_type")
+            else e.putString("last_tracking_type", type)
             e.apply()
         } catch (_: Exception) { }
     }
@@ -2305,6 +2328,7 @@ class AgentChatView(
         activeCategory = category
         rememberCategory(category) // v28 P14
         activeTrackingType = trackingType
+        rememberTrackingType(trackingType) // v41: history namespace ke liye
         setActiveCard(cardId, cardName, cardToken)
         if (newSession) {
             // P8: purani chat saaf — bacha hua message/context kuch nahi.
@@ -2315,15 +2339,16 @@ class AgentChatView(
             askedKeys.clear()
             // v29 P1c (isolation): prefs me bachi purani memory bhi saaf —
             // naye work par purani memory leak NAHI hogi.
-            clearWorkMemory(category)
+            // v41: namespace me trackingType bhi (track ke types alag).
+            clearWorkMemory(workKeyFor(category, trackingType) ?: category)
             try {
-                draftPrefs().edit().remove(histKey(category)).apply()
+                draftPrefs().edit().remove(histKey(category, trackingType)).apply()
             } catch (_: Exception) { }
             post { messageList.removeAllViews() }
         } else {
             // v29 P1c (no-loss): resume par is work ki memory wapas —
             // rotation/kill ke baad bhi user ko dobara details nahi deni.
-            restoreWorkMemory(category)
+            restoreWorkMemory(workKeyFor(category, trackingType) ?: category)
         }
         // v29 P1: card details cache refresh (prefill = card se aayi
         // details, canonical keys). Har request me known_details me jayengi.
@@ -2378,14 +2403,66 @@ class AgentChatView(
         activeCategory = null
         rememberCategory(null) // v28 P14
         activeTrackingType = null
+        rememberTrackingType(null) // v41
         post { categoryChip.visibility = View.GONE }
         toast("Category hatayi — ab aam chat")
     }
 
+    // ---------- v41: user apni chat history khud delete kar sake ----------
+
+    /** 🗑️ button — is kaam ki chat history delete karne ka confirmation. */
+    private fun confirmClearChat() {
+        val act = context as? Activity ?: return
+        if (act.isFinishing || act.isDestroyed) return
+        val cat = activeCategory
+        if (cat == null) {
+            toast("Pehle koi kaam chuno, phir uski chat saaf kar sakte ho")
+            return
+        }
+        val label = WorkCategories.labelOf(cat)
+        val typeLabel = activeTrackingType?.let { " › ${WorkCategories.trackLabelOf(it)}" } ?: ""
+        AlertDialog.Builder(act)
+            .setTitle("🗑️ Chat saaf karein?")
+            .setMessage("🔖 $label$typeLabel — is kaam ki baat-cheet (screen + saved history + yaad ki hui details) delete ho jayegi. Ye wapas nahi aayegi.\n\nDoosre kaam ki chat ko kuch nahi hoga.")
+            .setPositiveButton("Saaf karo") { d, _ ->
+                d.dismiss()
+                clearCurrentChat()
+            }
+            .setNegativeButton("Rehne do", null)
+            .show()
+    }
+
+    /** Is kaam (category + track-type) ki chat + memory — screen aur prefs dono se. */
+    private fun clearCurrentChat() {
+        val cat = activeCategory ?: return
+        val type = activeTrackingType
+        val wk = workKeyFor(cat, type) ?: cat
+        try {
+            history.clear()
+            sessionDetails.clear()
+            askedKeys.clear()
+            cardCachedDetails.clear()
+            post { messageList.removeAllViews() }
+            val e = draftPrefs().edit()
+            e.remove(histKey(cat, type))
+            e.remove(memKey(wk, "session"))
+            e.remove(memKey(wk, "asked"))
+            e.apply()
+            // Khaali state persist — dobara purani memory wapas na aaye.
+            persistWorkMemory()
+            toast("🗑️ Chat saaf ho gayi")
+        } catch (t: Throwable) {
+            android.util.Log.e("FmChat", "clearCurrentChat failed", t)
+            toast("⚠️ Saaf karne me dikkat — dobara try karo")
+        }
+    }
+
     // ---------- v28 P6: per-category chat history (local) ----------
 
-    /** local history key: chat_history_<category> */
-    private fun histKey(cat: String) = "chat_history_$cat"
+    /** local history key: chat_history_<category>_<type> (v41: type joda —
+     *  track ke 8 types (zameen/scholarship/...) ab ek key share NAHI karte,
+     *  isliye chat history mix nahi hogi. */
+    private fun histKey(cat: String, type: String?) = "chat_history_${cat}_${type ?: "main"}"
 
     /** Is category ki history prefs me save karo (max 200 messages). */
     private fun saveChatHistory() {
@@ -2395,16 +2472,16 @@ class AgentChatView(
             for ((role, content) in history.takeLast(200)) {
                 arr.put(JSONObject().put("role", role).put("content", content))
             }
-            draftPrefs().edit().putString(histKey(cat), arr.toString()).apply()
+            draftPrefs().edit().putString(histKey(cat, activeTrackingType), arr.toString()).apply()
         } catch (_: Exception) { }
     }
 
     /** Saved history wapas lao + screen par render karo. */
-    private fun loadChatHistory(cat: String) {
+    private fun loadChatHistory(cat: String, type: String?) {
         history.clear()
         post { messageList.removeAllViews() }
         try {
-            val raw = draftPrefs().getString(histKey(cat), null) ?: return
+            val raw = draftPrefs().getString(histKey(cat, type), null) ?: return
             val arr = JSONArray(raw)
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
@@ -2434,8 +2511,20 @@ class AgentChatView(
      * Per-work namespace: "chat_mem_<work>_session" / "_asked".
      * work = category, ya card-create mode me "card_create".
      */
-    private fun workKey(): String? =
-        activeCategory ?: if (cardCreateMode) "card_create" else null
+    private fun workKey(): String? {
+        val cat = activeCategory ?: if (cardCreateMode) "card_create" else null
+        return workKeyFor(cat, activeTrackingType)
+    }
+
+    /**
+     * v41: track ke 8 types ka work-memory namespace alag-alag.
+     * Pehle sab "track" me ghulte the (zameen ki details scholarship me
+     * leak hoti thi) — ab "track_zameen", "track_scholarship", ...
+     */
+    private fun workKeyFor(cat: String?, type: String?): String? {
+        if (cat == null) return null
+        return if (cat == "track") "track_${type ?: "main"}" else cat
+    }
 
     private fun memKey(work: String, field: String) = "chat_mem_${work}_$field"
 
@@ -2619,9 +2708,11 @@ class AgentChatView(
             val act = context as? Activity ?: return
             showPickerTrackTypes(act) { picked ->
                 activeTrackingType = picked
+                rememberTrackingType(picked) // v41
                 finishCategorySwitch(catKey, catLabel)
             }
         } else {
+            rememberTrackingType(null) // v41
             finishCategorySwitch(catKey, catLabel)
         }
     }
@@ -2634,7 +2725,7 @@ class AgentChatView(
             categoryChip.text = chipText
             categoryChip.visibility = View.VISIBLE
         }
-        loadChatHistory(catKey)
+        loadChatHistory(catKey, activeTrackingType)
         val n = history.size
         toast(
             if (n > 0) "$catLabel — pichli baat-cheet wapas ($n)"
@@ -2649,20 +2740,55 @@ class AgentChatView(
      * resume (server form-tasks se category filter karke laata hai).
      * Track category me trackings bhi (tap: status puchho; long-press: band karo).
      */
+    /**
+     * v41: Agent section category-wise → kaam-wise.
+     * Pehle category chuno (agar active nahi), phir us category ke kaam
+     * (tasks + trackings) dikhenge. Har kaam: tap = continue, lamba dabao =
+     * delete (task) / band karo (tracking).
+     */
     fun showPastWork() {
         val cat = activeCategory
-        val act = context as? Activity ?: return
         if (cat == null) {
-            AlertDialog.Builder(act)
-                .setTitle("📜 Purane Kaam (पुराने काम)")
-                .setMessage(
-                    "Pehle upar 📂 se koi Kaam (काम) chuno — " +
-                        "phir uske purane kaam yahan dikhenge."
-                )
-                .setPositiveButton("Theek hai", null)
-                .show()
+            pickCategoryThenPastWork()
             return
         }
+        loadPastWork(cat)
+    }
+
+    /** Koi category active nahi — pehle category chuno, phir uske kaam. */
+    private fun pickCategoryThenPastWork() {
+        val act = context as? Activity ?: return
+        if (act.isFinishing || act.isDestroyed) return
+        val dlg = AlertDialog.Builder(act).create()
+        val box = LinearLayout(act).apply {
+            orientation = VERTICAL
+            setPadding(dp(20), dp(16), dp(20), dp(16))
+        }
+        box.addView(TextView(act).apply {
+            text = "📂 Pehle category chuno — phir uske kaam dikhenge"
+            textSize = 16f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#202124"))
+            setPadding(0, 0, 0, dp(10))
+        })
+        for (c in WorkCategories.ALL) {
+            box.addView(dialogRow(act, c.icon, c.label, c.desc) {
+                dlg.dismiss()
+                loadPastWork(c.key)
+            })
+        }
+        box.addView(Button(act).apply {
+            text = "← Peeche (वापस)"
+            minimumWidth = 0
+            setOnClickListener { dlg.dismiss() }
+        })
+        dlg.setView(box)
+        dlg.show()
+    }
+
+    /** Is category ke purane kaam (tasks + trackings) server se lao. */
+    private fun loadPastWork(cat: String) {
+        val act = context as? Activity ?: return
         toast("Purane kaam la raha hun…")
         Thread({
             val tasks = try {
@@ -2708,13 +2834,23 @@ class AgentChatView(
         for (t in tasks) {
             val title = t.optString("name", "Kaam").ifEmpty { "Kaam" }
             val status = t.optString("status", "").ifEmpty { "—" }
-            list.addView(dialogRow(
+            // v41: lamba dabao = delete (server par cancelled + local pending
+            // saaf — deleted kaam dobara kabhi start nahi hoga).
+            val row = dialogRow(
                 act, "📝", title,
-                "Status: $status — tap karke continue karo"
+                "Status: $status — tap: continue • lamba dabao: delete"
             ) {
                 dlg.dismiss()
                 resumeTask(t)
-            })
+            }
+            row.setOnLongClickListener {
+                confirmDeleteTask(act, t) {
+                    dlg.dismiss()
+                    showPastWork()
+                }
+                true
+            }
+            list.addView(row)
         }
         if (trackings.isNotEmpty()) {
             list.addView(TextView(act).apply {
@@ -2766,9 +2902,58 @@ class AgentChatView(
         }
     }
 
-    /** Task resume — wahi kaam/context agent ko wapas do. */
-    private fun resumeTask(t: JSONObject) {
+    /**
+     * v41: user apna kaam delete kar sake.
+     * - Server par run ko "cancelled" (terminal) mark — dobara kabhi
+     *   claim/resume nahi hoga, chahe purana state bacha ho.
+     * - Local AgentResume pending bhi saaf (agar yahi run tha).
+     * - Active (chal raha) kaam delete nahi hoga — pehle BAND KARO.
+     */
+    private fun confirmDeleteTask(act: Activity, t: JSONObject, onDone: () -> Unit) {
         val title = t.optString("name", "kaam").ifEmpty { "kaam" }
+        val runId = t.optString("run_id").ifEmpty { t.optString("id") }
+        val status = t.optString("status", "")
+        if (status == "running" || status == "in_progress" || status == "started") {
+            AlertDialog.Builder(act)
+                .setTitle("⏳ Pehle kaam band karo")
+                .setMessage("\"$title\" abhi chal raha hai. Delete karne se pehle use BAND KARO (emergency stop), phir delete karo.")
+                .setPositiveButton("Samajh gaya", null)
+                .show()
+            return
+        }
+        AlertDialog.Builder(act)
+            .setTitle("🗑️ Kaam delete karein?")
+            .setMessage("\"$title\" hamesha ke liye band ho jayega — ye dobara start nahi hoga, aur iski entry list se hat jayegi.")
+            .setPositiveButton("Delete karo") { d, _ ->
+                d.dismiss()
+                Thread({
+                    try {
+                        if (runId.isNotEmpty()) {
+                            AgentApi.updateRun(
+                                context, runId, "cancelled", 0,
+                                "User ne delete kiya", ""
+                            )
+                        }
+                    } catch (_: Exception) { }
+                    // Local pending bhi saaf — sirf agar yahi run pending tha.
+                    try {
+                        val pending = com.formmitra.app.engine.AgentResume.checkPending(context)
+                        if (pending != null && pending.runId == runId) {
+                            com.formmitra.app.engine.AgentResume.clear(context)
+                        }
+                    } catch (_: Exception) { }
+                    post {
+                        toast("🗑️ Kaam delete ho gaya")
+                        onDone()
+                    }
+                }, "fm-delete-task").start()
+            }
+            .setNegativeButton("Rehne do", null)
+            .show()
+    }
+
+    /** Task resume — wahi kaam/context agent ko wapas do. */
+    private fun resumeTask(t: JSONObject) {        val title = t.optString("name", "kaam").ifEmpty { "kaam" }
         val status = t.optString("status", "")
         val url = t.optString("target_url", t.optString("url", ""))
         val sb = StringBuilder("📜 Purana kaam continue karo: \"$title\"")

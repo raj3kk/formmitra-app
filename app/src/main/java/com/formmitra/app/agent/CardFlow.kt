@@ -87,7 +87,7 @@ object CardFlow {
                             // #4: card nahi hai → create-card par REDIRECT
                             toast(act, "Pehle apna FormMitra Card banao 🪪")
                             showCreateChooser(
-                                act, emptyMap(), onAgentCreate,
+                                act, emptyMap(),
                                 onCreated = { prefill, id, name, token ->
                                     onReady(prefill, id, name, token)
                                 }
@@ -109,7 +109,7 @@ object CardFlow {
                                         },
                                         onCreateNew = {
                                             showCreateChooser(
-                                                act, emptyMap(), onAgentCreate,
+                                                act, emptyMap(),
                                                 onCreated = { prefill, id, name, token ->
                                                     onReady(prefill, id, name, token)
                                                 }
@@ -119,7 +119,7 @@ object CardFlow {
                                 },
                                 onCreateNew = {
                                     showCreateChooser(
-                                        act, emptyMap(), onAgentCreate,
+                                        act, emptyMap(),
                                         onCreated = { prefill, id, name, token ->
                                             onReady(prefill, id, name, token)
                                         }
@@ -325,36 +325,22 @@ object CardFlow {
         }, "fm-card-detail").start()
     }
 
-    // ============ create chooser: Manual | Agent ============
+    // ============ create: seedha manual form (v41) ============
 
     /**
+     * v41 (user order): "agent choose" option hata diya — Naya Card ab
+     * hamesha seedha manual form se banta hai, koi chooser dialog nahi.
+     * (Manual form me "Radd karo" hai — cancel ka rasta khula hai.)
+     *
      * @param prefillDetails pehle se di hui basic details (card me jayengi)
      * @param onCreated (prefill, cardId, cardName, cardToken)
      */
     fun showCreateChooser(
         act: Activity,
         prefillDetails: Map<String, String>,
-        onAgentCreate: (prefill: Map<String, String>) -> Unit,
         onCreated: (Map<String, String>, String, String, String) -> Unit
     ) {
-        AlertDialog.Builder(act)
-            .setTitle("🪪 Naya Card (नया कार्ड)")
-            .setMessage(
-                "Card kaise banana hai? (2 tareeke)\n\n" +
-                    "✍️ Manual — form bharke turant banao.\n" +
-                    "🎤 Through Agent — agent ek-ek karke poochhega, " +
-                    "tum mic se bolo ya likhkar do."
-            )
-            .setPositiveButton("✍️ Manual (फॉर्म)") { d, _ ->
-                d.dismiss()
-                showManualForm(act, prefillDetails, onCreated)
-            }
-            .setNeutralButton("🎤 Agent se (एजेंट से)") { d, _ ->
-                d.dismiss()
-                onAgentCreate(prefillDetails)
-            }
-            .setNegativeButton("Baad me", null)
-            .show()
+        showManualForm(act, prefillDetails, onCreated)
     }
 
     // ============ Manual form (C13: Edit Profile + A-Z MERGED) ============
@@ -734,7 +720,7 @@ object CardFlow {
             )
             .setPositiveButton("🪪 Card banao") { d, _ ->
                 d.dismiss()
-                showCreateChooser(act, emptyMap(), onAgentCreate, onCreated)
+                showCreateChooser(act, emptyMap(), onCreated)
             }
             .setNegativeButton("Baad me (बाद में)", null)
             .show()
