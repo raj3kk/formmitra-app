@@ -137,6 +137,36 @@ run_test selftest_contract SelfTestContractKt \
   "$SRC/engine/GateLogic.kt" \
   "$APP/tools/selftest/SelfTestContract.kt"
 
+# POINT 29 (v31): SettingsStore pure logic — server sync mapping
+# (serverPatchBody / mergePendingToBody / localPairsFromServer),
+# formatBytes, deleteFilesUnder (real FS).
+# NOTE: real DocsStore ka dep-tree (CryptoVault → AgentApi → AgentLoopLogic…)
+# selftest me nahi uthate — tools/selftest/DocsStoreLinkStub.kt sirf linker
+# ke liye hai (APK build me kabhi nahi jata; build-apk.sh sirf app/src/main
+# compile karta hai). Tested functions pure hain, Context touch nahi hota.
+run_test_settings() {
+  local name="selftest_settings"
+  echo "== $name =="
+  "$KOTLINC" -J-Xmx1g -cp "$ANDR_JAR" \
+    "$SRC/agent/SettingsStore.kt" \
+    "$APP/tools/selftest/DocsStoreLinkStub.kt" \
+    "$APP/tools/selftest/SelfTestSettings.kt" \
+    -d "$OUT/$name" >"$OUT/$name.log" 2>&1
+  if [ $? -ne 0 ]; then echo "COMPILE FAILED:"; tail -20 "$OUT/$name.log"; TOTAL_FAIL=$((TOTAL_FAIL+1)); return; fi
+  # android.jar ke org.json stubs runtime par "Stub!" throw karte hain —
+  # REAL org.json pehle, android.jar classpath par NAHI (sirf pure
+  # functions chalte hain, Context kabhi touch nahi hota).
+  ORGJSON=$APP/tools/lib/json-20231013.jar
+  java -cp "$OUT/$name:$ORGJSON:$STDLIB" SelfTestSettingsKt 2>&1 | tee "$OUT/$name.out" | grep -E "^(PASS|FAIL)" | tail -3
+  local fails passes
+  fails=$(grep -cE "^(FAIL|Exception in thread)" "$OUT/$name.out" || true)
+  passes=$(grep -cE "^PASS" "$OUT/$name.out" || true)
+  echo "-> $name PASS: $passes FAIL: $fails"
+  TOTAL_FAIL=$((TOTAL_FAIL+fails))
+  TOTAL_PASS=$((TOTAL_PASS+passes))
+}
+run_test_settings
+
 echo "==============================="
 echo "TOTAL PASS: $TOTAL_PASS"
 echo "TOTAL FAILURES: $TOTAL_FAIL"

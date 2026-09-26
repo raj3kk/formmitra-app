@@ -666,6 +666,20 @@ object AgentApi {
     fun cards(ctx: Context): ApiResult = get("/api/cards", ctx)
 
     /**
+     * POINT 29: GET /api/settings → {settings}.
+     * Server-persisted prefs: notifications / live_view / automation
+     * (captcha_auto_solve). Session-auth (401 bina login).
+     */
+    fun userSettings(ctx: Context): ApiResult = get("/api/settings", ctx)
+
+    /**
+     * POINT 29: PATCH /api/settings (partial body) → {settings}.
+     * Sirf SettingsStore.SYNCED_KEYS wali values bhejo.
+     */
+    fun patchSettings(ctx: Context, body: JSONObject): ApiResult =
+        patch("/api/settings", ctx, body)
+
+    /**
      * POST /api/cards — naya card.
      * @return ApiResult (201 → json.card; 400 error:"card_limit" → 4 ho gaye)
      */

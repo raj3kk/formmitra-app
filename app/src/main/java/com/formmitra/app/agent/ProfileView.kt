@@ -2,10 +2,15 @@ package com.formmitra.app.agent
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
@@ -31,6 +36,9 @@ import org.json.JSONObject
  *  (4) ⚙️ Account (खाता) — operational cheezein jo hatayi nahi ja sakti:
  *      Working Mode, notifications, inbox, saved logins, admin, logout.
  *      (Profile DATA nahi — isliye alag section.)
+ *  (5) ⚙️ Settings (सेटिंग) — POINT 29: CAPTCHA auto-solve toggle,
+ *      camera/mic/storage permission rows, live view quality + data saver,
+ *      storage usage + cache clear. Server /api/settings se sync.
  *
  *  Sab labels English (Hindi) bilingual (D17). Har delete par confirmation
  *  popup (D18). Sab kuch named sections me (D19).
@@ -42,6 +50,16 @@ class ProfileView(
     private val onOpenAdmin: () -> Unit,
     private val onLogout: () -> Unit
 ) : LinearLayout(context) {
+
+    companion object {
+        // POINT 29: settings permission rows — MainActivity.onRequestPermissionsResult
+        // se forward hote hain (AgentChatView.REQ_VOICE_PERM pattern jaisa).
+        const val REQ_PERM_CAMERA = 1101
+        const val REQ_PERM_MIC = 1102
+        const val REQ_PERM_STORAGE = 1103
+        // Device-specific permission state — server ko KABHI sync nahi hota.
+        private const val PERM_PREFS = "formmitra_perm_state"
+    }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
@@ -69,6 +87,14 @@ class ProfileView(
     private val adminBtn: Button
     private val inboxBtn: Button
     private val loginsList = LinearLayout(context)
+
+    // (5) settings (POINT 29)
+    private val settingsSwitches = mutableListOf<Pair<Switch, () -> Boolean>>()
+    private var suppressSettingsSwitch = false
+    private lateinit var liveQualityValue: TextView
+    private lateinit var storageText: TextView
+    private val permStatusViews = mutableMapOf<Int, TextView>()
+    private val permActionBtns = mutableMapOf<Int, Button>()
 
     /** Card khula ho to uska view (back par wapas list). */
     private var cardDetailView: CardDetailView? = null
@@ -178,6 +204,113 @@ class ProfileView(
             ).apply { setMargins(0, dp(4), 0, 0) }
         })
         refreshVoiceLabel()
+
+        // ============ (5) ⚙️ Settings (POINT 29) ============
+        content.addView(sectionTitle("⚙️ Settings (सेटिंग)"))
+        content.addView(TextView(context).apply {
+            text = "App kaise kaam kare — ye choices server par bhi save hoti hain."
+            textSize = 10f
+            setTextColor(Color.parseColor("#80868B"))
+            setPadding(0, 0, 0, dp(3))
+        })
+        // Row 1: CAPTCHA auto-solve toggle (server automation.captcha_auto_solve se sync)
+        addSettingsSwitchRow(
+            "🧩 CAPTCHA khud solve karo (ऑटो-सॉल्व)\n" +
+                "ON: agent CAPTCHA khud hal karega • OFF: tumhe dikhayega, tum hal karoge",
+            get = { try { SettingsStore.getBool(context, SettingsStore.K_CAPTCHA_AUTO, true) }
+                catch (_: Exception) { true } },
+            set = { on ->
+                SettingsStore.setBool(context, SettingsStore.K_CAPTCHA_AUTO, on)
+                toast(if (on) "CAPTCHA auto-solve ON 🧩"
+                    else "CAPTCHA auto-solve OFF — ab tumhe dikhega")
+                syncSettingsToServer()
+            }
+        )
+        // Row 2: camera / mic / storage permission rows (status + action)
+        for (spec in permSpecs()) {
+            addPermRow(spec)
+        }
+        // Row 3a: live view quality chooser (server live_view.quality se sync)
+        val qualityRow = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = with(UiKit) { context.cardBg() }
+            setPadding(dp(9), dp(6), dp(9), dp(6))
+        }
+        val qualityCol = LinearLayout(context).apply {
+            orientation = VERTICAL
+            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+        }
+        qualityCol.addView(TextView(context).apply {
+            text = "📺 Live view quality (लाइव नज़र)"
+            textSize = 11f
+            setTextColor(Color.parseColor("#202124"))
+        })
+        liveQualityValue = TextView(context).apply {
+            textSize = 10f
+            setTextColor(Color.parseColor("#80868B"))
+        }
+        qualityCol.addView(liveQualityValue)
+        qualityRow.addView(qualityCol)
+        val qualityBtn = Button(context).apply {
+            text = "Badlo"
+            textSize = 11f
+            setOnClickListener { showLiveQualityPicker() }
+        }
+        UiKit.pressFeedback(qualityBtn)
+        qualityRow.addView(qualityBtn)
+        content.addView(qualityRow.apply {
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, 0, 0, dp(4)) }
+        })
+        // Row 3b: data saver — sirf WiFi par full-quality (server live_view.wifi_only_full se sync)
+        addSettingsSwitchRow(
+            "📶 Sirf WiFi par full-quality (डेटा बचाओ)\n" +
+                "ON: mobile data par live view halka chalega",
+            get = { try { SettingsStore.getBool(context, SettingsStore.K_LIVE_WIFI_ONLY, true) }
+                catch (_: Exception) { true } },
+            set = { on ->
+                SettingsStore.setBool(context, SettingsStore.K_LIVE_WIFI_ONLY, on)
+                toast(if (on) "Data saver ON 📶 — WiFi par hi full-quality"
+                    else "Data saver OFF — mobile data par bhi full-quality")
+                syncSettingsToServer()
+            }
+        )
+        // Row 4: storage usage + cache clear (sirf cache udta hai)
+        val storageRow = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = with(UiKit) { context.cardBg() }
+            setPadding(dp(9), dp(6), dp(9), dp(6))
+        }
+        val storageCol = LinearLayout(context).apply {
+            orientation = VERTICAL
+            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+        }
+        storageCol.addView(TextView(context).apply {
+            text = "💽 App ka storage (स्टोरेज)"
+            textSize = 11f
+            setTextColor(Color.parseColor("#202124"))
+        })
+        storageText = TextView(context).apply {
+            textSize = 10f
+            setTextColor(Color.parseColor("#80868B"))
+        }
+        storageCol.addView(storageText)
+        storageRow.addView(storageCol)
+        val clearBtn = Button(context).apply {
+            text = "🧹 Cache saaf karo"
+            textSize = 11f
+            setOnClickListener { confirmClearCache() }
+        }
+        UiKit.pressFeedback(clearBtn)
+        storageRow.addView(clearBtn)
+        content.addView(storageRow.apply {
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, 0, 0, dp(4)) }
+        })
 
         // ============ (4) ⚙️ Account ============
         content.addView(sectionTitle("⚙️ Account (खाता)"))
@@ -372,6 +505,9 @@ class ProfileView(
         refreshLogins()
         checkOwner()
         refreshVoiceLabel()
+        // POINT 29: settings rows refresh + server sync (pending push / pull).
+        refreshSettingsRows()
+        syncSettingsToServer()
     }
 
     /** Logout ke baad cached state saaf. */
@@ -662,6 +798,338 @@ class ProfileView(
             }
             .setNegativeButton("Radd karo", null)
             .show()
+    }
+
+    // ============ (5) settings — POINT 29 ============
+
+    /** Settings toggle row builder (listener fire-guard ke saath). */
+    private fun addSettingsSwitchRow(label: String, get: () -> Boolean, set: (Boolean) -> Unit) {
+        val row = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = with(UiKit) { context.cardBg() }
+            setPadding(dp(9), dp(6), dp(9), dp(6))
+        }
+        row.addView(TextView(context).apply {
+            text = label
+            textSize = 11f
+            setTextColor(Color.parseColor("#202124"))
+            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+        })
+        val sw = Switch(context).apply {
+            isChecked = try { get() } catch (_: Exception) { false }
+            setOnCheckedChangeListener { _, on ->
+                if (suppressSettingsSwitch) return@setOnCheckedChangeListener
+                try { set(on) } catch (_: Exception) { }
+            }
+        }
+        row.addView(sw)
+        settingsSwitches.add(Pair(sw, get))
+        content.addView(row.apply {
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, 0, 0, dp(4)) }
+        })
+    }
+
+    private data class PermSpec(
+        val label: String,
+        val why: String,
+        val reqCode: Int,
+        val perm: () -> String
+    )
+
+    private fun permSpecs(): List<PermSpec> = listOf(
+        PermSpec(
+            "📷 Camera (कैमरा)", "Document scan / photo ke liye",
+            REQ_PERM_CAMERA
+        ) { Manifest.permission.CAMERA },
+        PermSpec(
+            "🎤 Mic (माइक)", "Awaaz se baat karne ke liye",
+            REQ_PERM_MIC
+        ) { Manifest.permission.RECORD_AUDIO },
+        PermSpec(
+            "💾 Storage (स्टोरेज)", "File save / padhne ke liye",
+            REQ_PERM_STORAGE
+        ) {
+            if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES
+            else Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+    )
+
+    /** Ek permission row (status + action button). */
+    private fun addPermRow(spec: PermSpec) {
+        val row = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = with(UiKit) { context.cardBg() }
+            setPadding(dp(9), dp(6), dp(9), dp(6))
+        }
+        val col = LinearLayout(context).apply {
+            orientation = VERTICAL
+            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+        }
+        col.addView(TextView(context).apply {
+            text = spec.label
+            textSize = 11f
+            setTextColor(Color.parseColor("#202124"))
+        })
+        val status = TextView(context).apply {
+            textSize = 10f
+            setTextColor(Color.parseColor("#80868B"))
+        }
+        col.addView(status)
+        row.addView(col)
+        val btn = Button(context).apply {
+            textSize = 11f
+            setOnClickListener { onPermAction(spec) }
+        }
+        UiKit.pressFeedback(btn)
+        row.addView(btn)
+        permStatusViews[spec.reqCode] = status
+        permActionBtns[spec.reqCode] = btn
+        refreshPermRow(spec)
+        content.addView(row.apply {
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, 0, 0, dp(4)) }
+        })
+    }
+
+    private fun isPermGranted(spec: PermSpec): Boolean = try {
+        context.checkSelfPermission(spec.perm()) == PackageManager.PERMISSION_GRANTED
+    } catch (_: Exception) { false }
+
+    private fun refreshPermRow(spec: PermSpec) {
+        val granted = isPermGranted(spec)
+        permStatusViews[spec.reqCode]?.text =
+            if (granted) "✅ Chalu hai" else "❌ Band hai"
+        permActionBtns[spec.reqCode]?.text =
+            if (granted) "⚙️ System settings" else "▶️ Chalu karo"
+    }
+
+    private fun wasPermAsked(reqCode: Int): Boolean = try {
+        context.getSharedPreferences(PERM_PREFS, Context.MODE_PRIVATE)
+            .getBoolean("asked_$reqCode", false)
+    } catch (_: Exception) { false }
+
+    private fun markPermAsked(reqCode: Int) {
+        try {
+            context.getSharedPreferences(PERM_PREFS, Context.MODE_PRIVATE)
+                .edit().putBoolean("asked_$reqCode", true).apply()
+        } catch (_: Exception) { }
+    }
+
+    /**
+     * Permission action — no-nagging rule: system kabhi khud nahi puchhta,
+     * sirf user ke tap par. Pehli baar seedha request; deny ke baad dobara
+     * tap par rationale; permanently-denied par system settings ka rasta.
+     * Granted ho to button system settings kholta hai (wahan se band ho
+     * sakta hai — app khud permission wapas nahi le sakti).
+     */
+    private fun onPermAction(spec: PermSpec) {
+        val act = context as? Activity ?: return
+        val perm = try { spec.perm() } catch (_: Exception) { return }
+        if (isPermGranted(spec)) {
+            openAppSystemSettings(act)
+            return
+        }
+        if (act.shouldShowRequestPermissionRationale(perm)) {
+            AlertDialog.Builder(act)
+                .setTitle(spec.label)
+                .setMessage("${spec.why}.\n\nChalu karna hai?")
+                .setPositiveButton("▶️ Haan, mango") { d, _ ->
+                    d.dismiss()
+                    requestPerm(act, spec, perm)
+                }
+                .setNegativeButton("Rehne do", null)
+                .show()
+            return
+        }
+        if (!wasPermAsked(spec.reqCode)) {
+            requestPerm(act, spec, perm)
+            return
+        }
+        // "Dobara mat puchho" wala deny — sirf system settings se wapas on.
+        AlertDialog.Builder(act)
+            .setTitle(spec.label)
+            .setMessage("Permission system settings se band hai.\nWahin se chalu karo.")
+            .setPositiveButton("⚙️ System settings kholo") { d, _ ->
+                d.dismiss()
+                openAppSystemSettings(act)
+            }
+            .setNegativeButton("Rehne do", null)
+            .show()
+    }
+
+    private fun requestPerm(act: Activity, spec: PermSpec, perm: String) {
+        try {
+            markPermAsked(spec.reqCode)
+            act.requestPermissions(arrayOf(perm), spec.reqCode)
+        } catch (_: Exception) { }
+    }
+
+    private fun openAppSystemSettings(act: Activity) {
+        try {
+            val i = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+            i.data = Uri.parse("package:" + act.packageName)
+            act.startActivity(i)
+        } catch (_: Exception) {
+            toast("Settings khul nahi payi")
+        }
+    }
+
+    /**
+     * MainActivity.onRequestPermissionsResult se forward
+     * (AgentChatView.REQ_VOICE_PERM pattern jaisa).
+     */
+    fun handlePermissionResult(requestCode: Int, granted: Boolean) {
+        try {
+            post {
+                for (spec in permSpecs()) {
+                    if (spec.reqCode == requestCode) {
+                        refreshPermRow(spec)
+                        toast(
+                            if (granted) "${spec.label} ✅ chalu ho gaya"
+                            else "${spec.label} ❌ band raha — yahin se dobara try kar sakte ho"
+                        )
+                        break
+                    }
+                }
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun qualityLabel(v: String): String = when (v) {
+        "full" -> "Full (सबसे साफ़ — ज़्यादा डेटा)"
+        "saver" -> "Saver (हल्का — कम डेटा)"
+        else -> "Auto (खुद तय करे)"
+    }
+
+    private fun showLiveQualityPicker() {
+        val act = context as? Activity ?: return
+        val opts = arrayOf(
+            "Auto (खुद तय करे)",
+            "Full (सबसे साफ़ — ज़्यादा डेटा)",
+            "Saver (हल्का — कम डेटा)"
+        )
+        val vals = arrayOf("auto", "full", "saver")
+        val cur = try {
+            SettingsStore.getString(context, SettingsStore.K_LIVE_QUALITY, "auto")
+        } catch (_: Exception) { "auto" }
+        var checked = vals.indexOf(cur).takeIf { it >= 0 } ?: 0
+        AlertDialog.Builder(act)
+            .setTitle("📺 Live view quality (लाइव नज़र)")
+            .setSingleChoiceItems(opts, checked) { _, w -> checked = w }
+            .setPositiveButton("✅ Lagao") { d, _ ->
+                d.dismiss()
+                try {
+                    SettingsStore.setString(
+                        context, SettingsStore.K_LIVE_QUALITY, vals[checked]
+                    )
+                    liveQualityValue.text = qualityLabel(vals[checked])
+                    toast("✓ Live quality: ${opts[checked]}")
+                    syncSettingsToServer()
+                } catch (_: Exception) { }
+            }
+            .setNegativeButton("Radd karo", null)
+            .show()
+    }
+
+    /** D18: cache clear par confirmation — sirf cache udega, kaam ka data nahi. */
+    private fun confirmClearCache() {
+        val act = context as? Activity ?: return
+        AlertDialog.Builder(act)
+            .setTitle("🧹 Cache saaf karo? (कैश साफ़ करें?)")
+            .setMessage(
+                "Sirf temporary cache udega.\n" +
+                    "Tumhare documents aur kaam ka data surakshit rahega."
+            )
+            .setPositiveButton("🧹 Haan, saaf karo") { d, _ ->
+                d.dismiss()
+                Thread({
+                    val freed = try { SettingsStore.clearCacheOnly(context) }
+                    catch (_: Exception) { 0L }
+                    post {
+                        toast("✅ ${SettingsStore.formatBytes(freed)} cache saaf hua")
+                        refreshStorageRow()
+                    }
+                }, "fm-clear-cache").start()
+            }
+            .setNegativeButton("Rehne do", null)
+            .show()
+    }
+
+    private fun refreshStorageRow() {
+        try {
+            val used = SettingsStore.storageUsedBytes(context)
+            post {
+                storageText.text =
+                    "App ne ${SettingsStore.formatBytes(used)} use kiya hai (documents + cache)"
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun refreshSettingsRows() {
+        try {
+            suppressSettingsSwitch = true
+            for ((sw, get) in settingsSwitches) {
+                try { sw.isChecked = get() } catch (_: Exception) { }
+            }
+            suppressSettingsSwitch = false
+            val q = try {
+                SettingsStore.getString(context, SettingsStore.K_LIVE_QUALITY, "auto")
+            } catch (_: Exception) { "auto" }
+            liveQualityValue.text = qualityLabel(q)
+            for (spec in permSpecs()) refreshPermRow(spec)
+            refreshStorageRow()
+        } catch (_: Exception) { }
+    }
+
+    /**
+     * Settings ↔ server sync.
+     * Pending local changes hon to PATCH bhejo (server merged settings wapas
+     * deta hai — wahi authoritative); warna GET se pull karo.
+     * Fail → chup-chaap rehne do, queue agli baar retry karegi.
+     */
+    private fun syncSettingsToServer() {
+        Thread({
+            try {
+                val pending = SettingsStore.pendingSync(context)
+                val mapped = pending.filterKeys { it in SettingsStore.SYNCED_KEYS }
+                if (mapped.isEmpty()) {
+                    pullSettingsFromServer()
+                    return@Thread
+                }
+                val body = SettingsStore.mergePendingToBody(mapped)
+                if (body.length() == 0) {
+                    SettingsStore.clearSyncPending(context, mapped.keys)
+                    return@Thread
+                }
+                val res = try { AgentApi.patchSettings(context, body) }
+                catch (_: Exception) { AgentApi.ApiResult(-1, null) }
+                if (res.code in 200..299) {
+                    SettingsStore.clearSyncPending(context, mapped.keys)
+                    res.json?.optJSONObject("settings")?.let {
+                        SettingsStore.applyServerSettings(context, it)
+                    }
+                    post { refreshSettingsRows() }
+                }
+            } catch (_: Exception) { }
+        }, "fm-settings-sync").start()
+    }
+
+    private fun pullSettingsFromServer() {
+        try {
+            val res = try { AgentApi.userSettings(context) }
+            catch (_: Exception) { AgentApi.ApiResult(-1, null) }
+            if (res.code in 200..299) {
+                res.json?.optJSONObject("settings")?.let {
+                    SettingsStore.applyServerSettings(context, it)
+                }
+                post { refreshSettingsRows() }
+            }
+        } catch (_: Exception) { }
     }
 
     // ============ (4) account ============

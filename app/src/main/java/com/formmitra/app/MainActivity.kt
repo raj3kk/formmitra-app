@@ -996,6 +996,16 @@ class MainActivity : Activity() {
                 grantResults[0] == PackageManager.PERMISSION_GRANTED
             com.formmitra.app.agent.PromptDialog.onVoicePermissionResult(this, granted)
         }
+        // POINT 29: ProfileView settings permission rows (camera/mic/storage).
+        if ((requestCode == com.formmitra.app.agent.ProfileView.REQ_PERM_CAMERA ||
+             requestCode == com.formmitra.app.agent.ProfileView.REQ_PERM_MIC ||
+             requestCode == com.formmitra.app.agent.ProfileView.REQ_PERM_STORAGE) &&
+            ::profileView.isInitialized
+        ) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            profileView.handlePermissionResult(requestCode, granted)
+        }
     }
 
     // Fire-and-forget update check — 404/offline: chup-chaap ignore.

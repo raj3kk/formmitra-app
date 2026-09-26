@@ -5,6 +5,14 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- POINT 29: settings permission rows — camera/mic/storage status.
+         Camera: document scan/photo. Storage: file save/padhna
+         (API 33+ par READ_MEDIA_IMAGES, usse neeche READ_EXTERNAL_STORAGE).
+         Mic (RECORD_AUDIO) pehle se declared hai. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <!-- L1-UPGRADE (OTP maximum assistance): SMS User Consent API —
