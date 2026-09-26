@@ -167,6 +167,15 @@ object FmRealtime {
                     Log.e(TAG, "onTaskEvent failed (non-fatal)", t)
                 }
             }
+            "operator_command" -> {
+                // Fullscreen operator console ke commands → automation
+                // WebView par execute (OperatorSession ka FormEngine).
+                try {
+                    com.formmitra.app.engine.OperatorCommandReceiver.onCommand(appCtx, payload)
+                } catch (t: Throwable) {
+                    Log.e(TAG, "operator_command failed (non-fatal)", t)
+                }
+            }
         }
     }
 

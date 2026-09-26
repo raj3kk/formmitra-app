@@ -81,7 +81,9 @@ object StepParser {
         "screenshot", "captcha_detect", "captcha_solve", "back", "forward",
         // v24 C15: explicit final-submit (click se pehle AI verification).
         "verify_submit",
-        "upload", "scroll"
+        "upload", "scroll",
+        // v31: server brain ke naye actions (act.ts contract sync).
+        "set_desktop", "research"
     )
 
     @Suppress("UNCHECKED_CAST")

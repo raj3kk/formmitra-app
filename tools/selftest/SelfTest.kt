@@ -43,14 +43,14 @@ fun main() {
     check("hindi 'पेमेंट'", VetoCheck.find("पेमेंट पेज") == "पेमेंट")
     check("hindi 'खरीदें'", VetoCheck.find("अभी खरीदें") == "खरीदें")
 
-    // ---- 2. StepParser: saare types (verify_submit v24 C15) ----
+    // ---- 2. StepParser: saare types (verify_submit v24 C15; set_desktop + research v31) ----
     val types = listOf(
         "goto", "fill", "select", "toggle", "press", "click",
         "wait_for_element", "wait_for_text", "wait_for_navigation",
         "screenshot", "captcha_detect", "captcha_solve", "back", "forward",
-        "verify_submit"
+        "verify_submit", "set_desktop", "research"
     )
-    check("type count = 17 (16 + verify_submit)", StepParser.TYPES.size == 17)
+    check("type count = 19 (17 + set_desktop + research)", StepParser.TYPES.size == 19)
     for (t in types) {
         val s = StepParser.parse(mapOf("type" to t))
         check("parse type '$t'", s.type == t)

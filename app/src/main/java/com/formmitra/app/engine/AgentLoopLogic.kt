@@ -25,6 +25,8 @@ object AgentActions {
         // v24 C15: final submit — click se pehle AI image-verification
         // (POST /api/agent/verify) ke baad hi execute hota hai.
         "verify_submit",
+        // v31: server brain ke naye actions — contract sync (server act.ts).
+        "set_desktop", "research",
         "done", "needs_user", "vetoed"
     )
     /** Terminal actions — execute nahi hote, loop finish karte hain. */
@@ -58,7 +60,10 @@ object AgentActions {
         "captcha_solve" to "captcha_solve",
         // v24 C15: verify_submit execute hota hai click ki tarah — par
         // usse PEHLE AgentLoop me AI image-verification hoti hai.
-        "verify_submit" to "click"
+        "verify_submit" to "click",
+        // v31: contract sync — executor FormEngine.executeStep me hai.
+        "set_desktop" to "set_desktop",
+        "research" to "research"
     )
 
     /**
@@ -136,6 +141,9 @@ fun validateAgentStep(step: Map<String, Any?>): String? {
             if ((step["doc"] as? String).isNullOrEmpty() &&
                 (step["path"] as? String).isNullOrEmpty()
             ) return "upload needs doc or path"
+        // v31: research bina query ke bekaar hai.
+        "research" ->
+            if ((step["research_query"] as? String).isNullOrEmpty()) return "research needs research_query"
     }
     val conf = (step["confidence"] as? Number)?.toDouble() ?: 1.0
     if (conf < AgentActions.MIN_CONFIDENCE) return "confidence too low ($conf)"
@@ -185,6 +193,11 @@ fun agentStepToSpec(step: Map<String, Any?>): Map<String, Any?> {
             out["doc"] = step["doc"] as? String ?: ""
             out["path"] = step["path"] as? String ?: ""
         }
+        // v31: set_desktop ka desktop_enabled ("true"/"false") StepSpec.state
+        // me jata hai; research ki query text me.
+        "set_desktop" -> out["state"] =
+            ((step["desktop_enabled"] as? String)?.ifEmpty { "true" } ?: "true")
+        "research" -> out["text"] = step["research_query"] as? String ?: ""
     }
     return out
 }

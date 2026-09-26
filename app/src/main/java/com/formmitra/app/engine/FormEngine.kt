@@ -293,6 +293,9 @@ class FormEngine(private val appContext: Context) {
 
         start()
         activeRunId = runId
+        // Operator/desktop mode: task JSON me "desktop":true ho to desktop
+        // Chrome UA + wide viewport (default mobile UA barkarar).
+        try { setDesktopMode(task.optBoolean("desktop", false)) } catch (_: Exception) { }
         val results = JSONArray()
         return try {
             if (targetUrl.isNotEmpty()) {
@@ -416,6 +419,19 @@ class FormEngine(private val appContext: Context) {
             "back" -> { goBack(); JSONObject().put("nav", "back") }
             "forward" -> { goForward(); JSONObject().put("nav", "forward") }
             "scroll" -> scrollPage(s)
+            // v31: set_desktop — WebView UA switch (desktop Chrome UA +
+            // wide viewport). research server-side hota hai (DuckDuckGo,
+            // act route me) — app par sirf acknowledge, dobara search nahi.
+            "set_desktop" -> {
+                val on = s.state.trim().lowercase() != "false"
+                val applied = setDesktopMode(on)
+                JSONObject().put("desktop_mode", on)
+                    .put("applied", applied)
+            }
+            "research" -> JSONObject()
+                .put("researched", false)
+                .put("note", "research server-side hota hai — server ke " +
+                    "research results agle step me aayenge")
             else -> throw Exception("unsupported step: '${s.type}'")
         }
     }
@@ -1551,4 +1567,269 @@ class FormEngine(private val appContext: Context) {
     private var activeRunId: String = ""
 
     private fun currentRunId(): String = activeRunId
+
+    // ---------------- operator console (fullscreen remote control) ----------------
+    //
+    // Web console (ya in-app OperatorView) server ke /api/agent/operator/command
+    // par command POST karta hai → server realtime channel par
+    // "operator_command" broadcast karta hai → OperatorCommandReceiver yahan
+    // aata hai. Har command ka result JSONObject me wapas — receiver usko
+    // RunReporter/operator-state se server ko report karta hai.
+
+    /** Desktop Chrome UA — operator task ya set_desktop command par. */
+    private val DESKTOP_UA =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+
+    /** Pehli baar ka default (mobile) UA — set_desktop off par wapas. */
+    private var defaultUa: String? = null
+
+    /** true = desktop UA mode abhi active. Operator state POST me jata hai. */
+    @Volatile var isDesktopMode: Boolean = false
+        private set
+
+    /**
+     * Desktop mode on/off. UA switch agle page load se pakka lagta hai —
+     * isliye switch ke baad reload bhi karte hain (page khula ho tabhi).
+     * @return true = apply ho gaya.
+     */
+    fun setDesktopMode(enabled: Boolean): Boolean {
+        val h = handler ?: return false
+        val latch = CountDownLatch(1)
+        var ok = false
+        var needReload = false
+        h.post {
+            try {
+                val wv = webView
+                if (wv != null) {
+                    if (enabled) {
+                        if (defaultUa == null) {
+                            defaultUa = try { wv.settings.userAgentString } catch (_: Exception) { null }
+                        }
+                        wv.settings.userAgentString = DESKTOP_UA
+                        wv.settings.useWideViewPort = true
+                        wv.settings.loadWithOverviewMode = true
+                    } else {
+                        defaultUa?.let { wv.settings.userAgentString = it }
+                        wv.settings.useWideViewPort = false
+                        wv.settings.loadWithOverviewMode = false
+                    }
+                    isDesktopMode = enabled
+                    ok = true
+                    try {
+                        needReload = !wv.url.isNullOrEmpty()
+                    } catch (_: Exception) { }
+                }
+            } catch (_: Exception) { }
+            latch.countDown()
+        }
+        latch.await(10, TimeUnit.SECONDS)
+        // UA change reload ke baad pakka lagta hai.
+        if (ok && needReload) opReload()
+        return ok
+    }
+
+    /** Operator ke liye page kholo (payment-veto ke saath). */
+    fun opGoto(url: String): Boolean {
+        if (url.isBlank()) return false
+        return try {
+            checkPageVetoTarget(url)
+            navigate(url)
+            if (!paymentVerifiedOnce) checkLivePageVeto()
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** Operator reload (WebView reload + settle). */
+    fun opReload(): Boolean {
+        val h = handler ?: return false
+        val latch = CountDownLatch(1)
+        h.post {
+            try { webView?.reload() } catch (_: Exception) { }
+            latch.countDown()
+        }
+        latch.await(5, TimeUnit.SECONDS)
+        Thread.sleep(1500)
+        return true
+    }
+
+    /**
+     * Operator command execute karo.
+     * Commands (contract): tap{x,y 0-1000}, scroll{direction,amount},
+     * swipe{x1,y1,x2,y2}, type{text,selector?}, fill{selector,text},
+     * select{selector,option}, back, forward, reload, screenshot,
+     * set_desktop{enabled}.
+     * (captcha_request OperatorSession me handle hota hai — wahan run_id
+     * + proof upload ka context hai.)
+     *
+     * Selector = CSS selector string (querySelector). type me selector na ho
+     * to focused element par type hota hai.
+     */
+    fun execOperatorCommand(command: String, params: JSONObject): JSONObject {
+        val out = JSONObject().put("command", command)
+        try {
+            when (command.trim().lowercase()) {
+                "tap" -> {
+                    val x = params.optDouble("x", -1.0)
+                    val y = params.optDouble("y", -1.0)
+                    if (x < 0 || y < 0) throw Exception("tap: x,y (0-1000) chahiye")
+                    val sent = tapNormalized(x, y)
+                    out.put("ok", sent).put("tapped", sent)
+                }
+                "scroll" -> {
+                    val dir = if (params.optString("direction", "down")
+                            .trim().lowercase() == "up") -1 else 1
+                    val amount = params.optDouble("amount", 80.0)
+                        .coerceIn(1.0, 200.0)
+                    val js = "(function(){try{" +
+                        "window.scrollBy(0,Math.floor(window.innerHeight*${amount / 100.0}*$dir));" +
+                        "return 'SCROLLED';}catch(e){return 'FAIL';}})()"
+                    val r = unwrapJsString(evalJsSync(js))
+                    out.put("ok", r == "SCROLLED")
+                        .put("direction", if (dir < 0) "up" else "down")
+                }
+                "swipe" -> {
+                    val sent = swipeNormalized(
+                        params.optDouble("x1", -1.0), params.optDouble("y1", -1.0),
+                        params.optDouble("x2", -1.0), params.optDouble("y2", -1.0)
+                    )
+                    out.put("ok", sent).put("swiped", sent)
+                }
+                "type", "fill" -> {
+                    val text = params.optString("text", "")
+                    val sel = params.optString("selector", "").trim()
+                    if (text.isEmpty()) throw Exception("type/fill: text chahiye")
+                    out.put("ok", opTypeText(sel, text, clear = command == "fill"))
+                        .put("typed_chars", text.length)
+                }
+                "select" -> {
+                    val sel = params.optString("selector", "").trim()
+                    val opt = params.optString("option", "")
+                    if (sel.isEmpty() || opt.isEmpty()) {
+                        throw Exception("select: selector + option chahiye")
+                    }
+                    out.put("ok", true).put("selected", opSelectOption(sel, opt))
+                }
+                "back" -> { goBack(); out.put("ok", true).put("nav", "back") }
+                "forward" -> { goForward(); out.put("ok", true).put("nav", "forward") }
+                "reload" -> { out.put("ok", opReload()).put("nav", "reload") }
+                "screenshot" -> {
+                    val b64 = capturePngBase64()
+                    out.put("ok", b64.isNotEmpty())
+                        .put("has_image", b64.isNotEmpty())
+                        .put("bytes", b64.length)
+                }
+                "set_desktop" -> {
+                    val en = params.optBoolean("enabled", true)
+                    val applied = setDesktopMode(en)
+                    out.put("ok", applied).put("desktop", isDesktopMode)
+                        .put(
+                            "note",
+                            "UA switch reload ke baad pakka lagta hai (reload auto)"
+                        )
+                }
+                else -> throw Exception("unknown operator command: '$command'")
+            }
+        } catch (e: Exception) {
+            out.put("ok", false).put("error", (e.message ?: "error").take(300))
+        }
+        return out
+    }
+
+    /** type/fill: CSS selector (ya focused element) par keyboard-faithful text. */
+    private fun opTypeText(selector: String, text: String, clear: Boolean): Boolean {
+        val q = JSONObject.quote(text)
+        val selQ = JSONObject.quote(selector)
+        val target = if (selector.isNotEmpty())
+            "var el=document.querySelector($selQ);"
+        else
+            "var el=document.activeElement||document.body;"
+        val js = """(function(){
+          $target
+          if(!el) return 'NOT_FOUND';
+          try{ el.scrollIntoView({block:'center'}); }catch(e){}
+          try{ el.focus(); }catch(e){}
+          var clear=${if (clear) "true" else "false"};
+          try{
+            var proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype :
+                        el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+            var setter = Object.getOwnPropertyDescriptor(proto,'value').set
+                     || Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value').set;
+            if(clear){ if(setter) setter.call(el,''); else el.value=''; }
+            var cur = clear ? '' : ((el.value||'')+'');
+            var str = $q;
+            if(setter) setter.call(el, cur + str); else el.value = cur + str;
+          }catch(e){ try{ el.value = (clear?'':(el.value||'')) + $q; }catch(x){ return 'FAIL'; } }
+          try{
+            var s=$q;
+            for(var i=0;i<Math.min(s.length,200);i++){
+              var ch=s.charAt(i);
+              el.dispatchEvent(new KeyboardEvent('keydown',{key:ch,bubbles:true,cancelable:true}));
+              el.dispatchEvent(new KeyboardEvent('keyup',{key:ch,bubbles:true,cancelable:true}));
+            }
+          }catch(e){}
+          el.dispatchEvent(new Event('input',{bubbles:true}));
+          el.dispatchEvent(new Event('change',{bubbles:true}));
+          return 'TYPED';
+        })()"""
+        return unwrapJsString(evalJsSync(js)) == "TYPED"
+    }
+
+    /** select: native <select> me text/value match karke option chuno. */
+    private fun opSelectOption(selector: String, option: String): String {
+        val selQ = JSONObject.quote(selector)
+        val optQ = JSONObject.quote(option)
+        val js = """(function(){
+          var el=document.querySelector($selQ);
+          if(!el) return 'NOT_FOUND';
+          if((el.tagName||'').toLowerCase()!=='select') return 'NOT_SELECT';
+          var nd=$optQ.toLowerCase(), pick=null, i;
+          for(i=0;i<el.options.length;i++){
+            var t=(el.options[i].text||'').toLowerCase(), v=(el.options[i].value||'').toLowerCase();
+            if(t===nd||v===nd){ pick=el.options[i]; break; }
+          }
+          if(!pick){
+            for(i=0;i<el.options.length;i++){
+              if((el.options[i].text||'').toLowerCase().indexOf(nd)>=0){ pick=el.options[i]; break; }
+            }
+          }
+          if(!pick) return 'NO_OPTION';
+          el.value=pick.value;
+          el.dispatchEvent(new Event('input',{bubbles:true}));
+          el.dispatchEvent(new Event('change',{bubbles:true}));
+          return 'SELECTED:'+pick.text;
+        })()"""
+        val r = unwrapJsString(evalJsSync(js))
+        if (!r.startsWith("SELECTED:")) throw Exception("select: $r")
+        Thread.sleep(700)
+        return r.removePrefix("SELECTED:")
+    }
+
+    /**
+     * Operator captcha_request: screenshot lo, operator run ke proof me
+     * upload karo (screenshot_url state POST me jayega — web console par
+     * dikhega), run needs_user nahi hoga (koi form run nahi hai).
+     * KABHI fake solve nahi — sirf handoff.
+     */
+    fun opCaptchaHandoff(runId: String): JSONObject {
+        val out = JSONObject().put("command", "captcha_request")
+        return try {
+            val shot = captureCaptchaPngBase64()
+            var proofUrl: String? = null
+            try {
+                proofUrl = RunReporter.uploadProof(appContext, runId, shot)
+            } catch (_: Exception) { }
+            out.put("ok", shot.isNotEmpty())
+                .put("proof_url", proofUrl ?: "")
+                .put(
+                    "note",
+                    "CAPTCHA screenshot server ko bhej diya — web console " +
+                        "se khud solve karo. Fake solve kabhi nahi hota."
+                )
+        } catch (e: Exception) {
+            out.put("ok", false).put("error", (e.message ?: "error").take(300))
+        }
+    }
 }

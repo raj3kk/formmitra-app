@@ -32,6 +32,12 @@
             android:name=".CrashReportActivity"
             android:exported="false"
             android:theme="@android:style/Theme.Material.Light.NoActionBar" />
+        <!-- operator console: fullscreen immersive remote-control view -->
+        <activity
+            android:name=".agent.OperatorView"
+            android:exported="false"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
         <receiver
             android:name=".BootReceiver"
             android:exported="false">

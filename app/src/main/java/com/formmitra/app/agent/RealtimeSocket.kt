@@ -266,7 +266,7 @@ object PhoenixMsg {
                 val p = msg.payload["payload"] as? Map<String, Any?> ?: emptyMap()
                 ev to p
             }
-            "notification", "task_status" -> msg.event to msg.payload
+            "notification", "task_status", "operator_command" -> msg.event to msg.payload
             else -> null
         }
     }
@@ -572,7 +572,7 @@ class RealtimeSocket(
         val (event, payload) = try {
             PhoenixMsg.extractEvent(msg) ?: return
         } catch (_: Exception) { return }
-        if (event != "notification" && event != "task_status") return
+        if (event != "notification" && event != "task_status" && event != "operator_command") return
         try {
             listener.onEvent(event, payload)
         } catch (t: Throwable) {

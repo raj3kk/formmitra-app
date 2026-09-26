@@ -243,6 +243,26 @@ class ProfileView(
         }
         UiKit.pressFeedback(notifBtn)
         content.addView(notifBtn)
+        // Operator console (fullscreen remote control)
+        val operatorBtn = Button(context).apply {
+            text = "🖥️ Operator Console (screen control)"
+            textSize = 12f
+            setOnClickListener {
+                try {
+                    context.startActivity(
+                        android.content.Intent(context, OperatorView::class.java)
+                    )
+                } catch (_: Exception) {
+                    toast("Operator view khul nahi paya")
+                }
+            }
+        }
+        UiKit.pressFeedback(operatorBtn)
+        content.addView(operatorBtn.apply {
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(4), 0, 0) }
+        })
         // Inbox
         inboxBtn = Button(context).apply {
             text = "📥 Notification Inbox (इनबॉक्स)"
