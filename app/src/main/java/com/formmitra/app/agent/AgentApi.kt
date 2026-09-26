@@ -328,6 +328,38 @@ object AgentApi {
     }
 
     /**
+     * v43: DELETE /api/app/form-tasks/{id} — kaam SACCHI me delete
+     * (task row + uske runs hard delete). Pehle sirf run cancel hota tha,
+     * task zinda rehta tha → delete ke baad bhi dikhta tha + /next usko
+     * resurrect kar deta tha. Ab yehi use karo.
+     * @return true = server ne delete kiya.
+     */
+    fun deleteTask(ctx: Context, taskId: String): Boolean {
+        if (taskId.isEmpty()) return false
+        return try {
+            val res = delete("/api/app/form-tasks/$taskId", ctx, JSONObject())
+            res.code in 200..299
+        } catch (_: Exception) { false }
+    }
+
+    /**
+     * v43: PATCH /api/app/form-tasks/{id} {status:"cancelled"} — kaam
+     * band karo (task + zinda runs cancelled). Local automation bhi
+     * rokni ho to FormRunService.requestCancelActive alag se call karo.
+     * @return true = server ne cancel kiya.
+     */
+    fun cancelTask(ctx: Context, taskId: String): Boolean {
+        if (taskId.isEmpty()) return false
+        return try {
+            val res = patch(
+                "/api/app/form-tasks/$taskId", ctx,
+                JSONObject().put("status", "cancelled")
+            )
+            res.code in 200..299
+        } catch (_: Exception) { false }
+    }
+
+    /**
      * v28 P5: POST /api/app/trackings — unified tracking banao.
      * {label, type, details} → (code, trackingId).
      * Server contract: /api/app/trackings expects `type`, `label`,

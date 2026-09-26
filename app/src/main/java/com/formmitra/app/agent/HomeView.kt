@@ -61,16 +61,25 @@ class HomeView(
         (v * resources.displayMetrics.density).toInt()
 
     // v28 P12: fail-soft toast helper (HomeView me pehle koi toast nahi tha).
-    private fun toast(msg: String) {
+    /** v43 UI: animated rich toast. */
+    private fun toast(msg: String, type: String = FmToast.INFO) {
         try {
-            android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_SHORT).show()
+            FmToast.show(context as? android.app.Activity, msg, type)
         } catch (_: Exception) { }
     }
 
     init {
         orientation = VERTICAL
-        setBackgroundColor(Color.parseColor("#FAFBFC"))
+        setBackgroundColor(Color.parseColor(FmTheme.CREAM))
         val pad = dp(12)
+
+        // v43 UI: Rich emerald header — bharosemand pehli nazar.
+        addView(with(FmTheme) {
+            context.richHeader(
+                "FormMitra",
+                "Aapka apna digital sahayak — kaam, tracking, sab kuch."
+            )
+        })
 
         // ---- upar: scrollable sections ----
         val scroll = ScrollView(context).apply {
@@ -78,6 +87,13 @@ class HomeView(
                 LayoutParams.MATCH_PARENT, 0, 1f
             )
             isFillViewport = true
+            // v43 UI: neeche scroll = tab bar chhupao, upar = dikhao.
+            setOnScrollChangeListener { _, _, scrollY, _, oldScrollY ->
+                try {
+                    (context as? com.formmitra.app.MainActivity)
+                        ?.onContentScrolled(scrollY - oldScrollY)
+                } catch (_: Exception) { }
+            }
         }
         val content = LinearLayout(context).apply {
             orientation = VERTICAL
@@ -147,25 +163,33 @@ class HomeView(
         return LinearLayout(ctx).apply {
             orientation = VERTICAL
             gravity = Gravity.CENTER
-            background = with(UiKit) { ctx.tintCard(cat.bg, cat.border) }
-            setPadding(dp(12), dp(14), dp(12), dp(14))
+            // v43 UI: rich card + elevation + gold top accent.
+            background = with(FmTheme) { ctx.richCard() }
+            setPadding(dp(12), dp(10), dp(12), dp(14))
+            try { elevation = dp(2).toFloat() } catch (_: Exception) { }
+            addView(android.view.View(ctx).apply {
+                layoutParams = LayoutParams(
+                    LayoutParams.MATCH_PARENT, dp(3)
+                ).apply { bottomMargin = dp(6) }
+                background = with(FmTheme) { ctx.goldGradient() }
+            })
             addView(TextView(ctx).apply {
                 text = cat.icon
-                textSize = 30f
+                textSize = 32f
                 gravity = Gravity.CENTER
             })
             addView(TextView(ctx).apply {
                 text = cat.label
                 textSize = 14f
                 setTypeface(null, Typeface.BOLD)
-                setTextColor(Color.parseColor("#202124"))
+                setTextColor(Color.parseColor(FmTheme.INK))
                 gravity = Gravity.CENTER
                 setPadding(0, dp(4), 0, 0)
             })
             addView(TextView(ctx).apply {
                 text = cat.desc
                 textSize = 11f
-                setTextColor(Color.parseColor("#5F6368"))
+                setTextColor(Color.parseColor(FmTheme.INK_SOFT))
                 gravity = Gravity.CENTER
                 setPadding(0, dp(2), 0, 0)
             })

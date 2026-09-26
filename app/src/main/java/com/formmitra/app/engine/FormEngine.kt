@@ -559,9 +559,11 @@ class FormEngine(private val appContext: Context) {
 
         start()
         activeRunId = runId
-        // Operator/desktop mode: task JSON me "desktop":true ho to desktop
-        // Chrome UA + wide viewport (default mobile UA barkarar).
-        try { setDesktopMode(task.optBoolean("desktop", false)) } catch (_: Exception) { }
+        // v43: automation hamesha DESKTOP mode me — user ka order.
+        // Desktop Chrome UA + wide viewport taaki site ka poora layout
+        // dikhe, tap/scroll targets bade hon. Task me "desktop":false
+        // explicitly ho tabhi mobile UA.
+        try { setDesktopMode(!task.optBoolean("no_desktop", false)) } catch (_: Exception) { }
         val results = JSONArray()
         return try {
             if (targetUrl.isNotEmpty()) {

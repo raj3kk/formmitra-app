@@ -63,8 +63,9 @@ class ProfileView(
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
-    private fun toast(msg: String) {
-        try { Toast.makeText(context, msg, Toast.LENGTH_SHORT).show() }
+    /** v43 UI: animated rich toast. */
+    private fun toast(msg: String, type: String = FmToast.INFO) {
+        try { FmToast.show(context as? android.app.Activity, msg, type) }
         catch (_: Exception) { }
     }
 
@@ -101,7 +102,11 @@ class ProfileView(
 
     init {
         orientation = VERTICAL
-        setBackgroundColor(Color.parseColor("#FAFBFC"))
+        setBackgroundColor(Color.parseColor(FmTheme.CREAM))
+        // v43 UI: Rich emerald header.
+        addView(with(FmTheme) {
+            context.richHeader("Meri Profile", "Aapke cards, settings aur account.")
+        })
         content.orientation = VERTICAL
         val pad = dp(11)
         content.setPadding(pad, dp(6), pad, pad)
@@ -488,6 +493,13 @@ class ProfileView(
                 android.view.ViewGroup.LayoutParams.WRAP_CONTENT
             )
         )
+        // v43 UI: neeche scroll = tab bar chhupao, upar = dikhao.
+        mainScroll.setOnScrollChangeListener { _, _, scrollY, _, oldScrollY ->
+            try {
+                (context as? com.formmitra.app.MainActivity)
+                    ?.onContentScrolled(scrollY - oldScrollY)
+            } catch (_: Exception) { }
+        }
         addView(
             mainScroll,
             LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)

@@ -72,6 +72,18 @@ class AgentChatView(
     /** v28 P3: track category me 8 track-types ka context (chat body me
      *  `tracking_type` jayega; chip me bhi dikhega). */
     private var activeTrackingType: String? = null
+    /**
+     * v43: naya kaam shuru karte waqt purana chal raha ho to ye pending
+     * rehta hai — "Purana band karke naya shuru karo" dabane par isi se
+     * enqueueTask dobara chalta hai.
+     */
+    private data class PendingNewTask(
+        val title: String,
+        val url: String,
+        val category: String,
+        val knownDetails: Map<String, String>,
+        val askedAlready: List<String>
+    )
     /** Category flow me plan aate hi start khud ho (koi Proceed tap nahi). */
     private var autoPlanArmed = false
     private lateinit var categoryChip: TextView
@@ -98,6 +110,9 @@ class AgentChatView(
 
     /** "Through Agent" card-create chuna → MainActivity chat kholta hai. */
     var onAgentCreateRequest: ((prefill: Map<String, String>) -> Unit)? = null
+
+    /** v43: "← Kaam" back — Work tab par wapas (MainActivity handle karega). */
+    var onBackToWork: (() -> Unit)? = null
 
     /** Card select/unlock hua — chat + aage ke automation dono me bind karo. */
     fun setActiveCard(cardId: String?, cardName: String?, cardToken: String?) {
@@ -268,26 +283,46 @@ class AgentChatView(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
         )
-        setBackgroundColor(Color.WHITE)
+        setBackgroundColor(Color.parseColor(FmTheme.CREAM))
         val pad = dp(12)
 
-        // Header: title + Details button
+        // v43 UI: Rich emerald header — back + title + Details + Live.
         val header = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(pad, dp(8), pad, dp(2))
+            background = with(FmTheme) { context.headerGradient() }
+            setPadding(pad, dp(10), pad, dp(10))
+            try { elevation = dp(4).toFloat() } catch (_: Exception) { }
         }
+        // v43: "← Kaam" — Work tab par wapas.
+        header.addView(Button(context).apply {
+            text = "← Kaam"
+            textSize = 13f
+            minimumWidth = 0
+            setTextColor(Color.WHITE)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(Color.parseColor("#FFFFFF").let { Color.argb(40, 255, 255, 255) })
+                cornerRadius = dp(10).toFloat()
+            }
+            setOnClickListener { onBackToWork?.invoke() }
+        })
         header.addView(TextView(context).apply {
             text = "🤖 Mitra"
             textSize = 18f
             setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.parseColor("#202124"))
+            setTextColor(Color.WHITE)
             layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+            setPadding(dp(8), 0, 0, 0)
         })
         header.addView(Button(context).apply {
             text = "📋 Details"
             textSize = 13f
             minimumWidth = 0
+            setTextColor(Color.WHITE)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(Color.argb(40, 255, 255, 255))
+                cornerRadius = dp(10).toFloat()
+            }
             setOnClickListener { showDetailsCard() }
         })
         // POINT 2+12 (merged): chat ↔ fullscreen live operator view toggle.
@@ -298,6 +333,11 @@ class AgentChatView(
             text = "🖥️ Live"
             textSize = 13f
             minimumWidth = 0
+            setTextColor(Color.WHITE)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(Color.argb(40, 255, 255, 255))
+                cornerRadius = dp(10).toFloat()
+            }
             setOnClickListener {
                 try {
                     val i = android.content.Intent(
@@ -438,6 +478,13 @@ class AgentChatView(
             // v20 Task 1: messages kam hon to bhi area bhara rahe — input
             // row hamesha neeche apni jagah par rahe
             isFillViewport = true
+            // v43 UI: neeche scroll = tab bar chhupao, upar = dikhao.
+            setOnScrollChangeListener { _, _, scrollY, _, oldScrollY ->
+                try {
+                    (context as? com.formmitra.app.MainActivity)
+                        ?.onContentScrolled(scrollY - oldScrollY)
+                } catch (_: Exception) { }
+            }
         }
         messageList = LinearLayout(context).apply {
             orientation = VERTICAL
@@ -1327,6 +1374,98 @@ class AgentChatView(
         } catch (t: Throwable) {
             android.util.Log.e("FmOneActive", "rejection card failed", t)
             addBubble("⏳ Pehla kaam poora karo ya band karo, phir naya shuru karo.", false)
+        }
+    }
+
+    /**
+     * v43: purana kaam chal raha ho aur user naya shuru kare — purana
+     * dikhao + "Purana band karke naya shuru karo" button. Dabate hi
+     * purana band hoga aur naya turant shuru hoga (user ka order).
+     */
+    private fun addSwitchWorkCard(pending: PendingNewTask) {
+        try {
+            val card = LinearLayout(context).apply {
+                orientation = VERTICAL
+                val d = GradientDrawable()
+                d.setColor(Color.parseColor("#E8F5E9"))
+                d.setStroke(dp(2), Color.parseColor("#43A047"))
+                d.cornerRadius = dp(14).toFloat()
+                background = d
+                setPadding(dp(16), dp(14), dp(16), dp(14))
+            }
+            val lp = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(6), 0, dp(6)) }
+            card.addView(TextView(context).apply {
+                text = "⏳ Ek kaam pehle se chal raha hai.\n" +
+                    "Naya kaam: \"${pending.title}\""
+                textSize = 15f
+                setTypeface(null, Typeface.BOLD)
+                setTextColor(Color.parseColor("#202124"))
+                setPadding(0, 0, 0, dp(10))
+            })
+            val row = LinearLayout(context).apply {
+                orientation = HORIZONTAL
+            }
+            val switchBtn = Button(context).apply {
+                text = "Purana band karke naya shuru karo"
+                textSize = 14f
+                minimumWidth = 0
+                layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+                    .apply { rightMargin = dp(8) }
+                setOnClickListener {
+                    try {
+                        com.formmitra.app.engine.FormRunService
+                            .requestCancelActive(context)
+                        addBubble(
+                            "Purana kaam band kar diya ⏹️ — naya kaam shuru ho raha hai…",
+                            false
+                        )
+                        try { messageList.removeView(card) } catch (_: Exception) { }
+                        // Naya kaam ab shuru karo (pre-check ab pass hoga).
+                        enqueueTask(
+                            pending.title, pending.url, pending.category,
+                            pending.knownDetails, pending.askedAlready
+                        ) { }
+                    } catch (_: Exception) {
+                        toast("⚠️ Nahi ho paya — dobara try karo")
+                    }
+                    scrollToBottom()
+                }
+            }
+            val dekhoBtn = Button(context).apply {
+                text = "Chal raha kaam dekho"
+                textSize = 14f
+                minimumWidth = 0
+                layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+                setOnClickListener {
+                    try {
+                        val i = android.content.Intent(
+                            context,
+                            com.formmitra.app.agent.OperatorView::class.java
+                        )
+                        com.formmitra.app.engine.FormRunService.activeTaskId
+                            ?.let { i.putExtra("run_id", it) }
+                        context.startActivity(i)
+                    } catch (_: Exception) {
+                        toast("⚠️ Live view nahi khul paya — dobara try karo")
+                    }
+                }
+            }
+            row.addView(switchBtn)
+            row.addView(dekhoBtn)
+            card.addView(row)
+            messageList.addView(card, lp)
+            scrollToBottom()
+            try {
+                VoiceOutput.speak(
+                    context,
+                    "Ek kaam pehle se chal raha hai. Purana band karke naya shuru kar sakte ho."
+                )
+            } catch (_: Exception) { }
+        } catch (t: Throwable) {
+            android.util.Log.e("FmOneActive", "switch card failed", t)
+            addBubble("⏳ Pehla kaam band karo, phir naya shuru karo.", false)
         }
     }
 
@@ -3091,6 +3230,31 @@ class AgentChatView(
         sendMessage(sb.toString())
     }
 
+    /**
+     * v43: Work tab se kaam kholo — us kaam ki chat me jao, wahan se
+     * kaam aage badhao. (resumeTask ka public wrapper.)
+     */
+    fun openWork(t: JSONObject) {
+        try { resumeTask(t) } catch (_: Exception) { }
+    }
+
+    /**
+     * v43: Work tab se "Naya kaam" — agent chat kholo (nayi baat-cheet
+     * yahin se shuru hoti hai; history category-wise alag rehti hai).
+     */
+    fun startFreshWork() {
+        try {
+            post {
+                try {
+                    addAssistantBubble(
+                        "Naya kaam shuru karte hain 👍 — kya karna hai, batao. " +
+                            "Link ho to bhej do."
+                    )
+                } catch (_: Exception) { }
+            }
+        } catch (_: Exception) { }
+    }
+
     /** Tracking resume — taaza status puchho. */
     private fun resumeTracking(tr: JSONObject) {
         val label = tr.optString("label", "tracking").ifEmpty { "tracking" }
@@ -3407,17 +3571,19 @@ class AgentChatView(
         Thread {
             try {
             var msg: String
-            // v36 (point 10): 1-active PRE-CHECK — chat me turant EXACT
-            // rejection card (service ke notification ka wait nahi; aur
-            // "shuru ho gaya" jhooth nahi). Owner exempt (unlimited).
-            // Service-side claim + server 409 backup me hain (race/multi-device).
+            // v43: 1-active PRE-CHECK — user ka order: "user jo shuru kare
+            // wahi ho, pehle wala option aaye rok, naya kaam chalu ho".
+            // Reject nahi — purana kaam dikhao + "Purana band karke naya
+            // shuru karo" button. Dabate hi purana band, naya turant shuru.
+            // Owner exempt (unlimited).
             val localActive =
                 com.formmitra.app.engine.FormRunService.activeTaskId
             if (localActive != null &&
                 !com.formmitra.app.engine.FormRunService.isOwnerDevice(context)
             ) {
+                val pending = PendingNewTask(title, url, category, knownDetails, askedAlready)
                 post {
-                    addOneActiveRejectionCard()
+                    addSwitchWorkCard(pending)
                     onDone()
                 }
                 return@Thread
@@ -4379,13 +4545,12 @@ class AgentChatView(
     }
 
     /**
-     * v29 zero-crash gate: toast kabhi crash na kare — context destroyed
-     * Activity ho to Toast.makeText throw karta hai (UI thread par =
-     * app crash). Har call site protected.
+     * v29 zero-crash gate + v43 UI: toast kabhi crash na kare —
+     * animated rich FmToast.
      */
-    private fun toast(msg: String) {
+    private fun toast(msg: String, type: String = FmToast.INFO) {
         try {
-            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+            FmToast.show(context as? android.app.Activity, msg, type)
         } catch (_: Exception) { }
     }
 

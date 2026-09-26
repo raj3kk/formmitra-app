@@ -54,8 +54,12 @@ class MainActivity : Activity() {
     private lateinit var agentChatView: AgentChatView
     private var homeVisible = false
     private var agentVisible = false
+    // v43: Agent + History merge → 📋 Kaam tab. historyView ab nav me nahi
+    // (legacy deep-links ke liye instance barkarar).
     private lateinit var historyView: com.formmitra.app.agent.HistoryView
     private var historyVisible = false
+    private lateinit var workTabView: com.formmitra.app.agent.WorkTabView
+    private var workVisible = false
     private lateinit var profileView: ProfileView
     private var profileVisible = false
 
@@ -74,6 +78,9 @@ class MainActivity : Activity() {
     }
 
     private lateinit var navInner: LinearLayout
+    // v43 UI: tab bar hide/show on scroll (neeche scroll = chhupao).
+    private var navBar: android.widget.HorizontalScrollView? = null
+    private var navHidden = false
     private var navButtons: List<Button> = emptyList()
     private var activePath = "/"
     private var isOwner = false
@@ -87,15 +94,16 @@ class MainActivity : Activity() {
     private val ownerEmail = "priyadarshirajindia@gmail.com"
 
     private val baseTabs = listOf(
-        "Home" to "/",
-        "💬 Agent" to "/agent",
-        "History" to "/history",
-        "Wallet" to "/wallet",
-        "Profile" to "/profile"
+        // v43 UI: icon + label tabs (rich pill design).
+        Triple("🏠", "Home", "/"),
+        // v43: 💬 Agent + History hatao → dono ka merge 📋 Kaam tab.
+        Triple("📋", "Kaam", "/work"),
+        Triple("👛", "Wallet", "/wallet"),
+        Triple("👤", "Profile", "/profile")
     )
 
     private fun currentTabs() =
-        if (isOwner) baseTabs + ("Admin" to "/admin") else baseTabs
+        if (isOwner) baseTabs + Triple("⚙️", "Admin", "/admin") else baseTabs
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -117,6 +125,11 @@ class MainActivity : Activity() {
                 layoutParams = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
                 )
+                // v43 UI: web page scroll (Wallet/Admin) = tab bar hide/show.
+                setOnScrollChangeListener { _, _, scrollY, _, oldScrollY ->
+                    try { this@MainActivity.onContentScrolled(scrollY - oldScrollY) }
+                    catch (_: Exception) { }
+                }
             }
             with(wv.settings) {
                 javaScriptEnabled = true
@@ -186,6 +199,8 @@ class MainActivity : Activity() {
         agentChatView.onAgentCreateRequest = { prefill ->
             onAgentCreateCard(null, null, prefill)
         }
+        // v43: "← Kaam" — Work tab par wapas.
+        agentChatView.onBackToWork = { selectTab("/work") }
         homeView = HomeView(
             this,
             // v24 B8/C14: category card → card-first flow complete hone par
@@ -220,6 +235,23 @@ class MainActivity : Activity() {
             visibility = View.GONE
         }
         root.addView(historyView)
+
+        // v43: 📋 Kaam tab — Agent + History ka merge (work cards).
+        workTabView = com.formmitra.app.agent.WorkTabView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            )
+            visibility = View.GONE
+        }
+        root.addView(workTabView)
+        // Work card tap → us kaam ki chat kholo.
+        workTabView.onOpenWorkChat = { task ->
+            showAgentChatForWork(task)
+        }
+        // ➕ Naya kaam → nayi agent chat.
+        workTabView.onNewWork = {
+            showAgentChatForWork(null)
+        }
 
         // Profile tab — native (v19, BUG 4): details + edit + vault + admin + logout
         profileView = ProfileView(
@@ -285,11 +317,25 @@ class MainActivity : Activity() {
             )
             isHorizontalScrollBarEnabled = false
             addView(navInner)
-            // v20 Task 2: halki top divider + shadow — nav alag dikhe
-            setBackgroundColor(Color.parseColor("#FFFFFF"))
-            try { elevation = 6f } catch (_: Exception) { }
+            // v43 UI: cream bg + GOLD top divider (premium touch).
+            setBackgroundColor(
+                Color.parseColor(com.formmitra.app.agent.FmTheme.CREAM)
+            )
+            try { elevation = 8f } catch (_: Exception) { }
         }
+        // Gold divider strip (nav ke upar).
+        val goldDivider = android.view.View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                (2 * resources.displayMetrics.density).toInt()
+            )
+            setBackgroundColor(
+                Color.parseColor(com.formmitra.app.agent.FmTheme.GOLD)
+            )
+        }
+        root.addView(goldDivider)
         root.addView(navScroll)
+        navBar = navScroll
         setContentView(root)
         buildNav()
 
@@ -313,10 +359,11 @@ class MainActivity : Activity() {
             com.formmitra.app.agent.FmRealtime.onTaskEvent = { _, _ ->
                 runOnUiThread {
                     try {
-                        if (::historyView.isInitialized &&
-                            historyView.visibility == View.VISIBLE
+                        // v43: Work tab visible ho to turant refresh.
+                        if (::workTabView.isInitialized &&
+                            workTabView.visibility == View.VISIBLE
                         ) {
-                            historyView.onTabShown()
+                            workTabView.refresh()
                         }
                     } catch (_: Exception) { }
                 }
@@ -349,25 +396,45 @@ class MainActivity : Activity() {
     /** Purane tab paths (notification/deep-link) → naye tabs. */
     private fun mapLegacyTab(path: String): String = when (path) {
         "/browser" -> "/"
+        // v43: Agent + History → 📋 Kaam me merge.
+        "/agent" -> "/work"
+        "/history" -> "/work"
         else -> path
     }
 
+    /**
+     * v43 UI: Rich tab bar — icon + label pill tabs.
+     * Selected = emerald gradient pill (white text), unselected = warm ink text.
+     * Kala kahin nahi; gold divider upar (premium touch).
+     */
     private fun buildNav() {
         navInner.removeAllViews()
         val tabs = currentTabs()
-        navButtons = tabs.map { (label, path) ->
+        navButtons = tabs.map { (icon, label, path) ->
             Button(this).apply {
-                text = label
+                text = "$icon  $label"
                 textSize = 14f
-                minWidth = (96 * resources.displayMetrics.density).toInt()
+                isAllCaps = false
+                minWidth = (104 * resources.displayMetrics.density).toInt()
+                minimumHeight = (52 * resources.displayMetrics.density).toInt()
                 layoutParams = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.WRAP_CONTENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT
                 ).apply {
-                    val m = (6 * resources.displayMetrics.density).toInt()
-                    setMargins(m, 0, m, 0)
+                    val m = (5 * resources.displayMetrics.density).toInt()
+                    setMargins(m, (6 * resources.displayMetrics.density).toInt(), m,
+                        (6 * resources.displayMetrics.density).toInt())
                 }
-                setOnClickListener { selectTab(path) }
+                setOnClickListener {
+                    // Tap feedback: halka scale.
+                    try {
+                        animate().scaleX(0.94f).scaleY(0.94f).setDuration(80)
+                            .withEndAction {
+                                animate().scaleX(1f).scaleY(1f).setDuration(120).start()
+                            }.start()
+                    } catch (_: Exception) { }
+                    selectTab(path)
+                }
             }
         }
         navButtons.forEach { navInner.addView(it) }
@@ -404,12 +471,14 @@ class MainActivity : Activity() {
             intent.removeExtra(com.formmitra.app.agent.NotifCenter.EXTRA_RUN_ID)
             intent.removeExtra(com.formmitra.app.agent.NotifCenter.EXTRA_PROMPT_RUN_ID)
         } catch (_: Exception) { }
-        val target = mapLegacyTab(tab ?: "/history")
+        val target = mapLegacyTab(tab ?: "/work")
         selectTab(target)
-        if (promptRunId.isNotEmpty() && target == "/history") {
-            historyView.openPromptEntry(promptRunId)
-        } else if (runId.isNotEmpty() && target == "/history") {
-            historyView.openRunDetail(runId)
+        // v43: run detail ab Work tab me — runId mile to uska task kholo.
+        // (historyView legacy deep-links ke liye instance barkarar hai.)
+        if (promptRunId.isNotEmpty() && target == "/work") {
+            try { historyView.openPromptEntry(promptRunId) } catch (_: Exception) { }
+        } else if (runId.isNotEmpty() && target == "/work") {
+            try { historyView.openRunDetail(runId) } catch (_: Exception) { }
         }
     }
 
@@ -483,32 +552,62 @@ class MainActivity : Activity() {
      * v29 zero-crash gate: toast kabhi crash na kare (destroyed activity
      * context par Toast.makeText throw karta hai — UI thread = crash).
      */
+    /** v43 UI: animated FmToast (rich, icon wala). */
     private fun toast(msg: String, long: Boolean = false) {
         try {
-            android.widget.Toast.makeText(
+            com.formmitra.app.agent.FmToast.show(
                 this, msg,
-                if (long) android.widget.Toast.LENGTH_LONG
-                else android.widget.Toast.LENGTH_SHORT
-            ).show()
+                com.formmitra.app.agent.FmToast.INFO,
+                if (long) 3200L else 2600L
+            )
         } catch (_: Exception) { }
     }
 
+    /**
+     * v43: Work tab se kaam kholo — agent chat full-screen dikhao.
+     * @param task null = naya kaam; warna us kaam ki chat (resume).
+     */
+    private fun showAgentChatForWork(task: org.json.JSONObject?) {
+        homeVisible = false
+        agentVisible = false
+        historyVisible = false
+        workVisible = false
+        profileVisible = false
+        homeView.visibility = View.GONE
+        historyView.visibility = View.GONE
+        workTabView.visibility = View.GONE
+        profileView.visibility = View.GONE
+        webView?.visibility = View.GONE
+        agentChatView.visibility = View.VISIBLE
+        agentVisible = true
+        agentChatView.onTabShown()
+        try {
+            if (task != null) agentChatView.openWork(task)
+            else agentChatView.startFreshWork()
+        } catch (_: Exception) { }
+        updateNavHighlight("/work")
+    }
+
     private fun selectTab(path: String) {
+        // v43 UI: tab switch par nav bar hamesha wapas dikhao.
+        showNavBar()
         val wasAgent = agentVisible
         homeVisible = false
         agentVisible = false
         historyVisible = false
+        workVisible = false
         profileVisible = false
         mirrorVisible = false
         mirrorHandler.removeCallbacks(mirrorRunnable)
         homeView.visibility = View.GONE
         agentChatView.visibility = View.GONE
         historyView.visibility = View.GONE
+        workTabView.visibility = View.GONE
         profileView.visibility = View.GONE
         browserMirrorView.visibility = View.GONE
         webView?.visibility = View.GONE
         if (wasAgent && path != "/agent") agentChatView.onTabHidden()
-        val tabPaths = currentTabs().map { it.second }.toSet()
+        val tabPaths = currentTabs().map { it.third }.toSet()
         when {
             path == "/" -> {
                 homeView.visibility = View.VISIBLE
@@ -518,16 +617,24 @@ class MainActivity : Activity() {
                 // auto-continue (coordination toote nahi).
                 try { resumePendingCategory() } catch (_: Exception) { }
             }
+            // v43: 📋 Kaam tab (Agent+History merge).
+            path == "/work" -> {
+                workTabView.visibility = View.VISIBLE
+                workVisible = true
+                workTabView.onTabShown()
+            }
+            // v43: /agent ab nav me nahi — Work tab se khulta hai
+            // (showAgentChatForWork). Purane deep-links ke liye rakha hai.
             path == "/agent" -> {
-                // v26: dedicated full-screen agent chat tab.
                 agentChatView.visibility = View.VISIBLE
                 agentVisible = true
                 agentChatView.onTabShown()
             }
             path == "/history" -> {
-                historyView.visibility = View.VISIBLE
-                historyVisible = true
-                historyView.onTabShown()
+                // v43: History ab /work me merge — purane link /work par bhejo.
+                workTabView.visibility = View.VISIBLE
+                workVisible = true
+                workTabView.onTabShown()
             }
             path == "/profile" -> {
                 // v19 BUG 4: native ProfileView (WebView nahi)
@@ -876,18 +983,62 @@ class MainActivity : Activity() {
         } catch (_: Exception) { }
     }
 
+    /**
+     * v43 UI: tab highlight — selected = emerald gradient pill + white bold text,
+     * unselected = warm ink text. Kala (DKGRAY/BLACK) kahin nahi.
+     */
     private fun updateNavHighlight(active: String) {
         val tabs = currentTabs()
-        tabs.forEachIndexed { idx, (_, path) ->
+        tabs.forEachIndexed { idx, (_, _, path) ->
             if (idx >= navButtons.size) return@forEachIndexed
+            val btn = navButtons[idx]
             val on = path == active
-            navButtons[idx].setTextColor(
-                if (on) Color.parseColor("#0E7C5B") else Color.DKGRAY
-            )
-            navButtons[idx].setTypeface(
-                null, if (on) Typeface.BOLD else Typeface.NORMAL
-            )
+            if (on) {
+                btn.background =
+                    com.formmitra.app.agent.FmTheme.run { this@MainActivity.selectedTabBg() }
+                btn.setTextColor(Color.WHITE)
+                btn.setTypeface(null, Typeface.BOLD)
+                try { btn.elevation = dp(4).toFloat() } catch (_: Exception) { }
+            } else {
+                btn.background =
+                    com.formmitra.app.agent.FmTheme.run { this@MainActivity.unselectedTabBg() }
+                btn.setTextColor(Color.parseColor(com.formmitra.app.agent.FmTheme.INK_SOFT))
+                btn.setTypeface(null, Typeface.NORMAL)
+                try { btn.elevation = 0f } catch (_: Exception) { }
+            }
         }
+    }
+
+    /** dp helper (MainActivity scope). */
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    /**
+     * v43 UI: content scroll hua — neeche scroll (dy>0) = tab bar chhupao,
+     * upar scroll (dy<=0) = tab bar dikhao. Smooth slide animation.
+     * Views (Home/Work/Profile) apne ScrollView se ye call karte hain.
+     */
+    fun onContentScrolled(dy: Int) {
+        try {
+            val bar = navBar ?: return
+            if (dy > 8 && !navHidden) {
+                // Neeche scroll — chhupao.
+                navHidden = true
+                bar.animate().translationY(bar.height.toFloat() + dp(8))
+                    .setDuration(220).start()
+            } else if (dy < -8 && navHidden) {
+                // Upar scroll — dikhao.
+                navHidden = false
+                bar.animate().translationY(0f).setDuration(220).start()
+            }
+        } catch (_: Exception) { }
+    }
+
+    /** Tab switch par tab bar hamesha dikhao (chhupa ho to wapas lao). */
+    private fun showNavBar() {
+        try {
+            navHidden = false
+            navBar?.animate()?.translationY(0f)?.setDuration(200)?.start()
+        } catch (_: Exception) { }
     }
 
     @Deprecated("Use OnBackPressedDispatcher on newer APIs")
