@@ -507,6 +507,21 @@ class FormRunService : Service() {
         runThread = Thread({
             try {
                 runTask(task, name)
+            } catch (t: Throwable) {
+                // CRASH-FREEDOM GATE (v36): run thread kabhi uncaught nahi
+                // marega. runTask ke andar ke guards ke baad bhi jo bache
+                // (pre-engine idempotency/category, post-engine notify),
+                // wo yahan pakda jayega — ErrorCatcher me asli wajah ke
+                // saath, app crash ke bina.
+                try {
+                    val rid = task.optString("run_id", "")
+                    ErrorCatcher.report(
+                        this, "Kaam chalate waqt (run thread)", t, name, rid
+                    )
+                } catch (_: Exception) { }
+                try {
+                    android.util.Log.e("FormRunService", "runTask uncaught (contained)", t)
+                } catch (_: Exception) { }
             } finally {
                 releaseClaim(claimId)
                 // v34 (Phase 2A): parked-OTP race — jawab park→finish ke

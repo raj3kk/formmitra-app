@@ -514,6 +514,19 @@ fun main() {
         check("gate audit login", pdSrc.contains("\"login\", req.title.take(120)"))
         check("gate audit document", pdSrc.contains("\"document\", req.title.take(120)"))
         check("gate audit device_auth", pdSrc.contains("\"device_auth\", req.title.take(120)"))
+        // ============ v36: CRASH-FREEDOM GATE — "App crash na ho" ============
+        // (1) run thread: try-finally me catch(Throwable) — runTask ka koi
+        // bhi uncaught exception thread nahi marega (ErrorCatcher report).
+        check("crash gate run thread catch", frsSrc.contains("catch (t: Throwable)") && frsSrc.contains("runTask uncaught (contained)"))
+        // (2) launch path: FmApp.onCreate me WorkManager init Throwable-guard
+        // (v15 crash dobara nahi), MainActivity scheduler calls guarded.
+        val fmAppSrc = codeOnly(File("$appDir/app/src/main/java/com/formmitra/app/FmApp.kt").readText())
+        check("crash gate wm init guarded", fmAppSrc.contains("WorkManager.initialize(this, workManagerConfiguration)") && fmAppSrc.contains("catch (t: Throwable)"))
+        val maSrc = codeOnly(File("$appDir/app/src/main/java/com/formmitra/app/MainActivity.kt").readText())
+        check("crash gate main scheduler guarded", maSrc.contains("Scheduler.scheduleDigest(this)") && maSrc.contains("Scheduler failed (non-fatal)"))
+        // (3) workers: doWork try/catch (WorkManager bhi wrap karta hai).
+        val ftwSrc = codeOnly(File("$appDir/app/src/main/java/com/formmitra/app/FormTaskWorker.kt").readText())
+        check("crash gate worker guarded", ftwSrc.contains("override fun doWork()") && ftwSrc.contains("return try {"))
     }
 
     println(if (failures == 0) "SELFTESTS-OK" else "SELFTESTS-FAILED: $failures")
