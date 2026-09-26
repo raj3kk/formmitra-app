@@ -13,6 +13,7 @@ if ! command -v java >/dev/null 2>&1; then
   fi
 fi
 APP=~/workspace/formmitra-app/app-android
+WEB=~/workspace/repos/formmitra
 SRC=$APP/app/src/main/java/com/formmitra/app
 KOTLINC=~/workspace/phone-agent/tools/kotlinc/bin/kotlinc
 STDLIB=~/workspace/phone-agent/tools/kotlinc/lib/kotlin-stdlib.jar
@@ -368,6 +369,24 @@ run_test_v43() {
   TOTAL_PASS=$((TOTAL_PASS+passes))
 }
 run_test_v43
+
+# v44: CAPTCHA root fix + Trainer system + Admin panel fix.
+run_test_v44() {
+  local name="selftest_v44"
+  echo "== $name =="
+  "$KOTLINC" -J-Xmx1g -cp "$ANDR_JAR" \
+    "$APP/tools/selftest/SelfTestV44.kt" \
+    -d "$OUT/$name" >"$OUT/$name.log" 2>&1
+  if [ $? -ne 0 ]; then echo "COMPILE FAILED:"; tail -20 "$OUT/$name.log"; TOTAL_FAIL=$((TOTAL_FAIL+1)); return; fi
+  java -Dfm.app.dir="$APP" -Dfm.web.dir="$WEB" -cp "$OUT/$name:$STDLIB" com.formmitra.app.selftest.SelfTestV44Kt 2>&1 | tee "$OUT/$name.out" | grep -E "^(PASS|FAIL|SKIP)" | tail -12
+  local fails passes
+  fails=$(grep -cE "^(FAIL|Exception in thread)" "$OUT/$name.out" || true)
+  passes=$(grep -cE "^PASS" "$OUT/$name.out" || true)
+  echo "-> $name PASS: $passes FAIL: $fails"
+  TOTAL_FAIL=$((TOTAL_FAIL+fails))
+  TOTAL_PASS=$((TOTAL_PASS+passes))
+}
+run_test_v44
 
 echo "==============================="
 echo "TOTAL PASS: $TOTAL_PASS"

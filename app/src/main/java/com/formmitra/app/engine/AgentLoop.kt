@@ -3463,7 +3463,8 @@ object AgentLoop {
                         .put("mode", "analyze")
                         .put("screenshot_b64", shot)
                         .put("dom_snippet", domSnippet)
-                        .put("url", url)
+                        .put("page_url", url)
+                        .put("widget_kind", kind)
                         .put("attempt", attempt)
                 )
             } catch (_: Exception) {
@@ -3475,6 +3476,17 @@ object AgentLoop {
                 continue
             }
             val cap = ares.json!!.optJSONObject("captcha") ?: JSONObject()
+            // v44: AI ko EXPLICITLY confirm karna hai ki screenshot me ASLI
+            // captcha dikh raha hai. captcha_present=false ya unknown+low
+            // confidence → false positive tha: attempt consume nahi, kaam
+            // continue (yehi "captcha nahi tha phir bhi 3 try" ka fix hai).
+            val present = cap.optBoolean("captcha_present", false)
+            val conf = cap.optDouble("confidence", 0.0)
+            val capType = cap.optString("type", "unknown")
+            if (!present || (capType == "unknown" && conf < 0.5)) {
+                attempts[0] = 0 // false alarm — counter reset, kaam aage badho
+                return null
+            }
             if (cap.optBoolean("is_access_wall", false)) {
                 return "Ye page access-wall hai (login wall) — CAPTCHA auto-solve yahan allowed nahi. " +
                     "Aap khud login karke task dobara chalayein"
@@ -3489,14 +3501,17 @@ object AgentLoop {
                         .put("mode", "verify")
                         .put("screenshot_b64", vshot)
                         .put("dom_snippet", domSnippet)
-                        .put("url", url)
+                        .put("page_url", url)
                         .put("attempt", attempt)
                         .put("verify_hint", cap.optString("verify_hint", ""))
                 )
             } catch (_: Exception) {
                 AgentApi.ApiResult(-1, null)
             }
-            val vcap = vres.json?.optJSONObject("captcha")
+            // v44: server verify route {verify:{...}} deta hai (captcha nahi)
+            // — dono keys try karo (backward compat).
+            val vcap = vres.json?.optJSONObject("verify")
+                ?: vres.json?.optJSONObject("captcha")
             val solved = vres.code == 200 && vcap?.optBoolean("solved", false) == true
             if (solved) {
                 attempts[0] = 0
@@ -3535,7 +3550,7 @@ object AgentLoop {
             sb.append("[")
                 .append(w.optString("kind", "?"))
                 .append("] ")
-                .append(w.optString("html", "").take(600))
+                .append(w.optString("html_snippet", "").take(600))
                 .append("\n")
         }
         return sb.toString().take(3200)

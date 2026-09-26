@@ -1514,8 +1514,32 @@ class FormEngine(private val appContext: Context) {
           function cls(e){
             try{ var c=e.getAttribute('class')||''; return (typeof c==='string')?c:''; }catch(x){ return ''; }
           }
+          // v44: SIRF visible, on-screen, non-zero-size widgets gino.
+          // Hidden/stale/zero-size captcha markup (display:none wale divs,
+          // invisible sitekey holders) FALSE POSITIVE tha — yehi "screen par
+          // captcha nahi tha phir bhi 3 try" ka root cause tha.
+          function visible(el){
+            try{
+              var r=el.getBoundingClientRect();
+              if(!r||r.width<=0||r.height<=0) return false;
+              var cs=getComputedStyle(el);
+              if(cs.display==='none'||cs.visibility==='hidden'||cs.visibility==='collapse') return false;
+              var op=parseFloat(cs.opacity||'1');
+              if(!(op>0)) return false;
+              if(el.getAttribute('aria-hidden')==='true') return false;
+              var p=el.parentElement, d=0;
+              while(p&&d<4){
+                var pcs=getComputedStyle(p);
+                if(pcs.display==='none'||pcs.visibility==='hidden'||pcs.visibility==='collapse') return false;
+                p=p.parentElement; d++;
+              }
+              return true;
+            }catch(e){ return false; }
+          }
+          var invisible_markers=0;
           function push(kind, el, snippet){
             if(out.length>=10) return;
+            if(!visible(el)){ invisible_markers++; return; }
             out.push({kind:kind, rect:rect(el), html_snippet:(snippet||'').slice(0,300)});
           }
           var docs=[document];
@@ -1572,7 +1596,7 @@ class FormEngine(private val appContext: Context) {
               }catch(x){}
             });
           });
-          return JSON.stringify({found: out.length>0, widgets: out});
+          return JSON.stringify({found: out.length>0, widgets: out, invisible_markers: invisible_markers});
         })()"""
         return unwrapJsObject(evalJsSync(js))
     }

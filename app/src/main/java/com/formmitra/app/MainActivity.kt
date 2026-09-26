@@ -147,6 +147,29 @@ class MainActivity : Activity() {
                 ): Boolean {
                     val u = try { request.url?.toString() }
                     catch (_: Exception) { null } ?: return false
+                    // v44 (Trainer): "formmitra://trainer/record?session=<id>"
+                    // → native recorder kholo (sirf owner; fail-closed).
+                    if (u.startsWith("formmitra://trainer/record")) {
+                        if (isOwner) {
+                            val sid = try {
+                                android.net.Uri.parse(u)
+                                    .getQueryParameter("session") ?: ""
+                            } catch (_: Exception) { "" }
+                            if (sid.isNotEmpty()) {
+                                val it = android.content.Intent(
+                                    this@MainActivity,
+                                    com.formmitra.app.agent.TrainerRecorderActivity::class.java
+                                )
+                                it.putExtra("session_id", sid)
+                                try { startActivity(it) } catch (_: Exception) { }
+                            } else {
+                                toast("Session id nahi mila")
+                            }
+                        } else {
+                            toast("Ye sirf admin ke liye hai")
+                        }
+                        return true
+                    }
                     // v19 BUG 2: same-origin in-page navigation (website ke Link
                     // clicks) par app=1 jod do taaki param khoye nahi. Bahar ke
                     // official links ko chhedo mat — WebView khud handle kare.

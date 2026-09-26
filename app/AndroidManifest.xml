@@ -46,6 +46,12 @@
             android:exported="false"
             android:theme="@android:style/Theme.Material.Light.NoActionBar"
             android:configChanges="orientation|screenSize|keyboardHidden" />
+        <!-- v44: trainer recorder (ADMIN ONLY — MainActivity isOwner check karke kholta hai) -->
+        <activity
+            android:name=".agent.TrainerRecorderActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
         <receiver
             android:name=".BootReceiver"
             android:exported="false">

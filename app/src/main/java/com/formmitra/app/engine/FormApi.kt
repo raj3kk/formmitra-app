@@ -101,4 +101,51 @@ object FormApi {
             conn.disconnect()
         }
     }
+
+    // v44 (Trainer recorder — ADMIN ONLY, server email-check karta hai):
+    // GET /api/app/trainer/sessions/{id} → session JSONObject ya null.
+    fun trainerSession(ctx: Context, sessionId: String): JSONObject? {
+        val conn = open("/api/app/trainer/sessions/$sessionId", "GET", ctx)
+        return try {
+            if (conn.responseCode != 200) return null
+            val body = readBody(conn)
+            JSONObject(body).optJSONObject("session")
+        } catch (_: Exception) {
+            null
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    // POST /api/app/trainer/sessions/{id}/steps {steps:[...]} → true/false.
+    fun trainerPostSteps(ctx: Context, sessionId: String, steps: org.json.JSONArray): Boolean {
+        val payload = JSONObject().put("steps", steps)
+        val conn = open("/api/app/trainer/sessions/$sessionId/steps", "POST", ctx)
+        return try {
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            val bytes = payload.toString().toByteArray(Charsets.UTF_8)
+            conn.outputStream.use { it.write(bytes) }
+            conn.responseCode in 200..299
+        } catch (_: Exception) {
+            false
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    // POST /api/app/trainer/sessions/{id}/finalize → true/false.
+    fun trainerFinalize(ctx: Context, sessionId: String): Boolean {
+        val conn = open("/api/app/trainer/sessions/$sessionId/finalize", "POST", ctx)
+        return try {
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.outputStream.use { it.write("{}".toByteArray(Charsets.UTF_8)) }
+            conn.responseCode in 200..299
+        } catch (_: Exception) {
+            false
+        } finally {
+            conn.disconnect()
+        }
+    }
 }
