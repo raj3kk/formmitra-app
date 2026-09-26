@@ -704,6 +704,11 @@ class MainActivity : Activity() {
             isOwner = true
             runOnUiThread { buildNav() }
         }
+        // v36 (point 10): owner unlimited — background service ke liye
+        // persistent flag (session-only isOwner service tak nahi pahunchta).
+        try {
+            com.formmitra.app.engine.FormRunService.setOwnerDevice(this, true)
+        } catch (_: Exception) { }
         if (::profileView.isInitialized) profileView.setOwner(true)
     }
 
@@ -711,6 +716,11 @@ class MainActivity : Activity() {
     private fun doLogout() {
         try {
             CookieManager.getInstance().removeAllCookies(null)
+        } catch (_: Exception) { }
+        // v36 (point 10): logout par owner flag saaf — agla user normal
+        // limit me rahe (stale unlimited kabhi nahi).
+        try {
+            com.formmitra.app.engine.FormRunService.setOwnerDevice(this, false)
         } catch (_: Exception) { }
         // v29 P8: logout par realtime socket band (doosre user ka channel
         // kabhi subscribe nahi hona chahiye).

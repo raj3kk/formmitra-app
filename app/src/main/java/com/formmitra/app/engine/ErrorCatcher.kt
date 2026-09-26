@@ -19,6 +19,8 @@ import java.io.StringWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * ErrorCatcher — v35 ADVANCED CATCHER.
@@ -45,6 +47,11 @@ import java.util.Locale
  */
 object ErrorCatcher {
     private const val TAG = "ErrorCatcher"
+
+    // v36: background reports ka persistent store (koi Activity na ho tab bhi).
+    private const val PREFS_REPORTS = "formmitra_error_reports"
+    private const val KEY_REPORTS = "reports"
+    private const val MAX_REPORTS = 20
 
     // ------------------------------------------------------------------
     // PURE (JVM-testable, koi Android nahi)
@@ -111,8 +118,108 @@ object ErrorCatcher {
         maskSecrets(t.javaClass.simpleName + (t.message?.let { ": $it" } ?: ""))
 
     /**
-     * Chat me paste karne layak poori report. Format:
-     * kaam, time, session id, jagah, wajah + masked stack (60 lines tak).
+     * v36 catcher order: POORA technical detail — kuch chhupana nahi.
+     * Sirf secrets mask (maskSecrets) — baaki sab RAW.
+     *
+     * Me hota hai:
+     *  - Error class (poora naam)
+     *  - Message (raw)
+     *  - Cause chain (poori)
+     *  - Error code (class-prefix + stack fingerprint — report match karne ke liye)
+     *  - Jahan hua (pehle 5 app frames: file/func/line jahan available)
+     *  - Stack trace — POORA, untruncated (fullTrace=true) ya pehli N lines
+     *
+     * Pure (JVM-testable).
+     */
+    fun technicalDetail(t: Throwable, maxLines: Int = Int.MAX_VALUE): String {
+        val sw = StringWriter()
+        t.printStackTrace(PrintWriter(sw))
+        val fullTrace = maskSecrets(sw.toString())
+        val lines = fullTrace.lines()
+        val trace = if (lines.size > maxLines) {
+            lines.take(maxLines).joinToString("\n") +
+                "\n... (${lines.size - maxLines} lines aur — \"Poora dekho\" me)"
+        } else fullTrace
+        val code = errorCode(t, fullTrace)
+        val where = whereHappened(t)
+        val causes = causeChain(t)
+        return buildString {
+            appendLine("Error class: ${t.javaClass.name}")
+            appendLine("Message: ${maskSecrets(t.message ?: "-")}")
+            appendLine("Error code: $code")
+            if (causes.isNotEmpty()) {
+                appendLine("Cause chain:")
+                for (c in causes) appendLine("  ← $c")
+            }
+            appendLine("Jahan hua:")
+            if (where.isEmpty()) appendLine("  (stack khaali)")
+            else for (w in where) appendLine("  $w")
+            appendLine("--- Stack trace (poora) ---")
+            append(trace)
+        }
+    }
+
+    /**
+     * Error code — report match karne ke liye stable fingerprint:
+     * CLASSNAME-xxxxxx (stack hash ke pehle 6 hex).
+     */
+    fun errorCode(t: Throwable, maskedTrace: String? = null): String {
+        return try {
+            val trace = maskedTrace ?: run {
+                val sw = StringWriter()
+                t.printStackTrace(PrintWriter(sw))
+                maskSecrets(sw.toString())
+            }
+            val hash = trace.hashCode().toUInt().toString(16).padStart(8, '0').take(6)
+            "${t.javaClass.simpleName.uppercase(Locale.US).take(12)}-$hash"
+        } catch (_: Exception) {
+            t.javaClass.simpleName.uppercase(Locale.US).take(12)
+        }
+    }
+
+    /**
+     * Jahan hua — pehle 5 frames (file/func/line jahan available).
+     * Format: at pkg.Class.func (File.kt:line)
+     */
+    fun whereHappened(t: Throwable, maxFrames: Int = 5): List<String> {
+        return try {
+            t.stackTrace.take(maxFrames).map { e ->
+                val loc = if (e.fileName != null) {
+                    " (${e.fileName}:${if (e.lineNumber >= 0) e.lineNumber else "?"})"
+                } else ""
+                "at ${e.className}.${e.methodName}$loc"
+            }
+        } catch (_: Exception) { emptyList() }
+    }
+
+    /**
+     * Cause chain — masked, sabse andar tak, BINA cap.
+     * Cycle-safe: cause cycle (A→B→A) par pehle dekha cause dobara nahi
+     * (infinite loop impossible). Koi arbitrary depth cap nahi — user order:
+     * causes poore dikhenge.
+     */
+    fun causeChain(t: Throwable): List<String> {
+        val out = mutableListOf<String>()
+        return try {
+            val seen = java.util.Collections.newSetFromMap(
+                java.util.IdentityHashMap<Throwable, Boolean>()
+            )
+            var c = t.cause
+            seen.add(t)
+            while (c != null && seen.add(c)) {
+                out.add(maskSecrets(c.javaClass.simpleName + (c.message?.let { ": $it" } ?: "")))
+                c = c.cause
+            }
+            out
+        } catch (_: Exception) { out }
+    }
+
+    /**
+     * Chat me paste karne layak POORI report (Copy button isi ko bhejta hai).
+     * v36 catcher order: kuch chhupana nahi — error class, message, cause
+     * chain, error code, jahan hua, POORA stack trace. Sirf secrets masked.
+     * Format: kaam, time, session id, jagah, wajah + technicalDetail (poora).
+     * Koi length cap NAHI (user order: copy me complete report).
      */
     fun formatReport(
         where: String,
@@ -122,9 +229,6 @@ object ErrorCatcher {
         extra: Map<String, String> = emptyMap()
     ): String {
         val ts = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
-        val sw = StringWriter()
-        t.printStackTrace(PrintWriter(sw))
-        val maskedTrace = maskSecrets(sw.toString()).lines().take(60).joinToString("\n")
         return buildString {
             appendLine("FormMitra error report")
             appendLine("Kaam: ${workName.ifEmpty { "-" }}")
@@ -135,9 +239,68 @@ object ErrorCatcher {
             for ((k, v) in extra) {
                 if (k.isNotEmpty() && v.isNotEmpty()) appendLine("$k: ${maskSecrets(v)}")
             }
-            appendLine("---")
-            append(maskedTrace)
-        }.take(48_000)
+            appendLine("=== Technical detail (poora) ===")
+            append(technicalDetail(t))
+        }
+    }
+
+    /**
+     * v36: BACKGROUND failure path — koi Activity visible na ho tab bhi.
+     * Asli wajah (masked) log + persist hoti hai; app khulne par user
+     * report dekh/copy kar sakta hai (lastReports()).
+     * Kabhi throw nahi karta — catcher khud crash nahi karega.
+     */
+    fun report(
+        ctx: Context,
+        where: String,
+        t: Throwable,
+        workName: String = "",
+        sessionId: String = ""
+    ) {
+        try {
+            Log.e(
+                TAG,
+                "[$where] work='$workName' session='$sessionId': ${shortCause(t)}",
+                t
+            )
+        } catch (_: Exception) { }
+        try {
+            val prefs = ctx.getSharedPreferences(PREFS_REPORTS, Context.MODE_PRIVATE)
+            val arr = try {
+                JSONArray(prefs.getString(KEY_REPORTS, "[]") ?: "[]")
+            } catch (_: Exception) {
+                JSONArray()
+            }
+            arr.put(
+                JSONObject()
+                    .put("at", System.currentTimeMillis())
+                    .put("where", where)
+                    .put("work", workName)
+                    .put("session", sessionId)
+                    // v36 catcher order: persisted report BHI poora (copy
+                    // me complete report — koi cap nahi, sirf secrets masked).
+                    .put("report", formatReport(where, workName, sessionId, t))
+            )
+            while (arr.length() > MAX_REPORTS) arr.remove(0)
+            prefs.edit().putString(KEY_REPORTS, arr.toString()).apply()
+        } catch (_: Exception) { }
+    }
+
+    /**
+     * v36: persist hui background reports (nayi pehle). Copy/share ke liye.
+     */
+    fun lastReports(ctx: Context): List<JSONObject> {
+        val out = ArrayList<JSONObject>()
+        try {
+            val arr = JSONArray(
+                ctx.getSharedPreferences(PREFS_REPORTS, Context.MODE_PRIVATE)
+                    .getString(KEY_REPORTS, "[]") ?: "[]"
+            )
+            for (i in arr.length() - 1 downTo 0) {
+                (arr.optJSONObject(i) ?: continue).let { out.add(it) }
+            }
+        } catch (_: Exception) { }
+        return out
     }
 
     /**
@@ -209,13 +372,34 @@ object ErrorCatcher {
             return
         }
         val friendly = friendlyMessage(t)
-        val detail = try {
-            "Asli wajah:\n${shortCause(t)}\n\n" +
-                maskSecrets(
-                    StringWriter().also {
-                        t.printStackTrace(PrintWriter(it))
-                    }.toString()
-                ).lines().take(25).joinToString("\n")
+        // v36 catcher order: do level — upar simple Hinglish, neeche
+        // expandable me POORA technical detail. Pehle chhota (error class +
+        // jahan hua + 25 lines), "Poora dekho" par poora untruncated trace.
+        val fullDetail = try {
+            technicalDetail(t)
+        } catch (_: Exception) {
+            "Error class: ${t.javaClass.name}\nMessage: ${shortCause(t)}"
+        }
+        val shortDetail = try {
+            buildString {
+                appendLine("Error class: ${t.javaClass.name}")
+                appendLine("Error code: ${errorCode(t)}")
+                appendLine("Jahan hua:")
+                val wh = whereHappened(t)
+                if (wh.isEmpty()) appendLine("  (stack khaali)")
+                else for (w in wh) appendLine("  $w")
+                appendLine()
+                appendLine("Asli wajah: ${shortCause(t)}")
+                appendLine()
+                appendLine("--- Stack (pehli 25 lines) ---")
+                append(
+                    maskSecrets(
+                        StringWriter().also {
+                            t.printStackTrace(PrintWriter(it))
+                        }.toString()
+                    ).lines().take(25).joinToString("\n")
+                )
+            }
         } catch (_: Exception) {
             "Asli wajah: ${t.javaClass.simpleName}"
         }
@@ -225,13 +409,30 @@ object ErrorCatcher {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad / 2, pad, pad / 2)
         }
+        // v36 catcher order: "Poora dekho" toggle — short detail se full
+        // untruncated technical detail par switch.
+        var showingFull = false
         val detailView = TextView(act).apply {
-            text = detail
+            text = shortDetail
             textSize = 11f
             typeface = Typeface.MONOSPACE
             visibility = android.view.View.GONE
             setPadding(pad / 2, pad / 2, pad / 2, pad / 2)
             setBackgroundColor(0xFFF5F5F5.toInt())
+        }
+        val fullToggle = TextView(act).apply {
+            text = "📜 Poora technical detail dekho"
+            textSize = 12f
+            setTextColor(0xFF1A73E8.toInt())
+            setPadding(pad / 2, pad / 4, pad / 2, pad / 4)
+            visibility = android.view.View.GONE
+            setOnClickListener {
+                try {
+                    showingFull = !showingFull
+                    detailView.text = if (showingFull) fullDetail else shortDetail
+                    text = if (showingFull) "📜 Chhota dekho" else "📜 Poora technical detail dekho"
+                } catch (_: Exception) { }
+            }
         }
         // Detail toggle — view ke andar (dialog ke 3-button limit se bahar).
         val toggle = TextView(act).apply {
@@ -244,11 +445,20 @@ object ErrorCatcher {
                     val showing = detailView.visibility == android.view.View.VISIBLE
                     detailView.visibility =
                         if (showing) android.view.View.GONE else android.view.View.VISIBLE
+                    fullToggle.visibility =
+                        if (showing) android.view.View.GONE else android.view.View.VISIBLE
+                    if (showing) {
+                        // Band karte waqt short par wapas (agla khulna saaf ho)
+                        showingFull = false
+                        detailView.text = shortDetail
+                        fullToggle.text = "📜 Poora technical detail dekho"
+                    }
                     text = if (showing) "🔍 Asli wajah dekho" else "🔍 Wajah chhupao"
                 } catch (_: Exception) { }
             }
         }
         root.addView(toggle)
+        root.addView(fullToggle)
         val scroll = ScrollView(act)
         scroll.addView(detailView)
         root.addView(scroll)

@@ -226,6 +226,28 @@ class AgentChatView(
         }
     }
 
+    // v36 — LIVE ACTIVITY INDICATOR (user order 2026-09-26): transient
+    // status line (thinking-indicator jaisa) — CHAT MESSAGE NAHI, history
+    // me save nahi hota, messageList me add nahi hota. Engine
+    // (AgentLoop) ke LiveActivity events se drive hota hai.
+    private lateinit var liveActivityText: TextView
+    private var liveActivityListenerRegistered = false
+    private var liveActivityVisible = false
+    private var liveBaseLabel = ""
+    private var liveDots = 0
+    private val liveDotsHandler = Handler(Looper.getMainLooper())
+    private val liveDotsRunnable = object : Runnable {
+        override fun run() {
+            if (!liveActivityVisible) return
+            liveDots = (liveDots + 1) % 4
+            liveActivityText.text = "✦ $liveBaseLabel" + ".".repeat(liveDots)
+            liveDotsHandler.postDelayed(this, 450)
+        }
+    }
+    private val liveActivityListener: (LiveActivity.Event) -> Unit = { e ->
+        post { onLiveActivityEvent(e) }
+    }
+
     companion object {
         /** MainActivity.onActivityResult se forward hota hai. */
         const val REQ_DOC_PICK = 1001
@@ -405,6 +427,22 @@ class AgentChatView(
         }
         scroll.addView(messageList)
         addView(scroll)
+
+        // v36 — LIVE ACTIVITY INDICATOR (user order 2026-09-26): chat ke
+        // neeche transient status line — thinking-indicator jaisa. CHAT
+        // MESSAGE NAHI: messageList me add nahi hota, history me save nahi
+        // hota. Kaam complete/rukne/fail par gayab ho jata hai.
+        liveActivityText = TextView(context).apply {
+            textSize = 13f
+            setTextColor(0xFF5B7C99.toInt())
+            setPadding(pad, dp(2), pad, dp(2))
+            gravity = Gravity.START
+            visibility = View.GONE
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            )
+        }
+        addView(liveActivityText)
 
         // v27 (RC2): 2-row input area.
         // ROOT CAUSE: plain Button ka platform default minWidth=88dp hota hai —
@@ -1124,9 +1162,9 @@ class AgentChatView(
                 declineBtn.isEnabled = false
                 toast("🚀 Kaam shuru kar raha hun…")
                 Thread({
-                    val runId = try {
+                    val (runId, code, err) = try {
                         AgentApi.startActionRun(context, offer.goal, offer.url)
-                    } catch (_: Exception) { null }
+                    } catch (_: Exception) { Triple(null, -1, "Kaam shuru nahi ho paya — dobara try karo") }
                     post {
                         try {
                             messageList.removeView(card)
@@ -1136,9 +1174,13 @@ class AgentChatView(
                         if (runId != null) {
                             addBubble(TrackOfferPolicy.startedText(), false)
                             VoiceOutput.speak(context, "Kaam shuru ho gaya.")
+                        } else if (code == 409) {
+                            // v36 (point 10): 1-active limit — EXACT rejection
+                            // + [Chal raha kaam dekho] / [Band karo] (user-dictated).
+                            addOneActiveRejectionCard()
                         } else {
-                            addBubble(TrackOfferPolicy.failedText(), false)
-                            toast(TrackOfferPolicy.failedText())
+                            addBubble(err ?: TrackOfferPolicy.failedText(), false)
+                            toast(err ?: TrackOfferPolicy.failedText())
                         }
                         scrollToBottom()
                     }
@@ -1161,6 +1203,97 @@ class AgentChatView(
             scrollToBottom()
         } catch (t: Throwable) {
             android.util.Log.e("FmTrackOffer", "card failed", t)
+        }
+    }
+
+    /**
+     * v36 (point 10): 1-active limit rejection card — chat me EXACT message
+     * + user-dictated actions. Labels/message paraphrase NAHI.
+     *
+     * "Pehla kaam poora karo ya band karo, phir naya shuru karo."
+     * [Chal raha kaam dekho] → active run ka live view kholo.
+     * [Band karo] → active run turant roko (slot free).
+     */
+    private fun addOneActiveRejectionCard() {
+        try {
+            val card = LinearLayout(context).apply {
+                orientation = VERTICAL
+                val d = GradientDrawable()
+                d.setColor(Color.parseColor("#FFF8E1"))
+                d.setStroke(dp(2), Color.parseColor("#F9A825"))
+                d.cornerRadius = dp(14).toFloat()
+                background = d
+                setPadding(dp(16), dp(14), dp(16), dp(14))
+            }
+            val lp = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(6), 0, dp(6)) }
+            card.addView(TextView(context).apply {
+                text = "⏳ Pehla kaam poora karo ya band karo, phir naya shuru karo."
+                textSize = 16f
+                setTypeface(null, Typeface.BOLD)
+                setTextColor(Color.parseColor("#202124"))
+                setPadding(0, 0, 0, dp(10))
+            })
+            val row = LinearLayout(context).apply {
+                orientation = HORIZONTAL
+            }
+            val dekhoBtn = Button(context).apply {
+                text = "Chal raha kaam dekho"
+                textSize = 14f
+                minimumWidth = 0
+                layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+                    .apply { rightMargin = dp(8) }
+                setOnClickListener {
+                    try {
+                        val i = android.content.Intent(
+                            context,
+                            com.formmitra.app.agent.OperatorView::class.java
+                        )
+                        com.formmitra.app.engine.FormRunService.activeTaskId
+                            ?.let { i.putExtra("run_id", it) }
+                        context.startActivity(i)
+                    } catch (_: Exception) {
+                        toast("⚠️ Live view nahi khul paya — dobara try karo")
+                    }
+                }
+            }
+            val bandKaroBtn = Button(context).apply {
+                text = "Band karo"
+                textSize = 14f
+                minimumWidth = 0
+                layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+                setOnClickListener {
+                    try {
+                        com.formmitra.app.engine.FormRunService
+                            .requestCancelActive(context)
+                        addBubble(
+                            "Chal raha kaam band kar diya ⏹️ — ab naya kaam shuru kar sakte ho.",
+                            false
+                        )
+                        try {
+                            messageList.removeView(card)
+                        } catch (_: Exception) { }
+                    } catch (_: Exception) {
+                        toast("⚠️ Band nahi ho paya — dobara try karo")
+                    }
+                    scrollToBottom()
+                }
+            }
+            row.addView(dekhoBtn)
+            row.addView(bandKaroBtn)
+            card.addView(row)
+            messageList.addView(card, lp)
+            scrollToBottom()
+            try {
+                VoiceOutput.speak(
+                    context,
+                    "Ek kaam pehle se chal raha hai. Pehla kaam poora karo ya band karo, phir naya shuru karo."
+                )
+            } catch (_: Exception) { }
+        } catch (t: Throwable) {
+            android.util.Log.e("FmOneActive", "rejection card failed", t)
+            addBubble("⏳ Pehla kaam poora karo ya band karo, phir naya shuru karo.", false)
         }
     }
 
@@ -2955,6 +3088,21 @@ class AgentChatView(
         Thread {
             try {
             var msg: String
+            // v36 (point 10): 1-active PRE-CHECK — chat me turant EXACT
+            // rejection card (service ke notification ka wait nahi; aur
+            // "shuru ho gaya" jhooth nahi). Owner exempt (unlimited).
+            // Service-side claim + server 409 backup me hain (race/multi-device).
+            val localActive =
+                com.formmitra.app.engine.FormRunService.activeTaskId
+            if (localActive != null &&
+                !com.formmitra.app.engine.FormRunService.isOwnerDevice(context)
+            ) {
+                post {
+                    addOneActiveRejectionCard()
+                    onDone()
+                }
+                return@Thread
+            }
             if (url.isEmpty()) {
                 msg = "Is form ka official link nahi mila — dobara pucho."
             } else {
@@ -3190,6 +3338,17 @@ class AgentChatView(
         // POINT 24 (revised): chat entry par Card PIN (ek baar) —
         // unlock persistent hai, dobara nahi maangega.
         try { ensureCardUnlockOnEntry() } catch (_: Exception) { }
+        // v36 — LIVE ACTIVITY INDICATOR: listener ek baar register karo;
+        // fresh last event ho to turant seed karo (chat khulne par bhi
+        // chal raha kaam dikhe).
+        try {
+            if (!liveActivityListenerRegistered) {
+                liveActivityListenerRegistered = true
+                LiveActivity.addListener(liveActivityListener)
+            }
+            val lastLive = LiveActivity.lastEvent()
+            if (lastLive != null) onLiveActivityEvent(lastLive)
+        } catch (_: Exception) { }
         if (polling) return
         polling = true
         pollHandler.post(pollRunnable)
@@ -3199,6 +3358,15 @@ class AgentChatView(
     fun onTabHidden() {
         polling = false
         pollHandler.removeCallbacks(pollRunnable)
+        // v36 — LIVE ACTIVITY INDICATOR: chat chhupa to listener hatao +
+        // indicator chhupao (transient hai — wapas aane par fresh seed hoga).
+        try {
+            if (liveActivityListenerRegistered) {
+                liveActivityListenerRegistered = false
+                LiveActivity.removeListener(liveActivityListener)
+            }
+            hideLiveActivity()
+        } catch (_: Exception) { }
     }
 
     // ============ POINT 24 (REVISED): PERSISTENT CARD UNLOCK ============
@@ -3376,6 +3544,9 @@ class AgentChatView(
     private fun handlePollResult(runs: JSONArray?) {
         if (runs == null || runs.length() == 0) {
             hideBanner()
+            // v36 — LIVE ACTIVITY INDICATOR: koi run nahi → indicator bhi
+            // gayab (fresh event na ho to).
+            try { pollLiveActivityFallback(false) } catch (_: Exception) { }
             return
         }
         val latest = runs.optJSONObject(0)
@@ -3389,6 +3560,21 @@ class AgentChatView(
         // latest run dekhta hai; tracked category run ka stage badle to
         // announce karo (repeat + mute bubble buttons se).
         announceRunStage(latest, status)
+        // v36 refine point 1: pre-flight plan USER-VISIBLE (chat me).
+        // Plan bana ho to ek baar dikhao — "ye link khulegi, ye ye steps
+        // honge" — galat lage to user shuru me hi pakad le (misunderstanding
+        // check ka practical roop).
+        try {
+            val runId = latest.optString("run_id").ifEmpty { latest.optString("id") }
+            val planTxt = com.formmitra.app.agent.PlanStore.takePlan(context, runId)
+            if (planTxt != null) {
+                addAssistantBubble(
+                    "📋 Plan taiyar hai:\n$planTxt\n\n" +
+                        "Galat lage to turant batao — main rok kar theek karunga. " +
+                        "Sahi lage to kuch mat karo, kaam shuru ho raha hai."
+                )
+            }
+        } catch (_: Exception) { }
         // A+C: stuck / blocker / needs_user — saaf rukho, batao, awaaz me sunao.
         // "failed" bhi blocker hai (pehle chup-chaap gayab ho jata tha).
         if (status == "needs_user" || status == "needs_attention" || status == "failed") {
@@ -3416,10 +3602,87 @@ class AgentChatView(
         } else {
             hideBanner()
         }
+        // v36 — LIVE ACTIVITY INDICATOR (spec point 5): server-poll fallback.
+        // Engine ka LiveActivity event miss hua ho aur server par run active
+        // dikhe to generic label — naya heavy infra nahi, existing 30s poll.
+        try {
+            val active = status == "running" || status == "queued" ||
+                status == "in_progress" || status == "needs_user" ||
+                status == "needs_attention"
+            pollLiveActivityFallback(active)
+        } catch (_: Exception) { }
     }
 
     private fun hideBanner() {
         if (::bannerBox.isInitialized) bannerBox.visibility = View.GONE
+    }
+
+    // ---------- v36: LIVE ACTIVITY INDICATOR (user order 2026-09-26) ----------
+    //
+    // "User ko chat me dikhe jab agent kaam karega — kya kar raha hai,
+    //  neeche show ho... Likha hua MESSAGE nahi, sirf jaise 'thinking' me
+    //  thinking show hota hai par message nahi aata — waise hi."
+    //
+    // Ye CHAT MESSAGE NAHI HAI — transient status line hai. messageList me
+    // add nahi hota, isliye history me kabhi save nahi hota. Kaam
+    // complete/rukne/fail hone par gayab (spec point 4).
+
+    /** LiveActivity event aaya — label dikhao ya (terminal par) chhupao. */
+    private fun onLiveActivityEvent(e: LiveActivity.Event) {
+        if (!::liveActivityText.isInitialized) return
+        if (LiveActivity.isTerminal(e)) {
+            hideLiveActivity()
+            return
+        }
+        // Stale event (90s se purana) ignore — process-restart ke baad ka
+        // purana label flash na ho.
+        if (System.currentTimeMillis() - e.at > LiveActivity.STALE_MS) return
+        val label = LiveActivity.labelFor(e.key) ?: run {
+            hideLiveActivity()
+            return
+        }
+        showLiveActivity(label)
+    }
+
+    /** Transient indicator dikhao — dots animate hote hain (thinking jaisa). */
+    private fun showLiveActivity(label: String) {
+        if (!::liveActivityText.isInitialized) return
+        liveBaseLabel = label
+        liveDots = 0
+        liveActivityText.text = "✦ $label"
+        if (!liveActivityVisible) {
+            liveActivityVisible = true
+            liveActivityText.visibility = View.VISIBLE
+            liveDotsHandler.post(liveDotsRunnable)
+        }
+    }
+
+    /** Indicator gayab — kaam khatam/ruka/fail ya gate band. */
+    private fun hideLiveActivity() {
+        liveActivityVisible = false
+        liveDotsHandler.removeCallbacks(liveDotsRunnable)
+        if (::liveActivityText.isInitialized) liveActivityText.visibility = View.GONE
+    }
+
+    /** Server poll fallback (spec point 5): engine event miss hua ho aur
+     *  server par run active dikhe to generic label — koi naya infra nahi. */
+    private fun pollLiveActivityFallback(activeRun: Boolean) {
+        if (!::liveActivityText.isInitialized) return
+        if (!activeRun) {
+            // Koi active run nahi aur fresh event bhi nahi → chhupao.
+            val last = LiveActivity.lastEvent()
+            val fresh = last != null &&
+                System.currentTimeMillis() - last.at <= LiveActivity.STALE_MS &&
+                !LiveActivity.isTerminal(last)
+            if (!fresh) hideLiveActivity()
+            return
+        }
+        val last = LiveActivity.lastEvent()
+        val fresh = last != null &&
+            System.currentTimeMillis() - last.at <= LiveActivity.STALE_MS
+        if (!fresh && !liveActivityVisible) {
+            showLiveActivity("Kaam kar raha hai")
+        }
     }
 
     // ---------- v24 #1: three-way coordination (agent + operator + AI) ----------

@@ -75,4 +75,93 @@ object LearnLogic {
     /** 24h TTL — purana verdict dobara istemal nahi. */
     fun isCacheFresh(savedAt: Long, now: Long, ttlMs: Long = 24 * 60 * 60 * 1000L): Boolean =
         savedAt > 0 && savedAt <= now && now - savedAt < ttlMs
+
+    // ================= v36: complete WORKFLOW patterns =================
+    // (User: "jo ek baar jaan gaya dobara AI se na puche.")
+    // Field-level patterns ke upar — poori site+task ka workflow.
+
+    /**
+     * Workflow pattern key: normalized goal + domain.
+     * Same site + same task = same key (goal ke extra shabdon se key nahi
+     * badalti — normalizeGoal chhote farq mita deta hai).
+     */
+    fun workPatternKey(goal: String, domain: String): String =
+        normalizeGoal(goal) + "@" + domain.trim().lowercase().take(120)
+
+    /**
+     * Goal normalize: lowercase, extra space/punctuation saaf, 120 chars.
+     * "Caste certificate apply karo" aur "caste certificate apply" ek jaise.
+     *
+     * v36 root-fix (selftest "pattern key normalized"): vinamra aagya-shabd
+     * ("karo", "please" jaise) key nahi badalte — ye "extra shabd" hain,
+     * task nahi. Iske bina "X karo" aur "X" alag pattern bante aur
+     * zero-AI replay kabhi hit nahi karta.
+     */
+    fun normalizeGoal(goal: String): String =
+        goal.trim().lowercase()
+            .replace(Regex("[^a-z0-9\\u0900-\\u097F ]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .split(" ")
+            .filter { it.isNotEmpty() && it !in GOAL_STOP_WORDS }
+            .joinToString(" ")
+            .take(120)
+
+    /** Aagya/vinamrata ke shabd — pattern key me mayne nahi rakhte. */
+    private val GOAL_STOP_WORDS = setOf(
+        "karo", "karein", "kijiye", "kije", "please", "kripya"
+    )
+
+    /**
+     * Pattern confidence: 0.0 (invalid) .. 1.0 (poora bharosa).
+     *  - fail >= 2 → 0.0 (invalid — WorkPatternStore ise delete karta hai)
+     *  - fail == 1 → 0.5 (ek mauka aur)
+     *  - success >= 3, fail == 0 → 1.0 (pakka pattern)
+     *  - success >= 1, fail == 0 → 0.8 (seekha hua, aur verify hoga)
+     */
+    fun patternConfidence(success: Int, fail: Int): Double = when {
+        fail >= 2 -> 0.0
+        fail == 1 -> 0.5
+        success >= 3 -> 1.0
+        success >= 1 -> 0.8
+        else -> 0.0
+    }
+
+    /**
+     * Kya ye pattern abhi replay karna chahiye (ZERO AI)?
+     *  - confidence >= 0.8
+     *  - fail == 0
+     *  - last verified 30 din ke andar (purana pattern stale ho sakta hai)
+     */
+    fun shouldReplay(
+        success: Int,
+        fail: Int,
+        updatedAt: Long,
+        now: Long,
+        maxAgeMs: Long = 30L * 24 * 60 * 60 * 1000
+    ): Boolean {
+        if (patternConfidence(success, fail) < 0.8) return false
+        if (fail != 0) return false
+        if (updatedAt <= 0 || updatedAt > now) return false
+        if (now - updatedAt > maxAgeMs) return false
+        return true
+    }
+
+    // ---- v36 refine point 2: per-step stuck escalation ----
+    /** Ek step fail ho to aage kya: 0=continue, 1=AI single-step help, 2=user gate. */
+    const val STEP_OK = 0
+    const val STEP_AI_HELP = 1
+    const val STEP_USER_GATE = 2
+
+    /**
+     * Same step N baar fail → escalation level.
+     * 2 fails → AI se single-step help; 3 fails → user ko saaf batao.
+     * Infinite retry loop KABHI nahi (loop ka maxSteps + STUCK_MAX backstop
+     * alag se hain).
+     */
+    fun stepEscalation(failCount: Int): Int = when {
+        failCount >= 3 -> STEP_USER_GATE
+        failCount >= 2 -> STEP_AI_HELP
+        else -> STEP_OK
+    }
 }

@@ -67,6 +67,21 @@ object PromptDialog {
     fun show(activity: Activity, req: UserPrompt.Request) {
         if (showingFor == req.runId) return
         showingFor = req.runId
+        // v36 — LIVE ACTIVITY INDICATOR (user order 2026-09-26): gate khulne
+        // par gate-specific transient label chat me (OTP/payment/choice/...).
+        // Ye message NAHI hai — history me save nahi hota.
+        try {
+            val gateKind = when (req.kind) {
+                "payment" -> "payment"
+                "choice", "option_choice" -> "choice"
+                "destructive_confirm" -> "destructive_confirm"
+                "document" -> "document"
+                "login" -> "login"
+                "device_auth" -> "device_auth"
+                else -> "input" // otp | input fields
+            }
+            LiveActivity.emitGate(req.runId, gateKind)
+        } catch (_: Exception) { }
         activity.runOnUiThread {
             try {
                 when (req.kind) {
@@ -102,6 +117,23 @@ object PromptDialog {
     }
 
     private fun showDocument(activity: Activity, req: UserPrompt.Request) {
+        // v36 gate audit completeness: document gate — kab aaya + kitni der
+        // ruka + kisne jawab diya (otp/choice/detail/login ki tarah).
+        var docGateId = ""
+        try {
+            docGateId = GateAudit.openGate(
+                activity, req.runId, "document", req.title.take(120)
+            )
+        } catch (_: Exception) { }
+        fun closeDocGate(decision: String) {
+            try {
+                if (docGateId.isNotEmpty()) {
+                    GateAudit.closeGate(
+                        activity, req.runId, docGateId, decision, GateAudit.BY_USER
+                    )
+                }
+            } catch (_: Exception) { }
+        }
         val layout = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 32, 48, 16)
@@ -127,6 +159,7 @@ object PromptDialog {
                 textSize = 14f
                 setOnClickListener {
                     // Sirf FILENAME jata hai — content kabhi nahi
+                    closeDocGate("answered")
                     answer(activity, req, mapOf("approved" to true, "doc" to name))
                     dlg?.dismiss()
                 }
@@ -148,6 +181,7 @@ object PromptDialog {
                                 val msg = if (docNote.isNotEmpty()) docNote
                                 else "Save ho gaya: $saved"
                                 toast(activity, msg)
+                                closeDocGate("answered")
                                 answer(activity, req, mapOf("approved" to true, "doc" to saved))
                                 try { dlg?.dismiss() } catch (_: Exception) { }
                             } else {
@@ -177,6 +211,7 @@ object PromptDialog {
             .setCancelable(false)
             .setNegativeButton("❌ Cancel") { _, _ ->
                 pendingDocPick = null
+                closeDocGate("cancelled")
                 UserPrompt.cancel(req.runId)
                 showingFor = ""
             }
@@ -192,6 +227,23 @@ object PromptDialog {
      * bharta hai (OTP pattern); server/AI/history me kabhi nahi jati.
      */
     private fun showLogin(activity: Activity, req: UserPrompt.Request) {
+        // v36 gate audit completeness: login gate — kab aaya + kitni der
+        // ruka + kisne jawab diya (otp/choice/detail ki tarah).
+        var loginGateId = ""
+        try {
+            loginGateId = GateAudit.openGate(
+                activity, req.runId, "login", req.title.take(120)
+            )
+        } catch (_: Exception) { }
+        fun closeLoginGate(decision: String) {
+            try {
+                if (loginGateId.isNotEmpty()) {
+                    GateAudit.closeGate(
+                        activity, req.runId, loginGateId, decision, GateAudit.BY_USER
+                    )
+                }
+            } catch (_: Exception) { }
+        }
         val layout = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 32, 48, 16)
@@ -244,6 +296,7 @@ object PromptDialog {
                 }
                 // Values yahin rehti hain — answer me loop ko milti hain,
                 // loop unhe sirf page me bharta hai (server/AI ko kabhi nahi).
+                closeLoginGate("answered")
                 answer(
                     activity, req,
                     mapOf(
@@ -258,6 +311,7 @@ object PromptDialog {
             dlg.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
                 userEt.setText("")
                 passEt.setText("")
+                closeLoginGate("cancelled")
                 UserPrompt.cancel(req.runId)
                 showingFor = ""
                 dlg.dismiss()
@@ -275,13 +329,34 @@ object PromptDialog {
      * TTS announcement dono raaston me.
      */
     private fun showDeviceAuth(activity: Activity, req: UserPrompt.Request) {
-        if (trySystemBiometric(activity, req)) return
-        showManualDeviceAuth(activity, req)
+        // v36 gate audit completeness: device_auth gate — kab aaya + kitni
+        // der ruka + kisne jawab diya. Dono raaston (system biometric /
+        // manual) me close hota hai.
+        var devAuthGateId = ""
+        try {
+            devAuthGateId = GateAudit.openGate(
+                activity, req.runId, "device_auth", req.title.take(120)
+            )
+        } catch (_: Exception) { }
+        fun closeDevAuthGate(decision: String) {
+            try {
+                if (devAuthGateId.isNotEmpty()) {
+                    GateAudit.closeGate(
+                        activity, req.runId, devAuthGateId, decision, GateAudit.BY_USER
+                    )
+                }
+            } catch (_: Exception) { }
+        }
+        if (trySystemBiometric(activity, req, ::closeDevAuthGate)) return
+        showManualDeviceAuth(activity, req, ::closeDevAuthGate)
     }
 
     /** Real system biometric prompt. @return true agar system prompt khul gaya. */
     @Suppress("DEPRECATION")
-    private fun trySystemBiometric(activity: Activity, req: UserPrompt.Request): Boolean {
+    private fun trySystemBiometric(
+        activity: Activity, req: UserPrompt.Request,
+        closeGate: (String) -> Unit
+    ): Boolean {
         if (android.os.Build.VERSION.SDK_INT < 29) return false
         return try {
             val mgr = activity.getSystemService(
@@ -322,11 +397,13 @@ object PromptDialog {
                     result: android.hardware.biometrics.BiometricPrompt.AuthenticationResult?
                 ) {
                     VoiceOutput.speak(activity, "Verify ho gaya — kaam aage badh raha hai.")
+                    closeGate("answered")
                     answer(activity, req, mapOf("approved" to true))
                 }
 
                 override fun onAuthenticationError(errorCode: Int, errString: CharSequence?) {
                     // User ne cancel kiya ya lockout — prompt khatam
+                    closeGate("cancelled")
                     UserPrompt.cancel(req.runId)
                     showingFor = ""
                     VoiceOutput.stop()
@@ -351,7 +428,10 @@ object PromptDialog {
     }
 
     /** Manual fallback — system biometric available na ho tab. */
-    private fun showManualDeviceAuth(activity: Activity, req: UserPrompt.Request) {
+    private fun showManualDeviceAuth(
+        activity: Activity, req: UserPrompt.Request,
+        closeGate: (String) -> Unit
+    ) {
         val layout = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 32, 48, 16)
@@ -375,6 +455,7 @@ object PromptDialog {
             text = "✅ Ho gaya"
             textSize = 16f
             setOnClickListener {
+                closeGate("answered")
                 answer(activity, req, mapOf("approved" to true))
                 dlg?.dismiss()
             }
@@ -382,6 +463,7 @@ object PromptDialog {
         val cancelBtn = Button(activity).apply {
             text = "❌ Cancel"
             setOnClickListener {
+                closeGate("cancelled")
                 UserPrompt.cancel(req.runId)
                 showingFor = ""
                 dlg?.dismiss()
@@ -503,6 +585,24 @@ object PromptDialog {
             .setNegativeButton("❌ Cancel", null)
             .create()
         dlg.setOnShowListener {
+            // v36 refine point 4: gate kab aaya — dialog show hote hi open.
+            var detailGateId = ""
+            try {
+                detailGateId = GateAudit.openGate(
+                    activity, req.runId,
+                    if (isOtpPrompt) "otp" else "detail",
+                    req.title.take(120)
+                )
+            } catch (_: Exception) { }
+            fun closeDetailGate(decision: String, by: String) {
+                try {
+                    if (detailGateId.isNotEmpty()) {
+                        GateAudit.closeGate(
+                            activity, req.runId, detailGateId, decision, by
+                        )
+                    }
+                } catch (_: Exception) { }
+            }
             dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 val map = mutableMapOf<String, Any?>("approved" to true)
                 edits.forEach { (k, et) -> map[k] = et.text.toString().trim() }
@@ -516,13 +616,22 @@ object PromptDialog {
                             if (otpAutoFilled) SmsOtpPolicy.autoReadNote()
                             else SmsOtpPolicy.manualNote()
                         )
+                        // v36 refine point 4: kisne jawab diya — agent (auto)
+                        // ya user (manual).
+                        closeDetailGate(
+                            "answered",
+                            if (otpAutoFilled) GateAudit.BY_AGENT else GateAudit.BY_USER
+                        )
                     } catch (_: Exception) { }
+                } else {
+                    closeDetailGate("answered", GateAudit.BY_USER)
                 }
                 answer(activity, req, map)
                 dlg.dismiss()
             }
             dlg.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
                 if (isOtpPrompt) SmsOtpConsent.stop()
+                closeDetailGate("declined", GateAudit.BY_USER)
                 UserPrompt.cancel(req.runId)
                 showingFor = ""
                 dlg.dismiss()
@@ -599,6 +708,23 @@ object PromptDialog {
             setPadding(0, 0, 0, 16)
         })
         var dlg: AlertDialog? = null
+        // v36 refine point 4: choice gate audit — kab aaya + kitni der ruka
+        // + kisne jawab diya (history me).
+        var choiceGateId = ""
+        try {
+            choiceGateId = GateAudit.openGate(
+                activity, req.runId, "choice", req.title.take(120)
+            )
+        } catch (_: Exception) { }
+        fun closeChoiceGate(decision: String) {
+            try {
+                if (choiceGateId.isNotEmpty()) {
+                    GateAudit.closeGate(
+                        activity, req.runId, choiceGateId, decision, GateAudit.BY_USER
+                    )
+                }
+            } catch (_: Exception) { }
+        }
         // Voice se choose: mic → bola hua text option se match
         val micRow = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -613,6 +739,7 @@ object PromptDialog {
                 text = opt
                 textSize = 15f
                 setOnClickListener {
+                    closeChoiceGate("answered")
                     answer(activity, req, mapOf("approved" to true, "choice" to opt))
                     dlg?.dismiss()
                 }
@@ -627,6 +754,7 @@ object PromptDialog {
                 }
                 if (hit != null) {
                     toast(activity, "Chuna: $hit")
+                    closeChoiceGate("answered")
                     answer(activity, req, mapOf("approved" to true, "choice" to hit))
                     dlg?.dismiss()
                 } else {
@@ -640,6 +768,7 @@ object PromptDialog {
             .setView(ScrollView(activity).apply { addView(layout) })
             .setCancelable(false)
             .setNegativeButton("❌ Cancel") { _, _ ->
+                closeChoiceGate("declined")
                 UserPrompt.cancel(req.runId)
                 showingFor = ""
             }

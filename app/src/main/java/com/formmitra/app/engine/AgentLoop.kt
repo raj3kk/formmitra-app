@@ -8,8 +8,10 @@ import com.formmitra.app.agent.DocumentAutoPick
 import com.formmitra.app.agent.FieldMapMemory
 import com.formmitra.app.agent.FlowAnnouncer
 import com.formmitra.app.agent.LearnLogic
+import com.formmitra.app.agent.LiveActivity
 import com.formmitra.app.agent.NotifCenter
 import com.formmitra.app.agent.SiteCredentialStore
+import com.formmitra.app.agent.WorkPatternStore
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.Callable
@@ -97,7 +99,13 @@ object AgentLoop {
          * POINT 21: har proof screenshot par callback (summary card me
          * "kitne proof" dikhane ke liye).
          */
-        onProof: () -> Unit = {}
+        onProof: () -> Unit = {},
+        /**
+         * v36 SMART COORDINATION: kaam shuru hone se pehle bana pre-flight
+         * plan ka Hinglish summary — UI ise user ko dikhaye (notification /
+         * chat). Plan banta hai to call hota hai, nahi to nahi.
+         */
+        onPlan: (String) -> Unit = {}
     ): FormEngine.RunResult {
         val stepsLog = JSONArray()
         val history = ArrayList<JSONObject>()
@@ -121,6 +129,26 @@ object AgentLoop {
         var actReason = AiUsage.R_NEW_STEP
         var stuckDiagnosed = false
         var lastDiagnosis: List<String> = emptyList()
+        // v36 SMART COORDINATION: escalation ladder state.
+        // pattern (zero AI) → agent_plan → ai_single_step → user_gate.
+        var ladderLevel = EscalationLadder.L_PATTERN
+        // v36: pre-flight plan (kaam shuru hone se pehle AI se ek baar me).
+        var preflightPlan: PreflightPlan.Plan? = null
+        var planContextSent = false
+        var planMissingDetails: List<String> = emptyList()
+        // v36: learned work-pattern replay (zero AI).
+        var patternSteps: JSONArray? = null
+        var patternKey = ""
+        // v36 refine point 3: pattern save ke waqt ka page-structure hash
+        // (replay se pehle compare — site badli to replay skip).
+        var patternEntryHash = ""
+        var startPageHash = ""
+        // v36 refine point 2: per-step fail count (same step 2-3 baar fail →
+        // AI single-step help → phir bhi fail → user gate; infinite loop kabhi nahi).
+        val stepFailCounts = LinkedHashMap<String, Int>()
+        // v36: is run ke verified steps — done par work-pattern save hoga
+        // (sirf source KEYs, personal values kabhi nahi).
+        val patternStepsCollected = JSONArray()
 
         // Local task: runId khaali ho to local-<timestamp> (standalone mode —
         // UI agent local task banate waqt khud bhi yehi format bhej sakta hai)
@@ -135,6 +163,10 @@ object AgentLoop {
         // v24-refine (AI-training + quota discipline): run-scoped AI-usage
         // hisaab reset.
         AiUsage.reset()
+        // v36 — LIVE ACTIVITY INDICATOR (user order 2026-09-26): chat me
+        // neeche transient status line — kaam shuru.
+        try { LiveActivity.emitState(effectiveRunId, LiveActivity.STATE_STARTED) }
+        catch (_: Exception) { }
         // (site-memory block neeche hai — local funs ke baad)
         // Server-side run record (best-effort — fail ho to bina reporting chalao)
         var agentRunId: String? = null
@@ -168,11 +200,43 @@ object AgentLoop {
         }
 
         fun finish(status: String, summary: String): FormEngine.RunResult {
+            // v36 — LIVE ACTIVITY INDICATOR: kaam khatam/ruka/fail →
+            // chat ka transient indicator GAYAB. needs_user = gate label.
+            try {
+                when (status) {
+                    "done" -> LiveActivity.emitState(effectiveRunId, LiveActivity.STATE_DONE)
+                    "needs_user" -> LiveActivity.emitGate(effectiveRunId, "needs_user")
+                    else -> LiveActivity.emitState(effectiveRunId, LiveActivity.STATE_FAILED)
+                }
+            } catch (_: Exception) { }
             // v24-refine (quota discipline): run ke end par AI-usage ka
             // saaf hisaab steps-log me — kitni AI calls (kyun-kyn) aur
             // kitni pattern-hits (kitni calls bachi).
             try { logStep(stepsTaken, "ai_usage", true, AiUsage.summary()) }
             catch (_: Exception) { }
+            // v36 user order (2026-09-26): token/model/cost ki jaankari user
+            // ko KAHIN nahi dikhegi — isliye tokenSummary() steps-log me NAHI
+            // jata. Asli hisaab server-side ledger me (admin panel, admin-only).
+            // v36: kaam POORA hua → verified workflow pattern seekho
+            // (agli baar zero-AI replay). Sirf source KEYs — personal
+            // values kabhi save nahi hote.
+            if (status == "done") {
+                try {
+                    if (patternKey.isNotEmpty() && patternStepsCollected.length() >= 2) {
+                        WorkPatternStore.save(
+                            ctx, patternKey, patternStepsCollected,
+                            preflightPlan?.promptVersion.orEmpty(),
+                            startPageHash,
+                            startUrl,
+                            preflightPlan?.expectedProofs ?: emptyList()
+                        )
+                        logStep(
+                            stepsTaken, "pattern_learned", true,
+                            "tareeka seekh liya — agli baar bina AI ke (${patternStepsCollected.length()} steps)"
+                        )
+                    }
+                } catch (_: Exception) { }
+            }
             // G2: needs_user / failed / needs_admin par resume state RAKHO —
             // WakeWorker ya user-jawab par usi step se continue hoga.
             // Sirf true terminal (done/cancelled/vetoed) par clear.
@@ -208,7 +272,202 @@ object AgentLoop {
             logStep(i, action, false, msg)
             // v24-refine: agla act() dobara-plan reason ke saath logged hoga.
             actReason = AiUsage.R_REPLAN_FAIL
+            // v36 LADDER: pehli stuck → agent_plan se ai_single_step
+            // (audit ke saath; user gate sirf STUCK_MAX par).
+            if (stuckCount == 1 && ladderLevel == EscalationLadder.L_AGENT) {
+                logStep(
+                    i, "ladder", true, EscalationLadder.auditEntry(
+                        ladderLevel, EscalationLadder.L_AI_STEP, action,
+                        "step atak/fail — AI se single-step help", false
+                    ).toString().take(300)
+                )
+                ladderLevel = EscalationLadder.L_AI_STEP
+            }
             return stuckCount >= AgentActions.STUCK_MAX
+        }
+
+        /**
+         * v36 LADDER ka aakhri level: user gate — audit ke saath
+         * needs_user finish. Iske upar kuch nahi (user hi final authority).
+         */
+        fun finishUserGate(i: Int, action: String, msg: String): FormEngine.RunResult {
+            logStep(
+                i, "ladder", true, EscalationLadder.auditEntry(
+                    ladderLevel, EscalationLadder.L_USER, action,
+                    "agent/AI se nahi hua — aapki madad chahiye", false
+                ).toString().take(300)
+            )
+            ladderLevel = EscalationLadder.L_USER
+            return finish("needs_user", msg)
+        }
+
+        /**
+         * v36: learned work-pattern ka EK failed step repair — SINGLE-STEP
+         * AI help (ladder: ai_single_step). Poora re-plan NAHI, sirf is
+         * step ke liye AI. @return true = repair hua, replay continue kare.
+         */
+        fun repairPatternStep(
+            stepIdx: Int,
+            failedType: String,
+            failedSelector: String,
+            pageUrl: String
+        ): Boolean {
+            val fromLevel = ladderLevel
+            ladderLevel = EscalationLadder.L_AI_STEP
+            logStep(
+                stepIdx + 1, "ladder", true, EscalationLadder.auditEntry(
+                    fromLevel, EscalationLadder.L_AI_STEP,
+                    "$failedType($failedSelector)",
+                    "pattern step fail — AI se sirf is step ki help", false
+                ).toString().take(300)
+            )
+            return try {
+                AiUsage.logAct(AiUsage.R_REPLAN_FAIL)
+                val snap = try { engine.domSnapshot() } catch (_: Exception) { JSONObject() }
+                val res = AgentApi.act(
+                    ctx, JSONObject()
+                        .put("goal", goal)
+                        .put("url", pageUrl)
+                        .put("page_title", snap.optString("title", ""))
+                        .put(
+                            "dom_snapshot", JSONObject()
+                                .put("fields", snap.optJSONArray("fields") ?: JSONArray())
+                                .put("buttons", snap.optJSONArray("buttons") ?: JSONArray())
+                                .put("page_text", snap.optString("page_text", "").take(2000))
+                        )
+                        .put("ladder_level", EscalationLadder.L_AI_STEP)
+                        .put(
+                            "repair_step", JSONObject()
+                                .put("index", stepIdx + 1)
+                                .put("type", failedType)
+                                .put("selector", failedSelector)
+                        )
+                        .put("stuck_count", 1)
+                        .put("run_id", effectiveRunId)
+                )
+                // v36: per-work model/token ledger — har AI call ka model +
+                // provider darj (server "usage" de to measured tokens bhi).
+                if (res.code == 200) {
+                    try {
+                        AiUsage.logModelCall(
+                            res.json?.optString("model", "") ?: "",
+                            res.json?.optString("provider", "") ?: ""
+                        )
+                        val usage = res.json?.optJSONObject("usage")
+                        if (usage != null) {
+                            AiUsage.logMeasuredTokens(
+                                usage.optLong("input_tokens", 0),
+                                usage.optLong("output_tokens", 0)
+                            )
+                        }
+                    } catch (_: Exception) { }
+                }
+                val stepJson = if (res.code == 200) res.json?.optJSONObject("step") else null
+                if (stepJson == null) return false
+                val stepMap = engine.jsonToMap(stepJson)
+                val action = (stepMap["action"] as? String)?.trim().orEmpty()
+                // v36 — LIVE ACTIVITY INDICATOR: har step se PEHLE chat me
+                // transient label (thinking-indicator jaisa — message NAHI).
+                try {
+                    if (action.isNotEmpty() && action != "done" && action != "needs_user") {
+                        LiveActivity.emitStep(agentRunId ?: effectiveRunId, action)
+                    }
+                } catch (_: Exception) { }
+                // needs_user/done yahan repair nahi — caller ladder neeche jayega
+                if (action.isEmpty() || action == "needs_user" || action == "done") return false
+                val specMap = agentStepToSpec(stepMap)
+                val detail = engine.runAgentStep(mapToJson(specMap))
+                logStep(stepIdx + 1, "ai_single_step", true, "repair ok: $action")
+                pushHistory(action, stepMap, "ok", "single-step repair: ${detail.toString().take(150)}")
+                stepsTaken++
+                true
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        /**
+         * v36: learned work-pattern replay — ZERO AI.
+         * Har stored step deterministic execute (veto + timeout runAgentStep
+         * ke andar). fill/select ka value aaj ke sources se (userProvided +
+         * DetailStore) — value_src sirf KEY hai, value kabhi store nahi hui.
+         * Ek step fail → repairPatternStep (single-step AI); repair bhi
+         * fail → false (caller normal AI loop par jayega).
+         */
+        fun replayWorkPattern(pageUrl: String): Boolean {
+            val steps = patternSteps ?: return false
+            // Aaj ke value sources (OTP/password kabhi nahi — filtered)
+            val valueSources = LinkedHashMap<String, String>()
+            try {
+                val uk = userProvided.keys()
+                while (uk.hasNext()) {
+                    val k = uk.next()
+                    valueSources[k] = userProvided.optString(k, "")
+                }
+                valueSources.putAll(DetailStore.loadAll(ctx))
+            } catch (_: Exception) { }
+            val total = steps.length()
+            var idx = 0
+            while (idx < total) {
+                val s = steps.optJSONObject(idx) ?: return false
+                val type = s.optString("type", "")
+                // v36 — LIVE ACTIVITY INDICATOR: replay step se pehle label.
+                try {
+                    if (type.isNotEmpty()) LiveActivity.emitStep(effectiveRunId, type)
+                } catch (_: Exception) { }
+                val sel = s.optJSONObject("selector") ?: JSONObject()
+                val selValue = sel.optString("value", "")
+                val spec = JSONObject()
+                    .put("type", type)
+                    .put(
+                        "selector", JSONObject()
+                            .put("mode", sel.optString("mode", "css").ifEmpty { "css" })
+                            .put("value", selValue)
+                    )
+                if (type == "fill" || type == "select") {
+                    val v = valueSources[s.optString("value_src", "")].orEmpty()
+                    if (v.isEmpty()) {
+                        logStep(idx + 1, "pattern_replay", false, "aaj ka value nahi mila (src)")
+                        if (!repairPatternStep(idx, type, selValue, pageUrl)) return false
+                        idx++
+                        continue
+                    }
+                    if (type == "fill") spec.put("text", v) else spec.put("option", v)
+                } else if (type == "goto") {
+                    spec.put("url", selValue)
+                }
+                var stepOk = true
+                try {
+                    val d = engine.runAgentStep(spec)
+                    if (type == "fill" && !d.optBoolean("verified", true)) {
+                        logStep(idx + 1, "pattern_replay", false, "fill verify fail")
+                        stepOk = false
+                    } else {
+                        logStep(idx + 1, "pattern_replay", true, d.toString().take(200))
+                        pushHistory(
+                            type,
+                            mapOf(
+                                "action" to type,
+                                "selector" to mapOf("mode" to sel.optString("mode"), "value" to selValue)
+                            ),
+                            "ok", "pattern replay (zero AI)"
+                        )
+                        stepsTaken++
+                    }
+                } catch (e: FormEngine.VetoException) {
+                    // Veto (payment/login-wall) → normal loop ka assisted flow sambhalega
+                    logStep(idx + 1, "pattern_replay", false, "veto: ${(e.message ?: "").take(120)}")
+                    return false
+                } catch (_: Exception) {
+                    logStep(idx + 1, "pattern_replay", false, "step fail")
+                    stepOk = false
+                }
+                if (!stepOk) {
+                    if (!repairPatternStep(idx, type, selValue, pageUrl)) return false
+                }
+                idx++
+            }
+            return true
         }
 
         // v24-refine (AI-training): site-memory — server ki seekhi hui
@@ -240,6 +499,117 @@ object AgentLoop {
                 }
             }
         } catch (_: Exception) { }
+
+        // v36 SMART COORDINATION — kaam shuru hone se PEHLE:
+        // (1) learned work-pattern? → zero-AI replay (navigation ke baad)
+        // (2) nahi → pre-flight plan (EK AI call, fixed prompt pack);
+        //     uske baad agent plan khud follow karega.
+        try {
+            patternKey = LearnLogic.workPatternKey(goal, SiteCredentialStore.domainOf(startUrl))
+        } catch (_: Exception) {
+            patternKey = ""
+        }
+        try {
+            val e = if (patternKey.isNotEmpty()) WorkPatternStore.find(ctx, patternKey) else null
+            if (e != null && LearnLogic.shouldReplay(
+                    e.optInt("success", 0), e.optInt("fail", 0),
+                    e.optLong("updated_at", 0), System.currentTimeMillis()
+                )
+            ) {
+                patternSteps = WorkPatternStore.stepsOf(e)
+                patternEntryHash = e.optString("page_hash", "")
+                AiUsage.logPatternHit(AiUsage.P_WORK_PATTERN)
+                ladderLevel = EscalationLadder.L_PATTERN
+                logStep(
+                    0, "ladder", true,
+                    "pattern: seekha hua tareeka mila — bina AI ke replay (${patternSteps?.length()} steps)"
+                )
+            }
+        } catch (_: Exception) { }
+        if (patternSteps == null) {
+            try {
+                val kdObj = JSONObject()
+                for ((k, v) in knownDetails) {
+                    if (k.isNotEmpty() && v.isNotEmpty()) kdObj.put(k, "yes")
+                }
+                val pfRes = AgentApi.preflight(
+                    ctx, JSONObject()
+                        .put("goal", goal)
+                        .put("known_details", kdObj)
+                        .put("run_id", effectiveRunId)
+                )
+                // v36 refine point 5: pre-flight AI call bhi budget me gini jati hai.
+                AiUsage.logPreflight()
+                // v36 — LIVE ACTIVITY INDICATOR: plan banne se pehle label.
+                try { LiveActivity.emitStep(effectiveRunId, "preflight_plan") }
+                catch (_: Exception) { }
+                try {
+                    AiUsage.logModelCall(
+                        pfRes.json?.optString("model", "") ?: "",
+                        pfRes.json?.optString("provider", "") ?: ""
+                    )
+                } catch (_: Exception) { }
+                val plan = PreflightPlan.parse(pfRes.json?.optJSONObject("plan"))
+                if (plan != null) {
+                    preflightPlan = plan
+                    val summ = PreflightPlan.hinglishSummary(plan)
+                    logStep(0, "preflight_plan", true, summ.take(300))
+                    try {
+                        onPlan(summ)
+                    } catch (_: Exception) { }
+                    planMissingDetails = plan.missingDetails.filter { it !in knownDetails }
+                } else if (forceStandalone && Standalone.isConfigured(ctx)) {
+                    // Standalone/offline task: server by design unreachable —
+                    // preflight ho hi nahi sakta; step-by-step standalone
+                    // brain se aage badho (ye fallback jaan-boojhkar hai).
+                    logStep(0, "preflight_plan", false, "standalone mode — server preflight skip, step-by-step")
+                } else {
+                    // v36 user order: preflight parse fail = ASLI failure +
+                    // Catcher me ASLI wajah (HTTP code + server jawab ka
+                    // khulasa — chup-chaap "purane step-by-step mode" nahi).
+                    try {
+                        val diag = StringBuilder("preflight parse fail")
+                            .append("; http=").append(pfRes.code)
+                        val rawPlan = pfRes.json?.opt("plan")
+                        diag.append("; plan field=").append(
+                            if (rawPlan == null) "missing"
+                            else rawPlan.javaClass.simpleName
+                        )
+                        val srvErr = pfRes.json?.optString("error", "")
+                        if (!srvErr.isNullOrEmpty()) {
+                            diag.append("; server error=").append(srvErr.take(300))
+                        }
+                        ErrorCatcher.report(
+                            ctx, "Pre-flight plan",
+                            RuntimeException(diag.toString()),
+                            goal, effectiveRunId
+                        )
+                    } catch (_: Exception) { }
+                    return finish(
+                        "failed",
+                        "Pre-flight plan nahi ban paya — kaam shuru nahi hua. Dobara try karo."
+                    )
+                }
+            } catch (t: Throwable) {
+                if (forceStandalone && Standalone.isConfigured(ctx)) {
+                    logStep(0, "preflight_plan", false, "standalone mode — preflight skip")
+                } else {
+                    // v36 user order: preflight call fail = ASLI failure +
+                    // Catcher me asli wajah (poori exception chain).
+                    // (server chahiye tha, mila nahi — chup fallback nahi).
+                    try {
+                        ErrorCatcher.report(
+                            ctx, "Pre-flight plan", t, goal, effectiveRunId
+                        )
+                    } catch (_: Exception) { }
+                    return finish(
+                        "failed",
+                        "Pre-flight call fail ho gayi — kaam shuru nahi hua. Dobara try karo."
+                    )
+                }
+            }
+            ladderLevel = EscalationLadder.L_AGENT
+        }
 
         // Pre-run: goal/start-URL me payment keyword = form-fee expected hai.
         // Yahan ROKO MAT — loop aage badhega; asli payment page aane par
@@ -308,6 +678,73 @@ object AgentLoop {
                 } catch (e: Exception) {
                     return finish("failed", "start URL nahi khula: ${e.message}")
                 }
+                // v36 refine point 3: start page ka structure hash — done par
+                // pattern ke saath save hoga (agli baar replay se pehle check).
+                if (startPageHash.isEmpty()) {
+                    try {
+                        val h = com.formmitra.app.agent.PageStructureHash.ofSnapshot(
+                            startUrl, engine.domSnapshot()
+                        )
+                        if (h.isNotEmpty()) startPageHash = h
+                    } catch (_: Exception) { }
+                }
+            }
+
+            // v36: learned work-pattern replay — ZERO AI. Sab steps safal →
+            // done (pattern aur pakka hota hai). Ek bhi fail → ladder neeche
+            // (agent_plan: normal AI loop khud sambhalega).
+            // v36 refine point 3: replay se PEHLE page-structure hash check —
+            // site badal gayi ho to 2-3 wasted replay attempts nahi, seedha
+            // AI plan par. Sirf pattern ho tabhi ek local domSnapshot (AI call nahi).
+            if (patternSteps != null && patternKey.isNotEmpty() && patternEntryHash.isNotEmpty()) {
+                val curHash = try {
+                    com.formmitra.app.agent.PageStructureHash.ofSnapshot(startUrl, engine.domSnapshot())
+                } catch (_: Exception) { "" }
+                if (curHash.isNotEmpty()) startPageHash = curHash
+                if (curHash.isNotEmpty() && curHash != patternEntryHash) {
+                    logStep(
+                        0, "ladder", true, EscalationLadder.auditEntry(
+                            EscalationLadder.L_PATTERN, EscalationLadder.L_AGENT,
+                            "", "page structure badal gayi (site update?) — purana tareeka skip, AI plan banayega",
+                            false
+                        ).toString().take(300)
+                    )
+                    ladderLevel = EscalationLadder.L_AGENT
+                    patternSteps = null
+                }
+            }
+            if (patternSteps != null && patternKey.isNotEmpty()) {
+                val replayOk = try {
+                    replayWorkPattern(startUrl)
+                } catch (_: Exception) {
+                    false
+                }
+                if (replayOk) {
+                    try {
+                        WorkPatternStore.recordSuccess(ctx, patternKey)
+                    } catch (_: Exception) { }
+                    try {
+                        onProgress(maxSteps)
+                    } catch (_: Exception) { }
+                    return finish(
+                        "done",
+                        "Pichli baar wala tareeka kaam kar gaya — bina AI ke poora ho gaya ✅ " +
+                            "(${(patternSteps?.length() ?: 0)} steps, 0 AI calls)"
+                    )
+                }
+                val stillValid = try {
+                    WorkPatternStore.recordFail(ctx, patternKey)
+                } catch (_: Exception) {
+                    false
+                }
+                logStep(
+                    0, "ladder", true, EscalationLadder.auditEntry(
+                        EscalationLadder.L_PATTERN, EscalationLadder.L_AGENT,
+                        "", "pattern replay fail — agent khud plan follow karega",
+                        !stillValid
+                    ).toString().take(300)
+                )
+                ladderLevel = EscalationLadder.L_AGENT
             }
 
             var currentUrl = startUrl
@@ -422,12 +859,28 @@ object AgentLoop {
                     }
                     // OTP/password yahan se filtered — AI/server ko kabhi nahi jate
                     .put("user_provided", filteredUserProvided(userProvided, sensitiveKeys))
+                    // v36: pre-flight plan context — SIRF pehle act() call me
+                    // (brain plan ke hisaab se chale; VALUES nahi bhejte
+                    // taaki AI invent na kare).
+                    .apply {
+                        val pf = preflightPlan
+                        if (!planContextSent && pf != null) {
+                            put("preflight_steps", PreflightPlan.stepsContextJson(pf))
+                            if (planMissingDetails.isNotEmpty()) {
+                                put("plan_missing", JSONArray(planMissingDetails))
+                            }
+                            planContextSent = true
+                        }
+                    }
                 // forceStandalone (offline task): server ko chhodo, seedha user ki
                 // Groq key se StandaloneBrain. Server unreachable fallback neeche
                 // (per-step) waise bhi hai; ye poore run ka standalone mode hai.
                 // v24-refine (quota discipline): har AI call ka reason logged —
                 // debugging me pata chale call KYUN hua (nayi/stuck/complex).
                 AiUsage.logAct(actReason)
+                // v36 user order (2026-09-26): TOKEN CAP HATAYA — token kharch
+                // par koi restriction/throttling/pause/block NAHI. Kaam kabhi
+                // budget ki wajah se nahi rukega.
                 var res: AgentApi.ApiResult = if (forceStandalone && Standalone.isConfigured(ctx)) {
                     try { onStandaloneMode() } catch (_: Exception) { }
                     logStep(i, "act", false, "standalone mode → StandaloneBrain (Groq direct)")
@@ -492,12 +945,28 @@ object AgentLoop {
                 if (res.code == 429) {
                     return finish("needs_user", "Aaj ka AI limit khatam ho gaya — kal phir try karein")
                 }
+                // v36: per-work model/token ledger — har AI call ka model +
+                // provider darj (server "usage" de to measured tokens bhi).
+                if (res.code == 200) {
+                    try {
+                        AiUsage.logModelCall(
+                            res.json?.optString("model", "") ?: "",
+                            res.json?.optString("provider", "") ?: ""
+                        )
+                        val usage = res.json?.optJSONObject("usage")
+                        if (usage != null) {
+                            AiUsage.logMeasuredTokens(
+                                usage.optLong("input_tokens", 0),
+                                usage.optLong("output_tokens", 0)
+                            )
+                        }
+                    } catch (_: Exception) { }
+                }
                 val stepJson = if (res.code == 200) res.json?.optJSONObject("step") else null
                 if (stepJson == null) {
                     pushHistory("act", emptyMap(), "error", "server code=${res.code}")
                     if (noteError(i, "act", "server se step nahi mila (code=${res.code})")) {
-                        return finish(
-                            "needs_user",
+                        return finishUserGate(i, "act",
                             "Jawab nahi mil raha — atak gaya hoon, aap dekh lein"
                         )
                     }
@@ -505,6 +974,13 @@ object AgentLoop {
                 }
                 val stepMap = engine.jsonToMap(stepJson)
                 val action = (stepMap["action"] as? String)?.trim() ?: ""
+                // v36 — LIVE ACTIVITY INDICATOR: har step se PEHLE chat me
+                // transient label (thinking-indicator jaisa — message NAHI).
+                try {
+                    if (action.isNotEmpty() && action != "done" && action != "needs_user") {
+                        LiveActivity.emitStep(agentRunId ?: effectiveRunId, action)
+                    }
+                } catch (_: Exception) { }
                 // CONTRACT SYNC (2026-09-26): act response ka top-level
                 // work_summary (running summary) — done step me fallback.
 
@@ -683,8 +1159,7 @@ object AgentLoop {
                 if (vErr != null) {
                     pushHistory(action, stepMap, "error", "invalid: $vErr")
                     if (noteError(i, action, "invalid step: $vErr")) {
-                        return finish(
-                            "needs_user",
+                        return finishUserGate(i, action,
                             "Galat step aa raha hai baar-baar — phas gaya hoon, aap dekh lein"
                         )
                     }
@@ -878,15 +1353,53 @@ object AgentLoop {
                                 "wahi selector blind mat dohrao"
                         )
                         if (noteError(i, action, msg)) {
-                            return finish(
-                                "needs_user",
-                                "Fill verify baar-baar fail ho raha hai — phas gaya hoon, aap dekh lein"
-                            )
+                        return finishUserGate(i, action,
+                            "Fill verify baar-baar fail ho raha hai — phas gaya hoon, aap dekh lein"
+                        )
                         }
                         continue
                     }
                     consecErrors = 0
                     stepsTaken++
+                    // v36: verified step → work-pattern ke liye collect.
+                    // Sirf source KEY (card/user/detail ka naam) — personal
+                    // VALUE kabhi nahi. goto ka URL selector me (mode=url).
+                    try {
+                        val stype = (specMap["type"] as? String).orEmpty()
+                        val sel = specMap["selector"] as? Map<String, Any?>
+                        var smode = ((sel?.get("mode") as? String)?.ifEmpty { "css" }) ?: "css"
+                        var sval = (sel?.get("value") as? String).orEmpty()
+                        if (stype == "goto") {
+                            smode = "url"
+                            sval = (specMap["url"] as? String).orEmpty()
+                        }
+                        var vsrc = ""
+                        if (stype == "fill") {
+                            val filledVal = (specMap["text"] as? String).orEmpty()
+                            val sources = LinkedHashMap<String, String>()
+                            val uk2 = userProvided.keys()
+                            while (uk2.hasNext()) {
+                                val k = uk2.next()
+                                sources[k] = userProvided.optString(k, "")
+                            }
+                            try {
+                                sources.putAll(DetailStore.loadAll(ctx))
+                            } catch (_: Exception) { }
+                            vsrc = LearnLogic.attributeSource(filledVal, sources) ?: ""
+                        }
+                        if (stype.isNotEmpty() && sval.isNotEmpty()) {
+                            patternStepsCollected.put(
+                                JSONObject()
+                                    .put("type", stype)
+                                    .put(
+                                        "selector", JSONObject()
+                                            .put("mode", smode)
+                                            .put("value", sval)
+                                    )
+                                    .put("value_src", vsrc)
+                            )
+                        }
+                    } catch (_: Exception) { }
                     // v24-refine: safal step → agla act() nayi situation;
                     // stuck-episode khatm (naya diagnosis episode shuru hoga).
                     actReason = AiUsage.R_NEW_STEP
@@ -934,6 +1447,9 @@ object AgentLoop {
                     try {
                         AgentResume.updateProgress(ctx, stepsTaken, dStr)
                     } catch (_: Exception) { }
+                    // v36 refine point 2: step safal → per-step fail count reset
+                    // (lagatar fail hi stuck hai).
+                    stepFailCounts.clear()
                 } catch (e: FormEngine.VetoException) {
                     logStep(i, action, false, "VETO: ${e.message}")
                     // Payment page beech me aaya → user se approval lo (assisted
@@ -962,6 +1478,34 @@ object AgentLoop {
                 } catch (e: Exception) {
                     val msg = (e.message ?: "error").take(200)
                     pushHistory(action, stepMap, "error", msg)
+                    // v36 refine point 2: per-STEP stuck detection — EK step
+                    // 2-3 baar fail → AI single-step help → phir bhi fail →
+                    // user ko saaf batao. Infinite retry loop KABHI nahi
+                    // (maxSteps + STUCK_MAX backstop alag se hain).
+                    val stepSig = try {
+                        val sel = stepMap["selector"] as? Map<*, *>
+                        "$action|${(sel?.get("value") as? String).orEmpty()}"
+                    } catch (_: Exception) { "$action|" }
+                    val stepFails = (stepFailCounts[stepSig] ?: 0) + 1
+                    stepFailCounts[stepSig] = stepFails
+                    when (com.formmitra.app.agent.LearnLogic.stepEscalation(stepFails)) {
+                        com.formmitra.app.agent.LearnLogic.STEP_USER_GATE -> {
+                            return finishUserGate(
+                                i, action,
+                                "Ye step 3 baar fail ho gaya — aage badhne ke liye aapki madad chahiye"
+                            )
+                        }
+                        com.formmitra.app.agent.LearnLogic.STEP_AI_HELP -> {
+                            logStep(
+                                i, "ladder", true, EscalationLadder.auditEntry(
+                                    ladderLevel, EscalationLadder.L_AI_STEP, action,
+                                    "same step 2 baar fail — AI se single-step help", false
+                                ).toString().take(300)
+                            )
+                            ladderLevel = EscalationLadder.L_AI_STEP
+                            actReason = AiUsage.R_STUCK_RETRY
+                        }
+                    }
                     // Upload me file missing → user se document maango (ek baar),
                     // same run continue. Dobara fail → neeche noteError path.
                     if (action == "upload" && !docPrompted &&
@@ -978,8 +1522,7 @@ object AgentLoop {
                         }
                     }
                     if (noteError(i, action, msg)) {
-                        return finish(
-                            "needs_user",
+                        return finishUserGate(i, action,
                             "Baar-baar error aa raha hai — phas gaya hoon, aap dekh lein"
                         )
                     }
@@ -1696,10 +2239,27 @@ object AgentLoop {
             title = "Pakka karna hai?",
             message = what
         )
+        // v36 refine point 4: gate kab aaya + kitni der ruka + kisne jawab diya.
+        val dgId = try {
+            com.formmitra.app.agent.GateAudit.openGate(
+                ctx, runId, "destructive_confirm", what.take(120)
+            )
+        } catch (_: Exception) { "" }
+        // v36 — LIVE ACTIVITY INDICATOR: gate-specific label chat me.
+        try { LiveActivity.emitGate(runId, "destructive_confirm") } catch (_: Exception) { }
         val ansStr = try { UserPrompt.ask(req) } catch (_: Exception) { null }
             ?: return false
         val ans = try { JSONObject(ansStr) } catch (_: Exception) { return false }
         val ok = ans.optBoolean("approved", false)
+        try {
+            if (dgId.isNotEmpty()) {
+                com.formmitra.app.agent.GateAudit.closeGate(
+                    ctx, runId, dgId,
+                    if (ok) "approved" else "declined",
+                    com.formmitra.app.agent.GateAudit.BY_USER, what.take(120)
+                )
+            }
+        } catch (_: Exception) { }
         history.add(
             JSONObject().put("action", "destructive_confirm")
                 .put("result", if (ok) "approved" else "declined")
@@ -2336,8 +2896,20 @@ object AgentLoop {
                     .put("upi_id", pay?.upiId ?: "")
             )
         } catch (_: Exception) { }
+        // v36 refine point 4: gate KAB aaya — openGate UserPrompt.ask se
+        // PEHLE (wait tab se gina jata hai jab user ko gate dikhta hai).
+        val payGateId = try {
+            com.formmitra.app.agent.GateAudit.openGate(
+                ctx, runId, "payment",
+                "amount=${pay?.amount ?: ""} merchant=${pay?.merchant ?: ""}"
+            )
+        } catch (_: Exception) { "" }
+        // v36 — LIVE ACTIVITY INDICATOR: gate-specific label chat me.
+        try { LiveActivity.emitGate(runId, "payment") } catch (_: Exception) { }
         val ansStr = UserPrompt.ask(req)
         // POINT 15 + QUALITY BAR 6: har payment decision audit trail me.
+        // v36 refine point 4: KITNI DER ruka + KISNE jawab diya — closeGate
+        // (wait_ms + answered_by history me).
         fun auditPayment(status: String, extra: String = "") {
             try {
                 com.formmitra.app.agent.GateAudit.log(
@@ -2350,6 +2922,16 @@ object AgentLoop {
                 )
             } catch (_: Exception) { }
         }
+        fun closePayGate(decision: String, by: String) {
+            try {
+                if (payGateId.isNotEmpty()) {
+                    com.formmitra.app.agent.GateAudit.closeGate(
+                        ctx, runId, payGateId, decision, by,
+                        "amount=${pay?.amount ?: ""}"
+                    )
+                }
+            } catch (_: Exception) { }
+        }
         if (ansStr == null) {
             try {
                 AgentApi.patchPayment(
@@ -2358,6 +2940,7 @@ object AgentLoop {
                 )
             } catch (_: Exception) { }
             auditPayment("failed", "reason=timeout")
+            closePayGate("expired", com.formmitra.app.agent.GateAudit.BY_AUTO)
             return "timeout"
         }
         val ans = try { JSONObject(ansStr) } catch (_: Exception) { JSONObject() }
@@ -2369,6 +2952,7 @@ object AgentLoop {
                 )
             } catch (_: Exception) { }
             auditPayment("failed", "reason=declined")
+            closePayGate("declined", com.formmitra.app.agent.GateAudit.BY_USER)
             return "declined"
         }
         if (!ans.optBoolean("payment_done", false)) {
@@ -2380,6 +2964,7 @@ object AgentLoop {
                 )
             } catch (_: Exception) { }
             auditPayment("failed", "reason=${ans.optString("reason", "unknown")}")
+            closePayGate("declined", com.formmitra.app.agent.GateAudit.BY_USER)
             return "timeout"
         }
         val method = ans.optString("method", "")
@@ -2406,6 +2991,7 @@ object AgentLoop {
                     )
                 } catch (_: Exception) { }
                 auditPayment("verified", "site-success-text mila")
+                closePayGate("approved", com.formmitra.app.agent.GateAudit.BY_USER)
                 return "verified"
             }
             try { Thread.sleep(3000) } catch (_: Exception) { }
@@ -2417,6 +3003,7 @@ object AgentLoop {
             )
         } catch (_: Exception) { }
         auditPayment("failed", "reason=unverified")
+        closePayGate("approved_unverified", com.formmitra.app.agent.GateAudit.BY_USER)
         return "unverified"
     }
 

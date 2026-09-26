@@ -48,6 +48,13 @@ class FormRunService : Service() {
         private const val DONE_NOTIF_ID = 4102
 
         /**
+         * v36 (point 10): 1-active-session — [Band karo] action ka intent.
+         * Active run ko turant rokta hai (slot free → naya kaam shuru ho
+         * sakta hai). Sirf user ke apne active run par lagta hai.
+         */
+        const val ACTION_CANCEL_ACTIVE = "com.formmitra.app.engine.CANCEL_ACTIVE"
+
+        /**
          * Duplicate-run guard (G2/J1): koi run chal raha ho to WakeWorker /
          * FormTaskWorker naya handoff na kare. Service start par set,
          * runTask khatam par clear (finally me).
@@ -71,9 +78,42 @@ class FormRunService : Service() {
             if (activeTaskId == taskId) activeTaskId = null
         }
 
+        // ---------- v36 (point 10): owner unlimited ----------
+        //
+        // Normal user = kul 1 active kaam (server + local claim dono enforce
+        // karte hain). Owner/admin unlimited — doosra kaam REJECT nahi hota,
+        // local line me lagta hai (pehla khatam hote hi pumpQueue apne aap
+        // shuru karta hai). Flag persistent hai taaki background service bhi
+        // jaan sake (MainActivity session-only rakhta hai).
+        private const val OWNER_PREFS = "formmitra_owner"
+        private const val OWNER_KEY = "is_owner"
+
+        fun setOwnerDevice(ctx: Context, b: Boolean) {
+            try {
+                ctx.getSharedPreferences(OWNER_PREFS, Context.MODE_PRIVATE)
+                    .edit().putBoolean(OWNER_KEY, b).apply()
+            } catch (_: Exception) { }
+        }
+
+        fun isOwnerDevice(ctx: Context): Boolean = try {
+            ctx.getSharedPreferences(OWNER_PREFS, Context.MODE_PRIVATE)
+                .getBoolean(OWNER_KEY, false)
+        } catch (_: Exception) { false }
+
         fun startWithTask(ctx: Context, task: JSONObject) {
             val intent = Intent(ctx, FormRunService::class.java).apply {
                 putExtra(EXTRA_TASK_JSON, task.toString())
+            }
+            ctx.startForegroundService(intent)
+        }
+
+        /**
+         * v36 (point 10): [Band karo] — active run band karne ki request.
+         * Notification action se aata hai.
+         */
+        fun requestCancelActive(ctx: Context) {
+            val intent = Intent(ctx, FormRunService::class.java).apply {
+                action = ACTION_CANCEL_ACTIVE
             }
             ctx.startForegroundService(intent)
         }
@@ -132,8 +172,14 @@ class FormRunService : Service() {
         fun enqueueTask(ctx: Context, task: JSONObject): Int {
             val runId = task.optString("run_id").ifEmpty { task.optString("id") }
             val name = task.optString("name", "form")
+            // v36 refine point 8: line me same runId pehle se ho to dobara
+            // mat lagao (duplicate agent run guard — queue level).
+            val existing = queueSnapshot(ctx)
+            if (runId.isNotEmpty() && existing.any { it.runId == runId }) {
+                return WorkQueue.positionOf(existing, runId)
+            }
             val entry = WorkQueue.Entry(runId, name, task.toString(), System.currentTimeMillis())
-            val q = WorkQueue.enqueue(queueSnapshot(ctx), entry)
+            val q = WorkQueue.enqueue(existing, entry)
             persistQueue(ctx, q)
             return WorkQueue.positionOf(q, runId)
         }
@@ -213,6 +259,111 @@ class FormRunService : Service() {
         try { runThread?.interrupt() } catch (_: Exception) { }
     }
 
+    /**
+     * v36 (point 10): [Band karo] — active run turant roko.
+     * Run thread interrupt (stuck-watchdog wala pattern) → finally me
+     * claim release + queue pump. Server run vetoed (best-effort) taaki
+     * server-side slot bhi free ho.
+     */
+    private fun cancelActiveRun() {
+        val taskId = activeTaskId
+        try { runThread?.interrupt() } catch (_: Exception) { }
+        try {
+            Thread({
+                try {
+                    val ar = com.formmitra.app.agent.AgentApi.activeRun(this)
+                    if (ar != null) {
+                        com.formmitra.app.engine.RunReporter.updateRun(
+                            this,
+                            ar.optString("id", ""),
+                            "vetoed",
+                            0,
+                            "",
+                            "User ne band kiya"
+                        )
+                    }
+                } catch (_: Exception) { }
+            }, "fm-cancel-active").apply { isDaemon = true }.start()
+        } catch (_: Exception) { }
+        try {
+            android.util.Log.i("FormRunService", "active run cancelled by user: $taskId")
+        } catch (_: Exception) { }
+        notifySimple(
+            NOTIF_ID + 51,
+            "Kaam band kiya ⏹️",
+            "Ab naya kaam shuru kar sakte ho."
+        )
+    }
+
+    /**
+     * v36 (point 10): user ka FRESH start hai ya system resume/retry?
+     * Resume (resumed=true ya start_step>0) kabhi block nahi hota —
+     * wahi kaam aage badh raha hai.
+     */
+    private fun isUserFreshStart(task: JSONObject): Boolean {
+        if (task.optBoolean("resumed", false)) return false
+        val s0 = task.optJSONArray("steps")?.optJSONObject(0)
+        if ((s0?.optInt("start_step", 0) ?: 0) > 0) return false
+        return true
+    }
+
+    /**
+     * v36 (point 10): doosra kaam shuru karne par — line me NAHI,
+     * EXACT mana: "Pehla kaam poora karo ya band karo, phir naya shuru karo."
+     * + [Chal raha kaam dekho] (app kholo) / [Band karo] (active run band,
+     * slot free). Labels user-dictated — paraphrase NAHI.
+     */
+    private fun notifyOneActiveLimit(name: String) {
+        try {
+            ensureChannel()
+            val nm =
+                getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val dekh = PendingIntent.getActivity(
+                this, 9101,
+                Intent(this, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                },
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val bandKaro = PendingIntent.getService(
+                this, 9102,
+                Intent(this, FormRunService::class.java).apply {
+                    action = ACTION_CANCEL_ACTIVE
+                },
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val n = if (android.os.Build.VERSION.SDK_INT >= 26) {
+                android.app.Notification.Builder(this, CHANNEL_ID)
+            } else {
+                @Suppress("DEPRECATION")
+                android.app.Notification.Builder(this)
+            }
+                .setContentTitle("Ek kaam pehle se chal raha hai ⏳")
+                .setContentText("Pehla kaam poora karo ya band karo, phir naya shuru karo.")
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentIntent(dekh)
+                .setAutoCancel(true)
+            if (android.os.Build.VERSION.SDK_INT >= 23) {
+                n.addAction(
+                    android.app.Notification.Action.Builder(
+                        null, "Chal raha kaam dekho", dekh
+                    ).build()
+                )
+                n.addAction(
+                    android.app.Notification.Action.Builder(
+                        null, "Band karo", bandKaro
+                    ).build()
+                )
+            }
+            nm.notify(NOTIF_ID + 50, n.build())
+        } catch (_: Exception) { }
+        try {
+            com.formmitra.app.agent.FlowAnnouncer.say(
+                this, "Pehla kaam poora karo ya band karo, phir naya shuru karo."
+            )
+        } catch (_: Exception) { }
+    }
+
     /** Kya ye run user ka wait kar raha hai? (prompt / detail batch) */
     private fun waitingUser(runId: String): Boolean {
         try {
@@ -233,6 +384,13 @@ class FormRunService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // v36 (point 10): [Band karo] action — active run turant band karo,
+        // slot free (phir naya kaam shuru ho sakta hai).
+        if (intent?.action == ACTION_CANCEL_ACTIVE) {
+            cancelActiveRun()
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         val taskJson = intent?.getStringExtra(EXTRA_TASK_JSON)
         if (taskJson.isNullOrEmpty()) {
             stopSelf(startId)
@@ -277,8 +435,43 @@ class FormRunService : Service() {
         // POINT 28: doosra kaam pehle ko MAARTA nahi — line me lagta hai.
         // Pehla khatam hote hi agla apne aap shuru hoga. Har kaam ki
         // alag history entry barkarar (run_id alag-alag).
+        // v36 (point 10): user ka FRESH start ab line me NAHI lagta —
+        // user order: "Pehla kaam poora karo ya band karo, phir naya shuru
+        // karo." Resume/retry (system) purane jaisa line me lagta rahega.
         val claimId = task.optString("run_id").ifEmpty { task.optString("id") }
         if (!tryClaim(claimId)) {
+            if (isUserFreshStart(task)) {
+                // v36 (point 10): owner/admin UNLIMITED — reject NAHI.
+                // Doosra kaam local line me lagao; pehla khatam hote hi
+                // pumpQueue apne aap shuru karega.
+                if (isOwnerDevice(this)) {
+                    val pos = try {
+                        enqueueTask(this, task)
+                    } catch (_: Exception) { queueSize(this) + 1 }
+                    try {
+                        android.util.Log.i(
+                            "FormRunService",
+                            "owner unlimited: fresh start queued at #$pos (active=$activeTaskId)"
+                        )
+                        notifySimple(
+                            NOTIF_ID + 20,
+                            "Line me lagaya 📋 $name",
+                            "Ek kaam chal raha hai — khatam hote hi apne aap shuru hoga."
+                        )
+                    } catch (_: Exception) { }
+                    stopSelf(startId)
+                    return START_NOT_STICKY
+                }
+                try {
+                    android.util.Log.i(
+                        "FormRunService",
+                        "1-active limit: fresh start rejected (active=$activeTaskId)"
+                    )
+                } catch (_: Exception) { }
+                notifyOneActiveLimit(name)
+                stopSelf(startId)
+                return START_NOT_STICKY
+            }
             val pos = try {
                 enqueueTask(this, task)
             } catch (_: Exception) { queueSize(this) + 1 }
@@ -353,6 +546,24 @@ class FormRunService : Service() {
         val runId = task.optString("run_id", "")
         val stepsJson = task.optJSONArray("steps") ?: JSONArray()
         val total = stepsJson.length()
+        // v36 refine point 8: IDEMPOTENCY — ek hi kaam ke liye duplicate
+        // agent runs nahi. Same runId ya same goal+url (10 min window) dobara
+        // aaye to skip (double-tap / FCM+poll double trigger / crash-retry).
+        val firstStepIdem = stepsJson.optJSONObject(0)
+        val idemGoal = firstStepIdem?.optString("goal", name).orEmpty().ifEmpty { name }
+        val idemUrl = firstStepIdem?.optString("url", task.optString("target_url", "")).orEmpty()
+        // Resume (WakeWorker parked-OTP/detail/gate resume) kabhi duplicate
+        // nahi — wahi kaam aage badh raha hai, isliye guard skip.
+        val isResumeTask = task.optBoolean("resumed", false) ||
+            (firstStepIdem?.optInt("start_step", 0) ?: 0) > 0
+        val idemAcquired = if (isResumeTask) true
+        else IdempotencyGuard.tryAcquire(this, runId, idemGoal, idemUrl)
+        if (!idemAcquired) {
+            try {
+                android.util.Log.w("FormRunService", "duplicate run skipped: $runId / $idemGoal")
+            } catch (_: Exception) { }
+            return
+        }
         var lastReported = 0
         // POINT 17/21: is run ki category (handoff + summary ke liye).
         val firstStepForCat = stepsJson.optJSONObject(0)
@@ -478,7 +689,22 @@ class FormRunService : Service() {
                     knownDetails = knownDetails,
                     askedAlready = askedAlready,
                     // POINT 21: proof screenshots gino (summary card).
-                    onProof = { proofShots++ }
+                    onProof = { proofShots++ },
+                    // v36 SMART COORDINATION: pre-flight plan bana → user ko
+                    // batao (ongoing notification me plan summary).
+                    // v36 refine point 1: plan CHAT me bhi dikhe — PlanStore
+                    // me save, AgentChatView ka poll ek baar bubble dikhayega
+                    // ("Galat lage to turant batao" — misunderstanding check).
+                    onPlan = { planTxt ->
+                        try {
+                            updateOngoing("Plan taiyar 📋 $name", planTxt.take(140))
+                        } catch (_: Exception) { }
+                        try {
+                            com.formmitra.app.agent.PlanStore.save(
+                                this@FormRunService, runId, planTxt
+                            )
+                        } catch (_: Exception) { }
+                    }
                 )
             } else {
                 engine.runTask(task) { step1Based, _ ->
@@ -497,6 +723,13 @@ class FormRunService : Service() {
                 }
             }
         } catch (t: Throwable) {
+            // v36: background failure → CENTRAL ErrorCatcher (asli wajah ke
+            // saath). Sirf friendly text nahi — masked technical report bhi
+            // persist hota hai taaki app khulne par dekha ja sake (v35 ka
+            // catcher background me chhoota hua tha).
+            try {
+                ErrorCatcher.report(this, "Kaam chalate waqt", t, name, runId)
+            } catch (_: Exception) { }
             FormEngine.RunResult("failed", "engine crash: ${t.message}", JSONArray())
         }
 
@@ -548,6 +781,9 @@ class FormRunService : Service() {
                             else "Kuch nahi — kaam poora ho gaya.",
                             proofCount = proofShots,
                             at = System.currentTimeMillis()
+                            // v36 user order (2026-09-26): token/model/cost ki
+                            // jaankari user ko KAHIN nahi dikhegi — aiUsage
+                            // field khaali rehta hai (hisaab admin panel par).
                         )
                     )
                 } catch (_: Exception) { }
@@ -588,6 +824,9 @@ class FormRunService : Service() {
                             nextAction = "History se resume karo — wahi se aage badhega.",
                             proofCount = proofShots,
                             at = System.currentTimeMillis()
+                            // v36 user order (2026-09-26): token/model/cost ki
+                            // jaankari user ko KAHIN nahi dikhegi — aiUsage
+                            // field khaali rehta hai (hisaab admin panel par).
                         )
                     )
                 } catch (_: Exception) { }
@@ -603,6 +842,11 @@ class FormRunService : Service() {
                 // Vetoed/needs_user par kabhi nahi (wahan user ka action chahiye).
                 scheduleOneRetry(task, name, result.status)
             }
+        }
+        // v36 refine point 8: run khatm (service thread done) → idempotency
+        // release. Resume tasks ne acquire kiya hi nahi tha (isResumeTask).
+        if (!isResumeTask) {
+            try { IdempotencyGuard.release(this, runId) } catch (_: Exception) { }
         }
     }
 

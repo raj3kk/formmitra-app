@@ -22,7 +22,9 @@ object RunSummaryStore {
         val pendingText: String,
         val nextAction: String,
         val proofCount: Int,
-        val at: Long
+        val at: Long,
+        /** v36: per-work model/token hisaab (chat card me dikh sakta hai). */
+        val aiUsage: String = ""
     )
 
     private fun prefs(ctx: Context) =
@@ -46,6 +48,7 @@ object RunSummaryStore {
                     .put("nextAction", s.nextAction)
                     .put("proofCount", s.proofCount)
                     .put("at", s.at)
+                    .put("aiUsage", s.aiUsage)
             )
             // Cap 20.
             while (arr.length() > 20) arr.remove(0)
@@ -65,7 +68,8 @@ object RunSummaryStore {
                         o.optString("runId"), o.optString("workName"),
                         o.optString("status"), o.optString("doneText"),
                         o.optString("pendingText"), o.optString("nextAction"),
-                        o.optInt("proofCount"), o.optLong("at")
+                        o.optInt("proofCount"), o.optLong("at"),
+                        o.optString("aiUsage", "")
                     )
                 )
             }

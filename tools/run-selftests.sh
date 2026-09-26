@@ -89,6 +89,7 @@ run_test_v29
 # v29 P8: realtime pure logic — WsFrame/PhoenixMsg/MiniJson/RealtimeChannel/
 # RealtimeCrypto (RealtimeSocket.kt ke pure objects; runtime par sirf ye
 # chhute hain — android/org.json stubs load nahi hote).
+
 run_test_v29_realtime() {
   local name="selftest_v29_realtime"
   echo "== $name =="
@@ -106,6 +107,44 @@ run_test_v29_realtime() {
   TOTAL_PASS=$((TOTAL_PASS+passes))
 }
 run_test_v29_realtime
+
+# v36: SMART COORDINATION pure logic — PreflightPlan / EscalationLadder /
+# AiUsage model-ledger (NO cap — user order 2026-09-26: token par koi
+# restriction nahi; hisaab admin-only) / LearnLogic work-patterns+
+# stepEscalation / PageStructureHash / GateAudit trail / IdempotencyGuard /
+# ErrorCatcher full-detail (org.json chahiye — compile android.jar par,
+# runtime par REAL org.json pehle) / LiveActivity indicator labels.
+run_test_v36() {
+  local name="selftest_v36"
+  echo "== $name =="
+  "$KOTLINC" -J-Xmx1g -cp "$ANDR_JAR" \
+    "$SRC/engine/PreflightPlan.kt" \
+    "$SRC/engine/EscalationLadder.kt" \
+    "$SRC/engine/AiUsage.kt" \
+    "$SRC/agent/LearnLogic.kt" \
+    "$SRC/agent/PageStructureHash.kt" \
+    "$SRC/agent/WorkPatternStore.kt" \
+    "$SRC/agent/GateAudit.kt" \
+    "$SRC/agent/LiveActivity.kt" \
+    "$SRC/engine/IdempotencyGuard.kt" \
+    "$SRC/engine/ErrorCatcher.kt" \
+    "$SRC/engine/FormApi.kt" \
+    "$SRC/engine/AgentLoopLogic.kt" \
+    "$SRC/agent/AgentApi.kt" \
+    "$SRC/BuildConfig.java" \
+    "$APP/tools/selftest/SelfTestV36.kt" \
+    -d "$OUT/$name" >"$OUT/$name.log" 2>&1
+  if [ $? -ne 0 ]; then echo "COMPILE FAILED:"; tail -20 "$OUT/$name.log"; TOTAL_FAIL=$((TOTAL_FAIL+1)); return; fi
+  ORGJSON=$APP/tools/lib/json-20231013.jar
+  java -Dfm.app.dir="$APP" -cp "$OUT/$name:$ORGJSON:$STDLIB:$ANDR_JAR" SelfTestV36Kt 2>&1 | tee "$OUT/$name.out" | grep -E "^(PASS|FAIL)" | tail -3
+  local fails passes
+  fails=$(grep -cE "^(FAIL|Exception in thread)" "$OUT/$name.out" || true)
+  passes=$(grep -cE "^PASS" "$OUT/$name.out" || true)
+  echo "-> $name PASS: $passes FAIL: $fails"
+  TOTAL_FAIL=$((TOTAL_FAIL+fails))
+  TOTAL_PASS=$((TOTAL_PASS+passes))
+}
+run_test_v36
 
 # Point 14: DetailBatchLogic (pure Kotlin, no Android)
 run_test selftest_details SelfTestDetailsKt \

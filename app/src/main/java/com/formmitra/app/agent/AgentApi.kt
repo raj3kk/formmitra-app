@@ -130,6 +130,19 @@ object AgentApi {
         postTransientRetry("/api/agent/act", ctx, body, 60_000, automationCardToken)
 
     /**
+     * v36 PRE-FLIGHT PLAN — kaam shuru hone se PEHLE AI se ek baar me
+     * poora plan: {goal_hinglish, start_url, steps[], expected_proofs[],
+     * gates[], missing_details[], estimated_minutes}.
+     * Request: {goal, known_details?, research?, run_id?}
+     * Response: {plan|null, prompt_version}
+     * Timeout 60s (server AI call). Transient-only retry act() jaisa.
+     * v36: parse/call fail = ASLI failure (koi silent step-by-step fallback
+     * nahi) — caller ErrorCatcher me asli wajah ke saath fail karta hai.
+     */
+    fun preflight(ctx: Context, body: JSONObject): ApiResult =
+        postTransientRetry("/api/agent/preflight", ctx, body, 60_000, automationCardToken)
+
+    /**
      * POST /api/agent/captcha — CAPTCHA protocol (AI sirf analyze karta hai).
      * Request analyze: {mode, screenshot_b64, dom_snippet, url, attempt}
      * Request verify:  {mode, screenshot_b64, dom_snippet, url, attempt, verify_hint}
@@ -353,16 +366,22 @@ object AgentApi {
 
     /**
      * POINT 25: POST /api/agent/runs {goal, url} — tracking action-offer
-     * tap par operator action shuru karo. @return run_id ya null.
+     * tap par operator action shuru karo.
+     * @return Triple(runId, httpCode, errorText) — 409 (1-active limit) par
+     *   errorText me server ka EXACT rejection message hota hai.
      * (Payment/checkout goal server khud reject karta hai.)
      */
-    fun startActionRun(ctx: Context, goal: String, url: String): String? {
+    fun startActionRun(ctx: Context, goal: String, url: String): Triple<String?, Int, String?> {
         val body = JSONObject().put("goal", goal)
         if (url.isNotEmpty()) body.put("url", url)
         val res = try { post("/api/agent/runs", ctx, body) }
-        catch (_: Exception) { return null }
-        if (res.code !in 200..299) return null
-        return res.json?.optString("run_id", null)?.ifEmpty { null }
+        catch (_: Exception) { return Triple(null, -1, "Network dikkat — dobara try karo") }
+        if (res.code in 200..299) {
+            return Triple(res.json?.optString("run_id", null)?.ifEmpty { null }, res.code, null)
+        }
+        val err = res.json?.optString("error", "").orEmpty()
+            .ifEmpty { "Kaam shuru nahi ho paya (code ${res.code})" }
+        return Triple(null, res.code, err)
     }
 
     /**
@@ -597,6 +616,28 @@ object AgentApi {
         val res = get("/api/agent/runs?limit=20", ctx)
         if (res.code !in 200..299) return null
         return res.json?.optJSONArray("runs")
+    }
+
+    /**
+     * v36 (point 10): 1-active-session limit — kaun se statuses "active"
+     * gine jayenge (server findActiveUserRun ke barabar).
+     * Pure function — selftest me pinned.
+     */
+    fun isActiveRunStatus(status: String): Boolean =
+        status == "running" || status == "needs_user" || status == "queued"
+
+    /**
+     * v36 (point 10): server par koi active run? → uska JSONObject
+     * (id/status/goal) ya null. [Band karo] action isi se run dhundhta hai.
+     */
+    fun activeRun(ctx: Context): JSONObject? {
+        val runs = try { listRuns(ctx) } catch (_: Exception) { return null }
+            ?: return null
+        for (i in 0 until runs.length()) {
+            val r = runs.optJSONObject(i) ?: continue
+            if (isActiveRunStatus(r.optString("status", ""))) return r
+        }
+        return null
     }
 
     /**
