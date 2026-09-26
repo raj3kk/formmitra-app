@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Base64
 import android.webkit.CookieManager
@@ -53,7 +54,43 @@ class FormEngine(private val appContext: Context) {
 
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
-    private var webView: WebView? = null
+    @Volatile private var webView: WebView? = null
+
+    /**
+     * v33 FIX (root cause: WebView background thread par bana tha →
+     * IllegalStateException). Android ka niyam: WebView ki CREATION aur
+     * uske saare View-method calls (loadUrl, evaluateJavascript, measure,
+     * layout, draw, dispatchTouchEvent, settings, scale/width/height,
+     * destroy, reload, canGoBack/Forward...) SIRF main (UI) thread par.
+     *
+     * onMain: block ko main thread par chalakar result wapas deta hai
+     * (blocking — caller background par hona chahiye, jo engine ka
+     * contract hai). Deadlock-guard: caller khud main thread par ho to
+     * block inline chalta hai (latch-await kabhi nahi).
+     */
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private fun <T> onMain(timeoutMs: Long = 30_000, block: () -> T): T {
+        if (Looper.myLooper() == Looper.getMainLooper()) return block()
+        var result: Any? = null
+        var err: Throwable? = null
+        val latch = CountDownLatch(1)
+        mainHandler.post {
+            try {
+                result = block()
+            } catch (t: Throwable) {
+                err = t
+            } finally {
+                latch.countDown()
+            }
+        }
+        if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+            throw TimeoutException("main-thread marshal timeout (${timeoutMs}ms)")
+        }
+        err?.let { throw it }
+        @Suppress("UNCHECKED_CAST")
+        return result as T
+    }
 
     /**
      * Assisted payment verify hone ke baad AgentLoop ise true karta hai.
@@ -73,37 +110,42 @@ class FormEngine(private val appContext: Context) {
         val latch = CountDownLatch(1)
         handler!!.post {
             try {
-                val wv = WebView(appContext)
-                with(wv.settings) {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    databaseEnabled = true
-                    mediaPlaybackRequiresUserGesture = false
-                }
-                // session cookies MainActivity ke WebView se shared hain
-                // (CookieManager process-global hai)
-                wv.webViewClient = WebViewClient()
-                // file upload: <input type=file> click par system picker NAHI —
-                // upload step ka pending file auto-supply hota hai (deterministic)
-                wv.webChromeClient = object : WebChromeClient() {
-                    override fun onShowFileChooser(
-                        view: WebView?,
-                        filePathCallback: ValueCallback<Array<Uri>>?,
-                        fileChooserParams: FileChooserParams?
-                    ): Boolean {
-                        return handleFileChooser(filePathCallback)
+                // v33: poori creation + setup MAIN thread par (WebView ka
+                // constructor background thread par IllegalStateException
+                // deta hai — yahi v32 ka real-phone crash tha).
+                onMain {
+                    val wv = WebView(appContext)
+                    with(wv.settings) {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        databaseEnabled = true
+                        mediaPlaybackRequiresUserGesture = false
                     }
-                }
-                wv.measure(
-                    android.view.View.MeasureSpec.makeMeasureSpec(
-                        1080, android.view.View.MeasureSpec.EXACTLY
-                    ),
-                    android.view.View.MeasureSpec.makeMeasureSpec(
-                        1920, android.view.View.MeasureSpec.EXACTLY
+                    // session cookies MainActivity ke WebView se shared hain
+                    // (CookieManager process-global hai)
+                    wv.webViewClient = WebViewClient()
+                    // file upload: <input type=file> click par system picker NAHI —
+                    // upload step ka pending file auto-supply hota hai (deterministic)
+                    wv.webChromeClient = object : WebChromeClient() {
+                        override fun onShowFileChooser(
+                            view: WebView?,
+                            filePathCallback: ValueCallback<Array<Uri>>?,
+                            fileChooserParams: FileChooserParams?
+                        ): Boolean {
+                            return handleFileChooser(filePathCallback)
+                        }
+                    }
+                    wv.measure(
+                        android.view.View.MeasureSpec.makeMeasureSpec(
+                            1080, android.view.View.MeasureSpec.EXACTLY
+                        ),
+                        android.view.View.MeasureSpec.makeMeasureSpec(
+                            1920, android.view.View.MeasureSpec.EXACTLY
+                        )
                     )
-                )
-                wv.layout(0, 0, 1080, 1920)
-                webView = wv
+                    wv.layout(0, 0, 1080, 1920)
+                    webView = wv
+                }
             } catch (_: Exception) {
             }
             latch.countDown()
@@ -118,7 +160,8 @@ class FormEngine(private val appContext: Context) {
             if (h != null) {
                 val latch = CountDownLatch(1)
                 h.post {
-                    try { webView?.destroy() } catch (_: Exception) { }
+                    // v33: destroy() bhi UI thread mangta hai.
+                    try { onMain { webView?.destroy() } } catch (_: Exception) { }
                     latch.countDown()
                 }
                 latch.await(5, TimeUnit.SECONDS)
@@ -443,9 +486,15 @@ class FormEngine(private val appContext: Context) {
         var out = "null"
         handler!!.post {
             try {
-                webView!!.evaluateJavascript(js) { v ->
-                    out = v ?: "null"
-                    latch.countDown()
+                // v33: evaluateJavascript UI thread mangta hai. Callback
+                // (v -> ...) khud main thread par aata hai — sirf latch
+                // countDown karta hai, block nahi, isliye deadlock nahi.
+                val wv = onMain { webView!! }
+                onMain {
+                    wv.evaluateJavascript(js) { v ->
+                        out = v ?: "null"
+                        latch.countDown()
+                    }
                 }
             } catch (_: Exception) { latch.countDown() }
         }
@@ -629,22 +678,25 @@ class FormEngine(private val appContext: Context) {
 
     private fun navigate(url: String) {
         val latch = CountDownLatch(1)
-        val wv = webView!!
         handler!!.post {
-            wv.webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, u: String?) {
-                    latch.countDown()
-                }
+            // v33: webViewClient + loadUrl UI thread par.
+            onMain {
+                val wv = webView!!
+                wv.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, u: String?) {
+                        latch.countDown()
+                    }
 
-                override fun onReceivedError(
-                    view: WebView?,
-                    request: android.webkit.WebResourceRequest?,
-                    error: android.webkit.WebResourceError?
-                ) {
-                    if (request?.isForMainFrame == true) latch.countDown()
+                    override fun onReceivedError(
+                        view: WebView?,
+                        request: android.webkit.WebResourceRequest?,
+                        error: android.webkit.WebResourceError?
+                    ) {
+                        if (request?.isForMainFrame == true) latch.countDown()
+                    }
                 }
+                wv.loadUrl(url)
             }
-            wv.loadUrl(url)
         }
         latch.await(45, TimeUnit.SECONDS)
         val deadline = SystemClock.elapsedRealtime() + 20_000
@@ -890,7 +942,11 @@ class FormEngine(private val appContext: Context) {
         val latch = CountDownLatch(1)
         handler!!.post {
             try {
-                if (webView!!.canGoBack()) webView!!.goBack()
+                // v33: canGoBack/goBack UI thread par.
+                onMain {
+                    val wv = webView!!
+                    if (wv.canGoBack()) wv.goBack()
+                }
             } catch (_: Exception) { }
             latch.countDown()
         }
@@ -926,7 +982,11 @@ class FormEngine(private val appContext: Context) {
         val latch = CountDownLatch(1)
         handler!!.post {
             try {
-                if (webView!!.canGoForward()) webView!!.goForward()
+                // v33: canGoForward/goForward UI thread par.
+                onMain {
+                    val wv = webView!!
+                    if (wv.canGoForward()) wv.goForward()
+                }
             } catch (_: Exception) { }
             latch.countDown()
         }
@@ -971,16 +1031,19 @@ class FormEngine(private val appContext: Context) {
         var bmp: Bitmap? = null
         handler!!.post {
             try {
-                val wv = webView!!
-                val h = (960 * wv.height / wv.width.coerceAtLeast(1)).coerceAtMost(1200)
-                val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                val canvas = android.graphics.Canvas(b)
-                canvas.scale(
-                    w.toFloat() / wv.width.coerceAtLeast(1),
-                    h.toFloat() / wv.height.coerceAtLeast(1)
-                )
-                wv.draw(canvas)
-                bmp = b
+                // v33: width/height/draw UI thread mangte hain.
+                bmp = onMain {
+                    val wv = webView!!
+                    val h = (960 * wv.height / wv.width.coerceAtLeast(1)).coerceAtMost(1200)
+                    val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    val canvas = android.graphics.Canvas(b)
+                    canvas.scale(
+                        w.toFloat() / wv.width.coerceAtLeast(1),
+                        h.toFloat() / wv.height.coerceAtLeast(1)
+                    )
+                    wv.draw(canvas)
+                    b
+                }
             } catch (_: Exception) { }
             latch.countDown()
         }
@@ -1019,24 +1082,27 @@ class FormEngine(private val appContext: Context) {
         var sent = false
         h.post {
             try {
-                val wv = webView ?: return@post
-                val scale = wv.scale
-                val vx = xCss * scale
-                val vy = yCss * scale
-                val now = android.os.SystemClock.uptimeMillis()
-                val down = android.view.MotionEvent.obtain(
-                    now, now,
-                    android.view.MotionEvent.ACTION_DOWN, vx, vy, 0
-                )
-                val up = android.view.MotionEvent.obtain(
-                    now, now + 80,
-                    android.view.MotionEvent.ACTION_UP, vx, vy, 0
-                )
-                wv.dispatchTouchEvent(down)
-                wv.dispatchTouchEvent(up)
-                down.recycle()
-                up.recycle()
-                sent = true
+                // v33: scale/dispatchTouchEvent UI thread par.
+                sent = onMain {
+                    val wv = webView ?: return@onMain false
+                    val scale = wv.scale
+                    val vx = xCss * scale
+                    val vy = yCss * scale
+                    val now = android.os.SystemClock.uptimeMillis()
+                    val down = android.view.MotionEvent.obtain(
+                        now, now,
+                        android.view.MotionEvent.ACTION_DOWN, vx, vy, 0
+                    )
+                    val up = android.view.MotionEvent.obtain(
+                        now, now + 80,
+                        android.view.MotionEvent.ACTION_UP, vx, vy, 0
+                    )
+                    wv.dispatchTouchEvent(down)
+                    wv.dispatchTouchEvent(up)
+                    down.recycle()
+                    up.recycle()
+                    true
+                }
             } catch (_: Exception) { }
             latch.countDown()
         }
@@ -1049,11 +1115,18 @@ class FormEngine(private val appContext: Context) {
      * Screenshot viewport ka linear scale hai, isliye mapping linear hai.
      */
     fun tapNormalized(x1000: Double, y1000: Double): Boolean {
-        val wv = webView ?: return false
-        val scale = try { wv.scale } catch (_: Exception) { 0f }
+        // v33: scale/width/height reads bhi UI thread par (caller background
+        // executor thread hota hai — seedha padhne par bhi thread-check
+        // lag sakta hai).
+        val dims: Triple<Float, Int, Int>? = try {
+            onMain(10_000) {
+                val wv = webView ?: return@onMain null
+                Triple(wv.scale, wv.width, wv.height)
+            }
+        } catch (_: Exception) { null }
+        if (dims == null) return false
+        val (scale, w, h) = dims
         if (scale <= 0f) return false
-        val w = try { wv.width } catch (_: Exception) { 0 }
-        val h = try { wv.height } catch (_: Exception) { 0 }
         if (w <= 0 || h <= 0) return false
         val xCss = (x1000.coerceIn(0.0, 1000.0) / 1000.0 * w / scale).toFloat()
         val yCss = (y1000.coerceIn(0.0, 1000.0) / 1000.0 * h / scale).toFloat()
@@ -1070,34 +1143,37 @@ class FormEngine(private val appContext: Context) {
         var sent = false
         h.post {
             try {
-                val wv = webView ?: return@post
-                val scale = wv.scale
-                if (scale <= 0f) return@post
-                fun cx(x: Double) = (x.coerceIn(0.0, 1000.0) / 1000.0 * wv.width / scale).toFloat()
-                fun cy(y: Double) = (y.coerceIn(0.0, 1000.0) / 1000.0 * wv.height / scale).toFloat()
-                val now = android.os.SystemClock.uptimeMillis()
-                val down = android.view.MotionEvent.obtain(
-                    now, now, android.view.MotionEvent.ACTION_DOWN, cx(x1), cy(y1), 0
-                )
-                wv.dispatchTouchEvent(down)
-                // 10 interpolated moves (~300ms) — slider pakad ke kheenchna
-                val steps = 10
-                for (i in 1..steps) {
-                    val t = i.toFloat() / steps
-                    val mx = cx(x1) + (cx(x2) - cx(x1)) * t
-                    val my = cy(y1) + (cy(y2) - cy(y1)) * t
-                    val mv = android.view.MotionEvent.obtain(
-                        now, now + i * 30L, android.view.MotionEvent.ACTION_MOVE, mx, my, 0
+                // v33: scale/width/height/dispatchTouchEvent UI thread par.
+                sent = onMain {
+                    val wv = webView ?: return@onMain false
+                    val scale = wv.scale
+                    if (scale <= 0f) return@onMain false
+                    fun cx(x: Double) = (x.coerceIn(0.0, 1000.0) / 1000.0 * wv.width / scale).toFloat()
+                    fun cy(y: Double) = (y.coerceIn(0.0, 1000.0) / 1000.0 * wv.height / scale).toFloat()
+                    val now = android.os.SystemClock.uptimeMillis()
+                    val down = android.view.MotionEvent.obtain(
+                        now, now, android.view.MotionEvent.ACTION_DOWN, cx(x1), cy(y1), 0
                     )
-                    wv.dispatchTouchEvent(mv)
-                    mv.recycle()
+                    wv.dispatchTouchEvent(down)
+                    // 10 interpolated moves (~300ms) — slider pakad ke kheenchna
+                    val steps = 10
+                    for (i in 1..steps) {
+                        val t = i.toFloat() / steps
+                        val mx = cx(x1) + (cx(x2) - cx(x1)) * t
+                        val my = cy(y1) + (cy(y2) - cy(y1)) * t
+                        val mv = android.view.MotionEvent.obtain(
+                            now, now + i * 30L, android.view.MotionEvent.ACTION_MOVE, mx, my, 0
+                        )
+                        wv.dispatchTouchEvent(mv)
+                        mv.recycle()
+                    }
+                    val up = android.view.MotionEvent.obtain(
+                        now, now + 350, android.view.MotionEvent.ACTION_UP, cx(x2), cy(y2), 0
+                    )
+                    wv.dispatchTouchEvent(up)
+                    down.recycle(); up.recycle()
+                    true
                 }
-                val up = android.view.MotionEvent.obtain(
-                    now, now + 350, android.view.MotionEvent.ACTION_UP, cx(x2), cy(y2), 0
-                )
-                wv.dispatchTouchEvent(up)
-                down.recycle(); up.recycle()
-                sent = true
             } catch (_: Exception) { }
             latch.countDown()
         }
@@ -1133,16 +1209,19 @@ class FormEngine(private val appContext: Context) {
         var bmp: Bitmap? = null
         handler!!.post {
             try {
-                val wv = webView!!
-                val h = 960 * wv.height / wv.width.coerceAtLeast(1)
-                val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                val canvas = android.graphics.Canvas(b)
-                canvas.scale(
-                    w.toFloat() / wv.width.coerceAtLeast(1),
-                    h.toFloat() / wv.height.coerceAtLeast(1)
-                )
-                wv.draw(canvas)
-                bmp = b
+                // v33: width/height/draw UI thread par.
+                bmp = onMain {
+                    val wv = webView!!
+                    val h = 960 * wv.height / wv.width.coerceAtLeast(1)
+                    val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    val canvas = android.graphics.Canvas(b)
+                    canvas.scale(
+                        w.toFloat() / wv.width.coerceAtLeast(1),
+                        h.toFloat() / wv.height.coerceAtLeast(1)
+                    )
+                    wv.draw(canvas)
+                    b
+                }
             } catch (_: Exception) { }
             latch.countDown()
         }
@@ -1600,8 +1679,9 @@ class FormEngine(private val appContext: Context) {
         var needReload = false
         h.post {
             try {
-                val wv = webView
-                if (wv != null) {
+                // v33: settings + url reads UI thread par.
+                val res: Pair<Boolean, Boolean> = onMain {
+                    val wv = webView ?: return@onMain Pair(false, false)
                     if (enabled) {
                         if (defaultUa == null) {
                             defaultUa = try { wv.settings.userAgentString } catch (_: Exception) { null }
@@ -1615,11 +1695,13 @@ class FormEngine(private val appContext: Context) {
                         wv.settings.loadWithOverviewMode = false
                     }
                     isDesktopMode = enabled
-                    ok = true
-                    try {
-                        needReload = !wv.url.isNullOrEmpty()
-                    } catch (_: Exception) { }
+                    val nr = try {
+                        !wv.url.isNullOrEmpty()
+                    } catch (_: Exception) { false }
+                    Pair(true, nr)
                 }
+                ok = res.first
+                needReload = res.second
             } catch (_: Exception) { }
             latch.countDown()
         }
@@ -1647,7 +1729,8 @@ class FormEngine(private val appContext: Context) {
         val h = handler ?: return false
         val latch = CountDownLatch(1)
         h.post {
-            try { webView?.reload() } catch (_: Exception) { }
+            // v33: reload() UI thread mangta hai.
+            try { onMain { webView?.reload() } } catch (_: Exception) { }
             latch.countDown()
         }
         latch.await(5, TimeUnit.SECONDS)
