@@ -57,6 +57,20 @@ class FormEngine(private val appContext: Context) {
     @Volatile private var webView: WebView? = null
 
     /**
+     * v38 — SHARED WEBVIEW MODE (Live WebView, user order 2026-09-26).
+     * true = ye engine apna WebView NAHI banata; LiveWebViewHost ka ek
+     * shared WebView use karta hai — wahi WebView "🖥️ Live" toggle me
+     * live dikhta hai. start() se PEHLE set karo.
+     */
+    @Volatile var useSharedWebView: Boolean = false
+
+    /** v38: renderer-crash ke baad host naya WebView de to reference badlo. */
+    private val sharedRecreateListener: (WebView) -> Unit = { wv ->
+        // Host ne engine setup pehle hi laga diya hai.
+        webView = wv
+    }
+
+    /**
      * v33 FIX (root cause: WebView background thread par bana tha →
      * IllegalStateException). Android ka niyam: WebView ki CREATION aur
      * uske saare View-method calls (loadUrl, evaluateJavascript, measure,
@@ -101,8 +115,51 @@ class FormEngine(private val appContext: Context) {
      */
     @Volatile var paymentVerifiedOnce: Boolean = false
 
+    /**
+     * Engine ka WebView setup — shared aur private dono mode me EK HI.
+     * (v38: LiveWebViewHost recreate par ise dobara lagata hai.)
+     * Caller MAIN thread par hona chahiye.
+     */
+    private fun applyEngineSetup(wv: WebView) {
+        with(wv.settings) {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            databaseEnabled = true
+            mediaPlaybackRequiresUserGesture = false
+        }
+        // session cookies MainActivity ke WebView se shared hain
+        // (CookieManager process-global hai)
+        // v38: host ka client — renderer-crash handling kabhi na khoye.
+        wv.webViewClient = LiveWebViewHost.HostWebViewClient()
+        // file upload: <input type=file> click par system picker NAHI —
+        // upload step ka pending file auto-supply hota hai (deterministic)
+        wv.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                view: WebView?,
+                filePathCallback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?
+            ): Boolean {
+                return handleFileChooser(filePathCallback)
+            }
+        }
+        wv.measure(
+            android.view.View.MeasureSpec.makeMeasureSpec(
+                1080, android.view.View.MeasureSpec.EXACTLY
+            ),
+            android.view.View.MeasureSpec.makeMeasureSpec(
+                1920, android.view.View.MeasureSpec.EXACTLY
+            )
+        )
+        wv.layout(0, 0, 1080, 1920)
+    }
+
     /** Engine thread start + hidden WebView. Blocking; caller background pe ho. */
     fun start() {
+        // v38: shared mode — host ka WebView lo, apna mat banao.
+        if (useSharedWebView) {
+            startShared()
+            return
+        }
         // v35: pichli start() adhuri reh gayi ho (thread hai, webView nahi)
         // to saaf karke dobara shuru karo — silent stuck kabhi nahi
         // ("session band rehta hai" ka ek root cause yehi tha).
@@ -125,37 +182,10 @@ class FormEngine(private val appContext: Context) {
                 // v33: poori creation + setup MAIN thread par (WebView ka
                 // constructor background thread par IllegalStateException
                 // deta hai — yahi v32 ka real-phone crash tha).
+                // v38: setup applyEngineSetup me (shared mode se shared).
                 onMain {
                     val wv = WebView(appContext)
-                    with(wv.settings) {
-                        javaScriptEnabled = true
-                        domStorageEnabled = true
-                        databaseEnabled = true
-                        mediaPlaybackRequiresUserGesture = false
-                    }
-                    // session cookies MainActivity ke WebView se shared hain
-                    // (CookieManager process-global hai)
-                    wv.webViewClient = WebViewClient()
-                    // file upload: <input type=file> click par system picker NAHI —
-                    // upload step ka pending file auto-supply hota hai (deterministic)
-                    wv.webChromeClient = object : WebChromeClient() {
-                        override fun onShowFileChooser(
-                            view: WebView?,
-                            filePathCallback: ValueCallback<Array<Uri>>?,
-                            fileChooserParams: FileChooserParams?
-                        ): Boolean {
-                            return handleFileChooser(filePathCallback)
-                        }
-                    }
-                    wv.measure(
-                        android.view.View.MeasureSpec.makeMeasureSpec(
-                            1080, android.view.View.MeasureSpec.EXACTLY
-                        ),
-                        android.view.View.MeasureSpec.makeMeasureSpec(
-                            1920, android.view.View.MeasureSpec.EXACTLY
-                        )
-                    )
-                    wv.layout(0, 0, 1080, 1920)
+                    applyEngineSetup(wv)
                     webView = wv
                 }
             } catch (t: Throwable) {
@@ -181,7 +211,52 @@ class FormEngine(private val appContext: Context) {
         }
     }
 
+    /**
+     * v38 — shared-mode start: LiveWebViewHost ka EK shared WebView lo.
+     * HandlerThread phir bhi chahiye (navigate()/tapAt handler par post
+     * karte hain). WebView destroy NAHI hota — host ke paas rehta hai.
+     */
+    private fun startShared() {
+        if (webView != null) return
+        // v35-style: adhura thread state saaf karo.
+        if (thread != null) {
+            try { thread?.quitSafely() } catch (_: Exception) { }
+            thread = null
+            handler = null
+        }
+        val t = HandlerThread("formmitra-engine").also { it.start() }
+        thread = t
+        handler = Handler(t.looper)
+        val wv = try {
+            LiveWebViewHost.acquire(appContext) { w -> applyEngineSetup(w) }
+        } catch (t: Throwable) {
+            try { thread?.quitSafely() } catch (_: Exception) { }
+            thread = null
+            handler = null
+            throw Exception(ErrorCatcher.startFailureMessage(t), t)
+        }
+        webView = wv
+        try {
+            LiveWebViewHost.addRecreateListener(sharedRecreateListener)
+        } catch (_: Exception) { }
+    }
+
     fun stop() {
+        // v38: shared mode — WebView DESTROY NAHI (host ke paas rehta hai,
+        // live view / agli run use karegi); sirf release (blank + idle).
+        if (useSharedWebView) {
+            try {
+                LiveWebViewHost.removeRecreateListener(sharedRecreateListener)
+            } catch (_: Exception) { }
+            try {
+                LiveWebViewHost.release()
+            } catch (_: Exception) { }
+            webView = null
+            try { thread?.quitSafely() } catch (_: Exception) { }
+            thread = null
+            handler = null
+            return
+        }
         try {
             val h = handler
             if (h != null) {
@@ -731,7 +806,9 @@ class FormEngine(private val appContext: Context) {
             // v33: webViewClient + loadUrl UI thread par.
             onMain {
                 val wv = webView!!
-                wv.webViewClient = object : WebViewClient() {
+                // v38: host ka client extend karo — renderer-crash handling
+                // per-navigation replace par bhi na khoye.
+                wv.webViewClient = object : LiveWebViewHost.HostWebViewClient() {
                     override fun onPageFinished(view: WebView?, u: String?) {
                         latch.countDown()
                     }

@@ -597,6 +597,9 @@ class FormRunService : Service() {
             runId.startsWith("local-")
 
         val engine = FormEngine(this)
+        // v38: shared live WebView — agent ka browsing "🖥️ Live" toggle me
+        // live dikhega; har run apna WebView nahi banata.
+        engine.useSharedWebView = true
         val firstStep = stepsJson.optJSONObject(0)
         val result = try {
             if (firstStep != null && firstStep.optString("type") == "agent_run") {

@@ -1,39 +1,45 @@
 package com.formmitra.app.agent
 
 import android.app.Activity
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.View
-import android.view.WindowManager
+import android.view.ViewGroup
+import android.webkit.WebView
 import android.widget.Button
-import android.widget.ImageView
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import com.formmitra.app.engine.OperatorApi
+import com.formmitra.app.engine.FormRunService
+import com.formmitra.app.engine.LiveWebViewHost
 import com.formmitra.app.engine.OperatorSession
-import java.net.HttpURLConnection
-import java.net.URL
 
 /**
- * Operator console — fullscreen immersive VIEW-ONLY view (v33 UX rule).
+ * v38 — LIVE WEBVIEW VIEW (user order 2026-09-26):
  *
- * - Session ko shuru SIRF agent/operator/AI karta hai (server command
- *   channel se — OperatorCommandReceiver). User ke paas session START
- *   ka button NAHI hai.
- * - Yahan live screenshot dikhta hai (GET operator/state har ~2.5s poll).
- * - STRICTLY VIEW-ONLY: screenshot par tap/drag/pinch se KOI command
- *   nahi jata; koi manual control nahi.
- * - User ke haath me sirf EMERGENCY STOP hai: "BAND KARO" — session
- *   chal rahi ho tab hi dabega. OTP/login/payment/option gates aur
- *   sudhaar chat se hote hain.
- * - Sab labels simple Hinglish. Har entry point Throwable-proof
- *   (CrashCatcher pattern).
+ * "Naya toggle nahi — wahi Live toggle, usi me LIVE WebView dikhe
+ *  (screenshot delay nahi, asli live). Agent idle → khaali browser;
+ *  agent kaam kare → sab kuch live. Browsing background me hi chalegi;
+ *  live view SIRF display (view-only)."
+ *
+ * - LiveWebViewHost ka EK shared WebView yahan attach hota hai — wahi
+ *   object jo automation chala raha hai. Attach/detach par object nahi
+ *   badalta → live kholne/band karne se automation kabhi rukti nahi
+ *   (approved addition #5).
+ * - STRICTLY VIEW-ONLY (v33 rule barkarar): WebView ke UPAR transparent
+ *   touch-blocker overlay — user ka tap/drag/pinch WebView tak pahunch
+ *   hi nahi sakta. WebView par KOI OnTouchListener NAHI lagate taaki
+ *   engine ke synthetic taps (tapAt — reCAPTCHA checkbox,
+ *   dispatchTouchEvent seedha WebView par) kaam karte rahen.
+ * - Approved addition #2: live khula ho aur kaam khatm/fail/band ho to
+ *   completion banner (blank screen nahi).
+ * - BAND KARO (emergency stop): operator session + active form run dono
+ *   band karta hai. OTP/login/payment/option gates aur sudhaar chat se.
+ * - Sab labels simple Hinglish. Har entry point Throwable-proof.
  */
 class OperatorView : Activity() {
 
@@ -41,13 +47,25 @@ class OperatorView : Activity() {
 
     private lateinit var statusText: TextView
     private lateinit var stopBtn: Button
-    private lateinit var screenView: ImageView
+    private lateinit var webContainer: FrameLayout
+    private lateinit var doneBanner: TextView
 
     private val uiHandler = Handler(Looper.getMainLooper())
-    @Volatile private var polling = false
-    @Volatile private var sessionOn = false
-    @Volatile private var lastShownUrl: String = ""
-    private var destroyed = false
+    @Volatile private var destroyed = false
+    @Volatile private var attachedWv: WebView? = null
+
+    private val liveActivityListener: (LiveActivity.Event) -> Unit = { e ->
+        try {
+            runOnUiThread { safe { onLiveEvent(e) } }
+        } catch (_: Exception) { }
+    }
+
+    /** v38 addition #3: renderer crash ke baad naya WebView — dobara attach. */
+    private val recreateListener: (WebView) -> Unit = { _ ->
+        try {
+            runOnUiThread { safe { attachWebView() } }
+        } catch (_: Exception) { }
+    }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
@@ -64,8 +82,7 @@ class OperatorView : Activity() {
             return
         }
         try {
-            // Fullscreen immersive (no action bar — manifest theme bhi NoActionBar)
-            window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+            window.addFlags(android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN)
             @Suppress("DEPRECATION")
             window.decorView.systemUiVisibility = (
                 View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
@@ -76,20 +93,38 @@ class OperatorView : Activity() {
                     or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                 )
             buildUi()
-            startPolling()
+            try {
+                LiveActivity.addListener(liveActivityListener)
+            } catch (_: Exception) { }
+            try {
+                LiveWebViewHost.addRecreateListener(recreateListener)
+            } catch (_: Exception) { }
+            attachWebView()
+            refreshFromLastEvent()
         } catch (t: Throwable) {
             Log.e(TAG, "onCreate UI failed (non-fatal)", t)
-            toast("Operator view khulne me dikkat")
+            toast("Live view khulne me dikkat")
             try { finish() } catch (_: Exception) { }
         }
     }
 
     override fun onDestroy() {
         destroyed = true
-        polling = false
+        try {
+            LiveActivity.removeListener(liveActivityListener)
+        } catch (_: Exception) { }
+        try {
+            LiveWebViewHost.removeRecreateListener(recreateListener)
+        } catch (_: Exception) { }
+        // v38 addition #5: live band → WebView wapas hidden mode me;
+        // AUTOMATION JAARI rehti hai (stop NAHI hota).
+        try {
+            detachWebView()
+        } catch (_: Exception) { }
+        try {
+            LiveWebViewHost.setLiveVisible(false)
+        } catch (_: Exception) { }
         try { uiHandler.removeCallbacksAndMessages(null) } catch (_: Exception) { }
-        // Session khuli reh sakti hai (background control chalta rahe) —
-        // user BAND KARO dabaye to hi band hoti hai.
         try { super.onDestroy() } catch (_: Exception) { }
     }
 
@@ -107,7 +142,7 @@ class OperatorView : Activity() {
             setPadding(dp(10), dp(10), dp(10), dp(6))
         }
         statusText = TextView(this).apply {
-            text = "Operator — session band hai, agent shuru karega"
+            text = "Live — taiyaar ho raha hai…"
             textSize = 14f
             setTextColor(Color.WHITE)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
@@ -121,23 +156,28 @@ class OperatorView : Activity() {
         topRow.addView(stopBtn)
         root.addView(topRow)
 
-        // Live screenshot
-        screenView = ImageView(this).apply {
+        // WebView container: [WebView | touch-blocker overlay | done banner]
+        webContainer = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
-            scaleType = ImageView.ScaleType.FIT_XY
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 3f
             )
-            // v33 VIEW-ONLY: koi touch listener nahi — tap/drag/pinch se
-            // koi command nahi jata. Sirf agent/operator/AI chalata hai.
-            isClickable = false
-            isFocusable = false
         }
-        root.addView(screenView)
+        // v38 addition #2: completion banner (shuru me chhupa).
+        doneBanner = TextView(this).apply {
+            visibility = View.GONE
+            textSize = 15f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#1E6B4F"))
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+        webContainer.addView(doneBanner)
+        root.addView(webContainer)
 
-        // v33 VIEW-ONLY: manual control section hataya (user order —
-        // "sirf agent operate kare, user kuch nahi kare"). Session start
-        // sirf agent/server karta hai; user ke paas sirf BAND KARO hai.
         root.addView(TextView(this).apply {
             text = "Sirf dekhne ke liye — screen ko agent chalata hai.\n" +
                 "OTP / login / payment / sudhaar chat me hoga.\n" +
@@ -150,90 +190,156 @@ class OperatorView : Activity() {
     }
 
     private inline fun safe(block: () -> Unit) {
-        try { block() } catch (t: Throwable) {
+        try {
+            block()
+        } catch (t: Throwable) {
             Log.e(TAG, "UI action failed (non-fatal)", t)
             toast("Kuch gadbad hui — dobara try karo")
+        }
+    }
+
+    // ---------------- live WebView attach/detach ----------------
+
+    /**
+     * Host ka shared WebView attach karo. Koi automation kabhi chali hi
+     * nahi to ensureForViewing() khaali browser banata hai ("agent idle
+     * → khaali browser").
+     */
+    private fun attachWebView() {
+        if (destroyed) return
+        val wv = try {
+            LiveWebViewHost.ensureForViewing(this)
+        } catch (t: Throwable) {
+            Log.e(TAG, "ensureForViewing failed", t)
+            toast("Browser taiyaar nahi hua")
+            return
+        }
+        try {
+            // Pehle se kahin attach ho to wahan se hatao (ek view, ek parent).
+            try {
+                (wv.parent as? ViewGroup)?.removeView(wv)
+            } catch (_: Exception) { }
+            // Purana blocker (recreate par) saaf karo — index 0 WebView ke
+            // liye khaali rakho; blocker + banner dobara jodo.
+            webContainer.removeAllViews()
+            wv.layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+            // v38 VIEW-ONLY: WebView par KOI touch listener NAHI (engine ke
+            // synthetic taps kaam karte rahen). Uske UPAR transparent
+            // blocker — user ka touch WebView tak pahunche hi nahi.
+            val blocker = View(this).apply {
+                layoutParams = FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
+                )
+                isClickable = true
+                isFocusable = true
+                setOnTouchListener { _, _ -> true }
+            }
+            webContainer.addView(wv, 0)
+            webContainer.addView(blocker)
+            webContainer.addView(doneBanner)
+            attachedWv = wv
+            try {
+                LiveWebViewHost.setLiveVisible(true)
+            } catch (_: Exception) { }
+            updateStatus()
+        } catch (t: Throwable) {
+            Log.e(TAG, "attachWebView failed (non-fatal)", t)
+        }
+    }
+
+    private fun detachWebView() {
+        val wv = attachedWv
+        attachedWv = null
+        if (wv == null) return
+        try {
+            (wv.parent as? ViewGroup)?.removeView(wv)
+        } catch (_: Exception) { }
+        // Hidden mode ka measure/layout (server screenshot loop ke liye).
+        try {
+            LiveWebViewHost.layoutForHidden()
+        } catch (_: Exception) { }
+    }
+
+    // ---------------- status + completion banner ----------------
+
+    private fun updateStatus() {
+        if (destroyed || !::statusText.isInitialized) return
+        val active = try {
+            LiveWebViewHost.isAutomationActive()
+        } catch (_: Exception) { false }
+        try {
+            if (active) {
+                statusText.text = "● Live — agent kaam kar raha hai"
+                stopBtn.isEnabled = true
+            } else {
+                statusText.text = "Live — browser (agent khaali hai)"
+                stopBtn.isEnabled = false
+            }
+        } catch (_: Exception) { }
+    }
+
+    /** v38 addition #2: kaam khatm/fail/band → banner (blank screen nahi). */
+    private fun onLiveEvent(e: LiveActivity.Event) {
+        if (destroyed) return
+        try {
+            if (LiveActivity.isTerminal(e)) {
+                val msg = when (e.key.substringAfter(":")) {
+                    LiveActivity.STATE_DONE -> "✓ Kaam poora ho gaya"
+                    LiveActivity.STATE_FAILED -> "⚠️ Kaam me dikkat aayi — chat me dekho"
+                    LiveActivity.STATE_STOPPED -> "⏹ Kaam band kar diya gaya"
+                    else -> null
+                }
+                if (msg != null && ::doneBanner.isInitialized) {
+                    doneBanner.text = msg
+                    doneBanner.visibility = View.VISIBLE
+                    doneBanner.bringToFront()
+                }
+                updateStatus()
+                return
+            }
+            // Naya kaam / naya step → banner hatao.
+            if (::doneBanner.isInitialized && doneBanner.visibility != View.GONE) {
+                doneBanner.visibility = View.GONE
+            }
+            updateStatus()
+        } catch (_: Exception) { }
+    }
+
+    private fun refreshFromLastEvent() {
+        try {
+            val last = LiveActivity.lastEvent() ?: run {
+                updateStatus()
+                return
+            }
+            onLiveEvent(last)
+        } catch (_: Exception) {
+            try { updateStatus() } catch (_: Exception) { }
         }
     }
 
     // ---------------- emergency stop ----------------
 
     private fun emergencyStop() {
-        if (!sessionOn) return
-        toast("Session band ho rahi…")
+        toast("Band ho raha…")
         Thread({
-            try { OperatorSession.stop(this) } catch (_: Exception) { }
-            runOnUiThread { safe {
-                sessionOn = false
-                statusText.text = "Operator — session band hai, agent shuru karega"
-                stopBtn.isEnabled = false
-                toast("Session band")
-            } }
-        }, "OperatorView-stop").apply { isDaemon = true }.start()
-    }
-
-    // ---------------- live screenshot poll ----------------
-
-    private fun startPolling() {
-        if (polling) return
-        polling = true
-        uiHandler.post(pollRunnable)
-    }
-
-    private val pollRunnable = object : Runnable {
-        override fun run() {
-            if (!polling || destroyed) return
-            Thread({
-                try {
-                    val state = OperatorApi.getState(this@OperatorView)
-                    val url = state?.optString("screenshot_url", "") ?: ""
-                    val active = state != null && state.optBoolean("session_active", url.isNotEmpty())
-                    if (!destroyed) {
-                        runOnUiThread { safe {
-                            if (!destroyed) {
-                                sessionOn = active
-                                if (active) {
-                                    statusText.text = "Operator — session CHALU (agent kaam kar raha hai)"
-                                    stopBtn.isEnabled = true
-                                } else {
-                                    statusText.text = "Operator — session band hai, agent shuru karega"
-                                    stopBtn.isEnabled = false
-                                }
-                            }
-                        } }
-                    }
-                    if (url.isNotEmpty() && url != lastShownUrl && !destroyed) {
-                        val bmp = downloadBitmap(url)
-                        if (bmp != null && !destroyed) {
-                            lastShownUrl = url
-                            runOnUiThread { safe {
-                                if (!destroyed) screenView.setImageBitmap(bmp)
-                            } }
-                        }
-                    }
-                } catch (_: Exception) { }
-                if (!destroyed && polling) {
-                    uiHandler.postDelayed(this, 2500)
-                }
-            }, "OperatorView-poll").apply { isDaemon = true }.start()
-        }
-    }
-
-    private fun downloadBitmap(url: String): Bitmap? {
-        var conn: HttpURLConnection? = null
-        return try {
-            conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 12_000
-                readTimeout = 12_000
-                requestMethod = "GET"
+            try {
+                OperatorSession.stop(this)
+            } catch (_: Exception) { }
+            // v38: active form run bhi band karo (notification wala rasta).
+            try {
+                FormRunService.requestCancelActive(this)
+            } catch (_: Exception) { }
+            if (!destroyed) {
+                runOnUiThread { safe {
+                    stopBtn.isEnabled = false
+                    statusText.text = "Band kar diya — chat me dekho"
+                    toast("Band ho gaya")
+                } }
             }
-            if (conn.responseCode != 200) return null
-            val bmp = conn.inputStream.use { BitmapFactory.decodeStream(it) }
-            bmp
-        } catch (_: Exception) {
-            null
-        } finally {
-            try { conn?.disconnect() } catch (_: Exception) { }
-        }
+        }, "OperatorView-stop").apply { isDaemon = true }.start()
     }
 }

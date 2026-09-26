@@ -271,6 +271,32 @@ run_test_v37() {
 }
 run_test_v37
 
+# v38: Live WebView pins — pure-JVM (WebView instantiate nahi hota).
+# LiveWebViewHost (power policy, host-client contract) + LiveActivity
+# (recover label, terminal mapping) + ErrorCatcher (host ka report path).
+run_test_v38() {
+  local name="selftest_v38"
+  echo "== $name =="
+  "$KOTLINC" -J-Xmx1g -cp "$ANDR_JAR" \
+    "$APP/tools/selftest/SelfTestV38.kt" \
+    "$SRC/engine/LiveWebViewHost.kt" \
+    "$SRC/agent/LiveActivity.kt" \
+    "$SRC/engine/ErrorCatcher.kt" \
+    -d "$OUT/$name" >"$OUT/$name.log" 2>&1
+  if [ $? -ne 0 ]; then echo "COMPILE FAILED:"; tail -20 "$OUT/$name.log"; TOTAL_FAIL=$((TOTAL_FAIL+1)); return; fi
+  # Runtime classpath me ANDR_JAR bhi: HostWebViewClient class load hote waqt
+  # uske superclass android.webkit.WebViewClient ki zaroorat padti hai
+  # (instantiate nahi hota — sirf class-load, stub-safe).
+  java -cp "$OUT/$name:$STDLIB:$ANDR_JAR" SelfTestV38Kt 2>&1 | tee "$OUT/$name.out" | grep -E "^(PASS|FAIL|SKIP)" | tail -5
+  local fails passes
+  fails=$(grep -cE "^(FAIL|Exception in thread)" "$OUT/$name.out" || true)
+  passes=$(grep -cE "^PASS" "$OUT/$name.out" || true)
+  echo "-> $name PASS: $passes FAIL: $fails"
+  TOTAL_FAIL=$((TOTAL_FAIL+fails))
+  TOTAL_PASS=$((TOTAL_PASS+passes))
+}
+run_test_v38
+
 echo "==============================="
 echo "TOTAL PASS: $TOTAL_PASS"
 echo "TOTAL FAILURES: $TOTAL_FAIL"

@@ -55,6 +55,8 @@ object OperatorSession {
         } catch (_: Exception) { }
         return try {
             val eng = FormEngine(appCtx)
+            // v38: shared live WebView — "🖥️ Live" toggle me yehi dikhega.
+            eng.useSharedWebView = true
             eng.start()
             engine = eng
             try { eng.setDesktopMode(desktop) } catch (_: Exception) { }

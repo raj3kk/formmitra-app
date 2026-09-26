@@ -235,6 +235,8 @@ class AgentChatView(
     private var liveActivityVisible = false
     private var liveBaseLabel = ""
     private var liveDots = 0
+    /** v38 addition #4: agent active ho to Live button par dot. */
+    private var liveBtn: Button? = null
     private val liveDotsHandler = Handler(Looper.getMainLooper())
     private val liveDotsRunnable = object : Runnable {
         override fun run() {
@@ -290,7 +292,8 @@ class AgentChatView(
         // POINT 2+12 (merged): chat ↔ fullscreen live operator view toggle.
         // Yehi fullscreen view Profile ke "Live Operator" se khulta hai —
         // ek hi OperatorView, do entry points.
-        header.addView(Button(context).apply {
+        // v38: usi me LIVE WebView (screenshot nahi, asli live).
+        val liveButton = Button(context).apply {
             text = "🖥️ Live"
             textSize = 13f
             minimumWidth = 0
@@ -309,7 +312,13 @@ class AgentChatView(
                     toast("⚠️ Live view nahi khul paya — dobara try karo")
                 }
             }
-        })
+        }
+        liveBtn = liveButton
+        header.addView(liveButton)
+        // v38 addition #4: attach par pichle event se dot restore karo.
+        try {
+            LiveActivity.lastEvent()?.let { updateLiveDot(it) }
+        } catch (_: Exception) { }
         // POINT 24 (revised): manual "Lock karo" — prominent, header me.
         // Unlock sirf yahan se ya sign-out se tootega (koi auto re-lock nahi).
         lockBtn = Button(context).apply {
@@ -3630,6 +3639,8 @@ class AgentChatView(
     /** LiveActivity event aaya — label dikhao ya (terminal par) chhupao. */
     private fun onLiveActivityEvent(e: LiveActivity.Event) {
         if (!::liveActivityText.isInitialized) return
+        // v38 addition #4: Live button par active-dot.
+        try { updateLiveDot(e) } catch (_: Exception) { }
         if (LiveActivity.isTerminal(e)) {
             hideLiveActivity()
             return
@@ -3662,6 +3673,21 @@ class AgentChatView(
         liveActivityVisible = false
         liveDotsHandler.removeCallbacks(liveDotsRunnable)
         if (::liveActivityText.isInitialized) liveActivityText.visibility = View.GONE
+    }
+
+    /**
+     * v38 addition #4 — Live button par state dot: agent background me
+     * kaam kar raha ho (fresh non-terminal event) to "● 🖥️ Live",
+     * warna plain "🖥️ Live". Sirf display hai — toggle ka kaam nahi badalta.
+     */
+    private fun updateLiveDot(e: LiveActivity.Event) {
+        val btn = liveBtn ?: return
+        try {
+            val active = !LiveActivity.isTerminal(e) &&
+                System.currentTimeMillis() - e.at <= LiveActivity.STALE_MS
+            val want = if (active) "● 🖥️ Live" else "🖥️ Live"
+            if (btn.text.toString() != want) btn.text = want
+        } catch (_: Exception) { }
     }
 
     /** Server poll fallback (spec point 5): engine event miss hua ho aur

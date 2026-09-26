@@ -37,6 +37,8 @@ object LiveActivity {
     const val STATE_DONE = "state_done"
     const val STATE_FAILED = "state_failed"
     const val STATE_STOPPED = "state_stopped"
+    /** v38: WebView renderer crash ke baad host ne recover kiya. */
+    const val STATE_RECOVERED = "webview_recovered"
 
     /** Terminal keys — in par indicator GAYAB (spec point 4). */
     val TERMINAL_KEYS = setOf("state:state_done", "state:state_failed", "state:state_stopped")
@@ -79,6 +81,12 @@ object LiveActivity {
         publish(Event(runId.ifEmpty { "run" }, "state:$state"))
     }
 
+    /** v38: renderer crash ke baad browser theek — chat status line par. */
+    @JvmStatic
+    fun emitRecovered() {
+        publish(Event("run", "state:$STATE_RECOVERED"))
+    }
+
     fun isTerminal(e: Event): Boolean = e.key in TERMINAL_KEYS
 
     /**
@@ -111,6 +119,8 @@ object LiveActivity {
         if (k.startsWith("state:")) {
             return when (bare) {
                 STATE_STARTED -> "Kaam shuru ho raha hai"
+                // v38: renderer crash recovery — terminal NAHI, kaam jaari.
+                STATE_RECOVERED -> "Browser theek ho gaya, kaam jaari"
                 else -> null
             }
         }
