@@ -92,7 +92,12 @@ object AgentLoop {
          * G2 (Background Working Mode): resume par ye step already ho chuke
          * hain — loop (startStep + 1) se continue karega, shuru se nahi.
          */
-        startStep: Int = 0
+        startStep: Int = 0,
+        /**
+         * POINT 21: har proof screenshot par callback (summary card me
+         * "kitne proof" dikhane ke liye).
+         */
+        onProof: () -> Unit = {}
     ): FormEngine.RunResult {
         val stepsLog = JSONArray()
         val history = ArrayList<JSONObject>()
@@ -332,7 +337,11 @@ object AgentLoop {
                 } catch (_: Exception) {
                     ""
                 }
-                if (shot.isNotEmpty()) mirrorShot()
+                if (shot.isNotEmpty()) {
+                    mirrorShot()
+                    // POINT 21: proof screenshot ginao (summary card).
+                    try { onProof() } catch (_: Exception) { }
+                }
                 val url = snap.optString("url", "").ifEmpty { currentUrl }
                 val title = snap.optString("title", "")
                 currentUrl = url
@@ -347,6 +356,30 @@ object AgentLoop {
                 // (d) act call — page_analysis ke saath (Operator pehle
                 // page samjhata hai; AI is block + screenshot se samajh ke
                 // action chunta hai)
+                //
+                // POINT 20: mid-run corrections — user ne kaha koi field
+                // galat hai + sahi value di. userProvided me dalo (sensitive
+                // filtering automatic) + history me note taaki brain SIRF
+                // ye field update kare — baaki same run continue (STOP nahi).
+                try {
+                    val cors = com.formmitra.app.agent.CorrectionStore
+                        .take(ctx, runId)
+                    for (c in cors) {
+                        userProvided.put(c.field, c.value)
+                        if (com.formmitra.app.engine.CorrectionPolicy
+                                .isSensitive(c.field)
+                        ) sensitiveKeys.add(c.field)
+                        pushHistory(
+                            "user_correction",
+                            mapOf("field" to c.field, "label" to c.label),
+                            "ok",
+                            "User ne kaha '${c.label}' galat hai — sahi " +
+                                "value user_provided me hai. SIRF ye field " +
+                                "update karo, baaki same run continue rakho."
+                        )
+                        logStep(i, "user_correction", false, c.label.take(80))
+                    }
+                } catch (_: Exception) { }
                 val hArr = JSONArray()
                 history.takeLast(15).forEach { hArr.put(it) }
                 val reqBody = JSONObject()
@@ -472,11 +505,20 @@ object AgentLoop {
                 }
                 val stepMap = engine.jsonToMap(stepJson)
                 val action = (stepMap["action"] as? String)?.trim() ?: ""
+                // CONTRACT SYNC (2026-09-26): act response ka top-level
+                // work_summary (running summary) — done step me fallback.
 
                 // (e) terminal actions — execute nahi hote
                 when (action) {
                     "done" -> {
-                        val summary = ((stepMap["result_summary"] as? String)?.ifEmpty { null }
+                        // CONTRACT SYNC (2026-09-26): act route response ka
+                        // field "work_summary" hai; purana "result_summary"
+                        // fallback ke liye rakha hai.
+                        val respSummary =
+                            res.json?.optString("work_summary", "").orEmpty()
+                        val summary = ((stepMap["work_summary"] as? String)?.ifEmpty { null }
+                            ?: respSummary.ifEmpty { null }
+                            ?: (stepMap["result_summary"] as? String)?.ifEmpty { null }
                             ?: (stepMap["reason"] as? String)?.ifEmpty { null }
                             ?: "Ho gaya ✅")
                         // Submission proof: final screenshot server pe (best-effort)
@@ -508,16 +550,26 @@ object AgentLoop {
                     "needs_user" -> {
                         // Structured prompt (server ne user_prompt object bheja)
                         // → popup dikhao, user bhare, loop AAGE badhega (terminal nahi).
+                        // Point 14: kind="input" ab NON-BLOCKING batch hai —
+                        // handleServerPrompt batch utha ke false deta hai.
                         val promptObj = stepMap["user_prompt"] as? Map<String, Any?>
                         if (promptObj != null) {
+                            val runIdNow = agentRunId ?: effectiveRunId
                             val ok = handleServerPrompt(
                                 ctx, engine, promptObj,
-                                agentRunId ?: effectiveRunId, userProvided, sensitiveKeys, history
+                                runIdNow, userProvided, sensitiveKeys, history
                             )
                             if (!ok) {
+                                // Batch utha? (non-blocking) → park message.
+                                // Nahi → purana timeout/decline message.
+                                val batched = try {
+                                    com.formmitra.app.agent.DetailBatchStore
+                                        .get(ctx, runIdNow) != null
+                                } catch (_: Exception) { false }
                                 return finish(
                                     "needs_user",
-                                    "Aapka jawab nahi mila / mana kiya — kaam ruka hai, app khol ke dekhein"
+                                    if (batched) "[details_batch] Kuch details chahiye — app me bhar dein, kaam apne aap aage badhega"
+                                    else "Aapka jawab nahi mila / mana kiya — kaam ruka hai, app khol ke dekhein"
                                 )
                             }
                             consecErrors = 0
@@ -534,6 +586,80 @@ object AgentLoop {
                         ((stepMap["blocked_reason"] as? String)?.ifEmpty { null }
                             ?: "Rok diya gaya — payment/safety")
                     )
+                    // CONTRACT SYNC (2026-09-26): correct_field — server ka
+                    // mid-run correction step (web/another device se aaya
+                    // correction). CorrectionStore me dalo; agle act() me
+                    // userProvided ke through apply hoga (sensitive
+                    // filtering automatic). Execute nahi hota — continue.
+                    "correct_field" -> {
+                        val field = (stepMap["field"] as? String)
+                            .orEmpty().trim()
+                        val value = (stepMap["value"] as? String).orEmpty()
+                        val label = (stepMap["label"] as? String)
+                            .orEmpty().ifEmpty { field }
+                        if (field.isNotEmpty()) {
+                            try {
+                                com.formmitra.app.agent.CorrectionStore.add(
+                                    ctx, runId, field, label, value
+                                )
+                                if (com.formmitra.app.engine.CorrectionPolicy
+                                        .isSensitive(field)
+                                ) sensitiveKeys.add(field)
+                                userProvided.put(field, value)
+                            } catch (_: Exception) { }
+                            pushHistory(
+                                "correct_field",
+                                mapOf("field" to field, "label" to label),
+                                "ok",
+                                "Server se correction aaya — '$label' update " +
+                                    "karke same run continue."
+                            )
+                            logStep(i, "correct_field", false, label.take(80))
+                        } else {
+                            pushHistory(
+                                "correct_field", stepMap, "error",
+                                "field khaali — ignore"
+                            )
+                        }
+                        consecErrors = 0
+                        continue
+                    }
+                    // Point 14 (SMART DETAIL COLLECTION): server ka compact
+                    // batch — ek saath saari details (one-by-one drip nahi).
+                    // NON-BLOCKING: batch uthao, run park karo (resume state
+                    // rakho), thread ko wait mat karwao. User jawab de to
+                    // WakeWorker usi step se resume karega (DetailStore me
+                    // jawab milenge → auto-fill → loop aage badhega).
+                    // NOTE: contract sync me "details_needed" whitelist me
+                    // aayega (BRAIN_ALLOWED_ACTIONS) — tab tak ye handler
+                    // validation se pehle chalta hai (terminal actions ki
+                    // tarah), taaki server bheje to kaam kare.
+                    "details_needed" -> {
+                        val fields = DetailBatchLogic.validateStep(stepMap)
+                        if (fields == null) {
+                            // Galat batch — purane flow par raho
+                            pushHistory(
+                                "details_needed", stepMap, "error",
+                                "khali/galat batch — ignore"
+                            )
+                            continue
+                        }
+                        val runIdNow = agentRunId ?: effectiveRunId
+                        val handled = handleDetailsNeeded(
+                            ctx, engine, fields, runIdNow, goal,
+                            userProvided, history
+                        )
+                        if (!handled) {
+                            // Batch uth gaya — run park (resume state rakha).
+                            // UI ko batane ke liye summary me marker.
+                            return finish(
+                                "needs_user",
+                                "[details_batch] Kuch details chahiye — app me bhar dein, kaam apne aap aage badhega"
+                            )
+                        }
+                        consecErrors = 0
+                        continue
+                    }
                 }
 
                 // (f) client-side validate
@@ -862,9 +988,126 @@ object AgentLoop {
     }
 
     // =====================================================================
+    // Point 14 — SMART DETAIL COLLECTION (non-blocking).
+    //
+    // Server "details_needed" ka compact batch bhejta hai (ek saath, drip
+    // nahi). Ye handler:
+    //  1. Pehle DetailStore/userProvided me dekhta hai — sab mile to turant
+    //     apply (koi sawal nahi, loop aage badhta hai).
+    //  2. Nahi mile to EKI batch uthata hai (DetailBatchStore — persisted,
+    //     crash-safe) + notification + chat card listener → user jab chahe
+    //     jawab de (koi blocking dialog nahi, koi 10-min timeout nahi).
+    //  3. Batch uthne par FALSE deta hai → caller run park karta hai
+    //     (AgentResume me step saved). Jawab aane par WakeWorker usi step
+    //     se resume karega — tab (1) me sab mil jayega.
+    //
+    // true = sab details mil gayin (loop continue kare);
+    // false = batch uth gaya, run park karo.
+    // =====================================================================
+
+    private fun handleDetailsNeeded(
+        ctx: Context,
+        engine: FormEngine,
+        fields: List<DetailBatchLogic.Field>,
+        runId: String,
+        taskName: String,
+        userProvided: JSONObject,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        // (1) Kya sab kuch pehle se pata hai? (DetailStore + userProvided)
+        val known = LinkedHashMap<String, String>()
+        try {
+            val ks = userProvided.keys()
+            while (ks.hasNext()) {
+                val k = ks.next()
+                val v = userProvided.optString(k, "")
+                if (v.isNotEmpty()) known[k] = v
+            }
+        } catch (_: Exception) { }
+        // DetailStore (device-local saved details) bhi dekho
+        try {
+            val stored = DetailStore.loadAll(ctx)
+            for ((k, v) in stored) {
+                if (v.isNotEmpty() && !known.containsKey(k)) known[k] = v
+            }
+        } catch (_: Exception) { }
+        val missing = DetailBatchLogic.missingFields(fields, known)
+        if (missing.isEmpty()) {
+            // Sab mil gaya — userProvided me dalo (agle act() me jayega)
+            for (f in fields) {
+                val v = known[f.key].orEmpty()
+                if (v.isNotEmpty()) {
+                    try { userProvided.put(f.key, v) } catch (_: Exception) { }
+                }
+            }
+            history.add(
+                JSONObject().put("action", "details_autofill")
+                    .put("result", "ok")
+                    .put("detail", "batch auto-fill: ${fields.map { it.key }}".take(200))
+            )
+            try {
+                AiUsage.logPatternHit(AiUsage.P_DETAIL)
+            } catch (_: Exception) { }
+            return true
+        }
+        // (2) Batch uthao — persisted + notification + chat card.
+        // Sirf missing fields puchho (pata wale dobara nahi).
+        raiseDetailBatch(ctx, runId, taskName, missing, history)
+        try {
+            FlowAnnouncer.say(
+                ctx, "Kuch details chahiye — app khol ke bhar do, kaam apne aap aage badhega."
+            )
+        } catch (_: Exception) { }
+        return false
+    }
+
+    /**
+     * Shared batch-raiser (handleDetailsNeeded + handleServerPrompt/input
+     * dono use karte hain): batch persist + history log + compact
+     * notification. Koi thread block nahi hota.
+     */
+    private fun raiseDetailBatch(
+        ctx: Context,
+        runId: String,
+        taskName: String,
+        fields: List<DetailBatchLogic.Field>,
+        history: ArrayList<JSONObject>
+    ) {
+        try {
+            com.formmitra.app.agent.DetailBatchStore.raise(
+                ctx, runId, taskName, fields
+            )
+        } catch (_: Exception) { }
+        history.add(
+            JSONObject().put("action", "detail_asked")
+                .put("result", "pending")
+                .put(
+                    "detail",
+                    "batch: ${fields.map { "${it.key} (${it.why})" }}".take(300)
+                )
+        )
+        try {
+            val summary = DetailBatchLogic.compactSummary(taskName, fields)
+            com.formmitra.app.agent.NotifCenter.notify(
+                ctx, com.formmitra.app.agent.NotifCenter.Cat.DETAIL,
+                "📝 Kuch details chahiye",
+                summary.take(200),
+                deepTab = "/agent",
+                deepRunId = runId,
+                key = "details_$runId"
+            )
+        } catch (_: Exception) { }
+    }
+
+    // =====================================================================
     // Interactive user prompts (OTP / input / choice / payment).
     // Loop BLOCK karke user ka jawab wait karta hai; jawab mile to kaam
     // aage badhta hai. Timeout/cancel → false → caller needs_user finish.
+    //
+    // Point 14: kind="input" AB BLOCK NAHI KARTA — wo upar handleDetailsNeeded
+    // wala non-blocking batch flow use karta hai. Blocking sirf gates ke
+    // liye: otp | login | device_auth | payment | document (ye pehle se hain,
+    // inko nahi toda).
     // =====================================================================
 
     /**
@@ -914,7 +1157,10 @@ object AgentLoop {
         sensitiveKeys: MutableSet<String>,
         history: ArrayList<JSONObject>
     ): Boolean {
-        val kind = (prompt["kind"] as? String)?.trim()?.ifEmpty { null } ?: "input"
+        // CONTRACT SYNC (2026-09-26): kind canonicalize — server "choice"
+        // ko "option_choice" bhejta hai; purana "choice" bhi accept.
+        val kind = ServerKinds.canonicalize(prompt["kind"] as? String)
+            ?: "input"
         val req = buildPromptRequest(runId, kind, prompt)
         // NOTE: duplicate notification nahi — UserPrompt.ask par FmApp ka
         // raised-listener NotifCenter se notify + PendingPrompt persist
@@ -926,13 +1172,24 @@ object AgentLoop {
         if (kind == "login") {
             // Saved credentials ho to apne aap login — user se mat puchho
             if (tryAutoLogin(ctx, engine, runId, sensitiveKeys, history)) return true
+            // POINT 19: saved login hai par auto-fill nahi hua → user ko
+            // CHOICE do (retry / naya login / saved hatao). true = ho gaya.
+            if (offerSavedLoginChoice(ctx, engine, runId, sensitiveKeys, history)) {
+                return true
+            }
         }
         if (kind == "document") {
             // Vault me sahi document ho to apne aap attach
             if (tryAutoDocument(ctx, engine, req.docType, userProvided, history)) return true
         }
-        if (kind == "choice") {
+        if (kind == "choice" || kind == ServerKinds.OPTION_CHOICE) {
             return handleChoicePrompt(ctx, engine, req, userProvided, history)
+        }
+        // CONTRACT SYNC (2026-09-26): destructive_confirm — server ka
+        // destructive gate. HAMESHA user confirmation; permanent automation
+        // approval ise bypass NAHI kar sakta. Background-safe (UserPrompt).
+        if (kind == ServerKinds.DESTRUCTIVE_CONFIRM) {
+            return handleDestructiveConfirm(ctx, runId, prompt, history)
         }
         if (kind == "device_auth") {
             // User-gated #2 (biometric/device PIN): sirf user de sakta hai.
@@ -950,13 +1207,46 @@ object AgentLoop {
             )
             return ok
         }
+        // POINT 22: run ke beech Card lock → chat me one-tap unlock popup.
+        // Run park hota hai (false); unlock par apne aap resume — restart nahi.
+        if (kind == "card_unlock" || kind == "card_unlock_needed") {
+            val cardId = (prompt["card_id"] as? String).orEmpty()
+                .ifEmpty { (prompt["cardId"] as? String).orEmpty() }
+            val cardName = (prompt["card_name"] as? String).orEmpty()
+                .ifEmpty { "Card" }
+            try {
+                val taskLabel = (prompt["title"] as? String).orEmpty()
+                    .ifEmpty { "kaam" }
+                com.formmitra.app.agent.CardUnlockNeeded.raise(
+                    ctx, runId, taskLabel.take(80), cardId, cardName
+                )
+                FlowAnnouncer.say(
+                    ctx, "Card lock ho gaya hai — chat me kholo, kaam apne aap aage badhega."
+                )
+                history.add(
+                    JSONObject().put("action", "card_unlock_needed")
+                        .put("result", "parked")
+                        .put("detail", "card $cardId lock — user unlock karega to resume")
+                )
+            } catch (_: Exception) { }
+            return false
+        }
         // ---- L1-UPGRADE: input — DetailStore (device-local saved details)
-        // se jo pata ho wo seedha bharo; sirf jo NA mile uske liye puchho
-        // (dialog me pata values pre-filled dikhengi). ----
+        // se jo pata ho wo seedha bharo; sirf jo NA mile uske liye puchho.
+        // Point 14: NA mile to BLOCKING dialog NAHI — non-blocking batch
+        // (DetailBatchStore) uthao aur turant FALSE (caller run park karega,
+        // resume state rakha jayega; 10-min timeout wala block hata diya).
+        // Gates (otp/login/device_auth/payment/document) pehle jaise hi
+        // blocking rahenge — unko nahi toda. ----
         var askReq = req
         if (kind == "input") {
             if (tryAutoFillInput(ctx, engine, req, prompt, userProvided, sensitiveKeys, history)) {
                 return true
+            }
+            val fields = DetailBatchLogic.parseFields(prompt["fields"])
+            if (fields.isNotEmpty()) {
+                raiseDetailBatch(ctx, runId, req.title, fields, history)
+                return false
             }
             val prefill = collectKnownInputValues(ctx, req)
             if (prefill.isNotEmpty()) askReq = req.copy(prefill = prefill)
@@ -1105,6 +1395,89 @@ object AgentLoop {
     }
 
     /**
+     * POINT 19: saved login hai par auto-fill nahi hua (ya fail hua) →
+     * user ko CHOICE: "saved login use karo" (dobara try) / "naya login do"
+     * / "saved hatao". Username mask dikhta hai, password kabhi nahi.
+     * @return true = login ho gaya (aage badho); false = manual dialog dikhao.
+     */
+    private fun offerSavedLoginChoice(
+        ctx: Context,
+        engine: FormEngine,
+        runId: String,
+        sensitiveKeys: MutableSet<String>,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        val domain = try {
+            com.formmitra.app.agent.SiteCredentialStore.domainOf(engine.pageUrl())
+        } catch (_: Exception) { "" }
+        if (domain.isEmpty()) return false
+        val creds = try {
+            com.formmitra.app.agent.SiteCredentialStore.get(ctx, domain)
+        } catch (_: Exception) { null } ?: return false
+        val maskedUser = maskUsername(creds.first)
+        val req = UserPrompt.Request(
+            runId = runId,
+            kind = "choice",
+            title = "Login kaise karu?",
+            message = "$domain ke liye saved login hai ($maskedUser). " +
+                "Password kabhi dikhaya nahi jata.",
+            options = listOf(
+                "saved login use karo",
+                "naya login do",
+                "saved hatao"
+            )
+        )
+        val ansStr = try { UserPrompt.ask(req) } catch (_: Exception) { null }
+            ?: return false
+        val ans = try { JSONObject(ansStr) } catch (_: Exception) { return false }
+        if (!ans.optBoolean("approved", false)) return false
+        return when (ans.optString("choice", "")) {
+            "saved login use karo" -> {
+                // Dobara try (transient fail ho sakta tha).
+                val ok = fillLoginFields(
+                    engine, creds.first, creds.second, sensitiveKeys, history
+                )
+                if (ok) {
+                    history.add(
+                        JSONObject().put("action", "fill_login_retry")
+                            .put("result", "ok")
+                            .put("detail", "saved credentials retry (domain=$domain)")
+                    )
+                    com.formmitra.app.engine.AiUsage.logPatternHit(
+                        com.formmitra.app.engine.AiUsage.P_LOGIN
+                    )
+                }
+                ok
+            }
+            "saved hatao" -> {
+                try {
+                    com.formmitra.app.agent.SiteCredentialStore
+                        .clear(ctx, domain)
+                } catch (_: Exception) { }
+                history.add(
+                    JSONObject().put("action", "saved_login_deleted")
+                        .put("result", "ok").put("detail", "domain=$domain")
+                )
+                false // manual dialog ab naya login lega
+            }
+            else -> false // "naya login do" → manual dialog
+        }
+    }
+
+    /** Username mask: "r•••@gmail.com" — poora kabhi nahi. */
+    private fun maskUsername(u: String): String {
+        if (u.isEmpty()) return "•••"
+        val at = u.indexOf('@')
+        return if (at > 1) {
+            u[0] + "•••" + u.substring(at)
+        } else if (u.length > 4) {
+            u.take(2) + "•••" + u.takeLast(2)
+        } else {
+            "•••"
+        }
+    }
+
+    /**
      * L1-UPGRADE: vault document apne aap attach.
      * true = unambiguous doc mila aur set/upload ho gaya.
      */
@@ -1246,6 +1619,58 @@ object AgentLoop {
                 .put("result", "ok").put("detail", choice.take(200))
         )
         return true
+    }
+
+    /**
+     * CONTRACT SYNC (2026-09-26): destructive_confirm — server ka
+     * destructive gate (cancel/withdraw/delete/account-close).
+     *
+     * HAMESHA blocking confirmation — permanent automation approval ise
+     * bypass NAHI kar sakta, koi "hamesha allow" nahi. UserPrompt se
+     * background-safe: notification → dialog → jawab.
+     *
+     * @return true = user ne "Haan karo" dabaya (aage badho);
+     *         false = mana/timeout (run park).
+     */
+    private fun handleDestructiveConfirm(
+        ctx: Context,
+        runId: String,
+        prompt: Map<String, Any?>,
+        history: ArrayList<JSONObject>
+    ): Boolean {
+        val what = (prompt["message"] as? String).orEmpty()
+            .ifEmpty { (prompt["title"] as? String).orEmpty() }
+            .ifEmpty { (prompt["action_label"] as? String).orEmpty() }
+            .ifEmpty { (prompt["label"] as? String).orEmpty() }
+            .ifEmpty { "ye kaam" }
+        val req = UserPrompt.Request(
+            runId = runId,
+            kind = ServerKinds.DESTRUCTIVE_CONFIRM,
+            title = "Pakka karna hai?",
+            message = what
+        )
+        val ansStr = try { UserPrompt.ask(req) } catch (_: Exception) { null }
+            ?: return false
+        val ans = try { JSONObject(ansStr) } catch (_: Exception) { return false }
+        val ok = ans.optBoolean("approved", false)
+        history.add(
+            JSONObject().put("action", "destructive_confirm")
+                .put("result", if (ok) "approved" else "declined")
+                .put("detail", what.take(200))
+        )
+        // Quality bar 6: har gate decision audit trail me.
+        try {
+            com.formmitra.app.agent.GateAudit.log(
+                ctx, "destructive_confirm", runId,
+                if (ok) "approved" else "declined", what.take(200)
+            )
+        } catch (_: Exception) { }
+        if (!ok) {
+            try {
+                FlowAnnouncer.say(ctx, "Theek hai — kuch nahi kiya.")
+            } catch (_: Exception) { }
+        }
+        return ok
     }
 
     /** Login fields bharo + submit dabao (auto aur manual dono yahi use karte hain). */
@@ -1664,6 +2089,19 @@ object AgentLoop {
             )
         } catch (_: Exception) { }
         val ansStr = UserPrompt.ask(req)
+        // POINT 15 + QUALITY BAR 6: har payment decision audit trail me.
+        fun auditPayment(status: String, extra: String = "") {
+            try {
+                com.formmitra.app.agent.GateAudit.log(
+                    ctx,
+                    "payment",
+                    runId,
+                    if (status == "verified") "verified" else "decided",
+                    "status=$status amount=${pay?.amount ?: ""} " +
+                        "merchant=${pay?.merchant ?: ""} $extra".trim()
+                )
+            } catch (_: Exception) { }
+        }
         if (ansStr == null) {
             try {
                 AgentApi.patchPayment(
@@ -1671,6 +2109,7 @@ object AgentLoop {
                     JSONObject().put("status", "failed").put("reason", "timeout")
                 )
             } catch (_: Exception) { }
+            auditPayment("failed", "reason=timeout")
             return "timeout"
         }
         val ans = try { JSONObject(ansStr) } catch (_: Exception) { JSONObject() }
@@ -1681,6 +2120,7 @@ object AgentLoop {
                     JSONObject().put("status", "failed").put("reason", "declined")
                 )
             } catch (_: Exception) { }
+            auditPayment("failed", "reason=declined")
             return "declined"
         }
         if (!ans.optBoolean("payment_done", false)) {
@@ -1691,6 +2131,7 @@ object AgentLoop {
                         .put("reason", ans.optString("reason", "unknown"))
                 )
             } catch (_: Exception) { }
+            auditPayment("failed", "reason=${ans.optString("reason", "unknown")}")
             return "timeout"
         }
         val method = ans.optString("method", "")
@@ -1700,6 +2141,7 @@ object AgentLoop {
                 JSONObject().put("status", "paid_claimed").put("method", method)
             )
         } catch (_: Exception) { }
+        auditPayment("paid_claimed", "method=$method")
         // Verify: site par success keywords dhoondo (max 3 round, 3s gap)
         repeat(3) {
             val text = try {
@@ -1715,6 +2157,7 @@ object AgentLoop {
                             .put("verified_at", System.currentTimeMillis())
                     )
                 } catch (_: Exception) { }
+                auditPayment("verified", "site-success-text mila")
                 return "verified"
             }
             try { Thread.sleep(3000) } catch (_: Exception) { }
@@ -1725,6 +2168,7 @@ object AgentLoop {
                 JSONObject().put("status", "failed").put("reason", "unverified")
             )
         } catch (_: Exception) { }
+        auditPayment("failed", "reason=unverified")
         return "unverified"
     }
 

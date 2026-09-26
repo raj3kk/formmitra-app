@@ -107,6 +107,36 @@ run_test_v29_realtime() {
 }
 run_test_v29_realtime
 
+# Point 14: DetailBatchLogic (pure Kotlin, no Android)
+run_test selftest_details SelfTestDetailsKt \
+  "$SRC/engine/DetailBatchLogic.kt" \
+  "$APP/tools/selftest/SelfTestDetails.kt"
+
+# Point 15 + 16: GateLogic + DocCompressPolicy (pure Kotlin, no Android)
+run_test selftest_gates SelfTestGatesKt \
+  "$SRC/engine/GateLogic.kt" \
+  "$SRC/engine/DocCompressPolicy.kt" \
+  "$APP/tools/selftest/SelfTestGates.kt"
+
+# Point 24 (revised): CardUnlockPolicy (pure Kotlin, no Android)
+run_test selftest_unlock SelfTestUnlockKt \
+  "$SRC/engine/CardUnlockPolicy.kt" \
+  "$APP/tools/selftest/SelfTestUnlock.kt"
+
+# Point 26 (+clarification): SmsOtpPolicy — no-nagging (pure Kotlin)
+run_test selftest_smsotp SelfTestSmsOtpKt \
+  "$SRC/engine/SmsOtpPolicy.kt" \
+  "$APP/tools/selftest/SelfTestSmsOtp.kt"
+
+# CONTRACT SYNC (2026-09-26): server authoritative vocabulary — whitelist +
+# spec mapping + kinds + plan fields + PIN actions + operator commands +
+# events + endpoints. Pinned counts (koi miss = FAIL).
+run_test selftest_contract SelfTestContractKt \
+  "$SRC/engine/AgentLoopLogic.kt" \
+  "$SRC/engine/FormStepLogic.kt" \
+  "$SRC/engine/GateLogic.kt" \
+  "$APP/tools/selftest/SelfTestContract.kt"
+
 echo "==============================="
 echo "TOTAL PASS: $TOTAL_PASS"
 echo "TOTAL FAILURES: $TOTAL_FAIL"

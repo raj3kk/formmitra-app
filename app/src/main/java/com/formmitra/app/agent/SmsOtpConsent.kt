@@ -39,6 +39,11 @@ object SmsOtpConsent {
     var onOtp: ((String) -> Unit)? = null
     /** Consent dialog available hua (button enable / auto-launch ke liye). */
     var onConsentReady: (() -> Unit)? = null
+    /**
+     * POINT 26 (no-nagging): user ne consent dialog cancel/deny kiya →
+     * caller denied persist karega (dobara auto prompt nahi).
+     */
+    var onDenied: (() -> Unit)? = null
 
     fun startListening(ctx: Context) {
         if (receiver != null) return
@@ -122,6 +127,11 @@ object SmsOtpConsent {
                     Log.i(TAG, "OTP parsed from consented SMS")
                     try { onOtp?.invoke(otp) } catch (_: Exception) { }
                 }
+            } else {
+                // POINT 26: user ne consent cancel/deny kiya → no-nagging:
+                // caller denied persist karega, manual flow chalega.
+                Log.i(TAG, "SMS consent denied/cancelled by user")
+                try { onDenied?.invoke() } catch (_: Exception) { }
             }
         } catch (t: Throwable) {
             Log.w(TAG, "handleActivityResult failed", t)
@@ -151,6 +161,7 @@ object SmsOtpConsent {
         consentIntent = null
         onOtp = null
         onConsentReady = null
+        onDenied = null
         activityRef = null
         try {
             val br = receiver

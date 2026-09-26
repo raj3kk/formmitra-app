@@ -24,6 +24,9 @@ import com.formmitra.app.engine.Standalone
 import com.formmitra.app.engine.UserPrompt
 import com.formmitra.app.engine.PrecheckLogic
 import com.formmitra.app.engine.AiUsage
+import com.formmitra.app.engine.CardUnlockPolicy
+import com.formmitra.app.engine.TrackOfferPolicy
+import com.formmitra.app.engine.DestructivePolicy
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -73,10 +76,16 @@ class AgentChatView(
     private lateinit var categoryChip: TextView
 
     // v24: active FormMitra Card — chat + automation dono me bind hota hai.
-    // Token memory-only (CardStore); PIN kabhi persist nahi hota.
+    // POINT 24 (revised): unlock PERSISTENT hai — memory token ke saath
+    // CardStore me unlock flag + encrypted token (koi auto re-lock nahi).
     private var activeCardId: String? = null
     private var activeCardName: String? = null
     private var activeCardToken: String? = null
+
+    /** POINT 24: header me manual lock/unlock button (prominent). */
+    private lateinit var lockBtn: Button
+    /** POINT 24: is card ke liye entry-PIN is session me dikhaya (nag nahi). */
+    private var pinPromptShownFor: String? = null
 
     /**
      * v24-refine (AI-trained conversational agent): card-create Q&A mode —
@@ -91,6 +100,7 @@ class AgentChatView(
 
     /** Card select/unlock hua — chat + aage ke automation dono me bind karo. */
     fun setActiveCard(cardId: String?, cardName: String?, cardToken: String?) {
+        val switched = cardId != activeCardId
         activeCardId = cardId
         activeCardName = cardName
         activeCardToken = cardToken
@@ -98,6 +108,20 @@ class AgentChatView(
         try {
             AgentApi.setAutomationCard(cardId, cardToken)
         } catch (_: Exception) { }
+        // POINT 24: card switch → naya card locked ho to PIN lagega
+        // (sirf selected card unlock hota hai — multi-card).
+        if (switched) pinPromptShownFor = null
+        try { refreshLockBtn() } catch (_: Exception) { }
+    }
+
+    /** POINT 24: sign-out → chat ka card state saaf (lockAll pehle ho chuka). */
+    fun onLoggedOut() {
+        activeCardId = null
+        activeCardName = null
+        activeCardToken = null
+        pinPromptShownFor = null
+        cardCachedDetails.clear()
+        try { refreshLockBtn() } catch (_: Exception) { }
     }
 
     /**
@@ -184,6 +208,16 @@ class AgentChatView(
     // task status polling (sirf Home/chat visible ho tabhi)
     private val pollHandler = Handler(Looper.getMainLooper())
     private var polling = false
+    /** Point 14: detail batch listener ek hi baar register ho. */
+    private var detailBatchListenerRegistered = false
+    // POINT 25: tracking action-offer.
+    private var trackOfferListenerRegistered = false
+    private val trackOfferCards = mutableMapOf<String, View>()
+    // POINT 22: card unlock needed.
+    private var cardUnlockListenerRegistered = false
+    private val cardUnlockCards = mutableMapOf<String, View>()
+    /** Dikhaye gaye batch cards (runId → card view) — duplicate na dikhe. */
+    private val detailBatchCards = mutableMapOf<String, View>()
     private val pollRunnable = object : Runnable {
         override fun run() {
             if (!polling) return
@@ -231,6 +265,39 @@ class AgentChatView(
             minimumWidth = 0
             setOnClickListener { showDetailsCard() }
         })
+        // POINT 2+12 (merged): chat ↔ fullscreen live operator view toggle.
+        // Yehi fullscreen view Profile ke "Live Operator" se khulta hai —
+        // ek hi OperatorView, do entry points.
+        header.addView(Button(context).apply {
+            text = "🖥️ Live"
+            textSize = 13f
+            minimumWidth = 0
+            setOnClickListener {
+                try {
+                    val i = android.content.Intent(
+                        context,
+                        com.formmitra.app.agent.OperatorView::class.java
+                    )
+                    // Active run ka context (agar ho) — live view wahi dikhaye.
+                    com.formmitra.app.engine.FormRunService.activeTaskId
+                        ?.let { i.putExtra("run_id", it) }
+                    context.startActivity(i)
+                } catch (t: Throwable) {
+                    android.util.Log.e("FmChat", "live view open failed", t)
+                    toast("⚠️ Live view nahi khul paya — dobara try karo")
+                }
+            }
+        })
+        // POINT 24 (revised): manual "Lock karo" — prominent, header me.
+        // Unlock sirf yahan se ya sign-out se tootega (koi auto re-lock nahi).
+        lockBtn = Button(context).apply {
+            text = "🔓 Card kholo"
+            textSize = 13f
+            minimumWidth = 0
+            visibility = View.GONE
+            setOnClickListener { onLockBtnTapped() }
+        }
+        header.addView(lockBtn)
         addView(header)
 
         // v28 P6/P7: category picker + purane kaam row (Agent tab ke andar).
@@ -808,6 +875,698 @@ class AgentChatView(
      * agent seedha task banata hai. Galat detail hui to run ke beech
      * detail-request loop (K4) se maang lega.
      */
+    // ---------- Point 14: SMART DETAIL COLLECTION (compact batch card) ----------
+    //
+    // Server "details_needed" ka compact batch bhejta hai (ya loop kind=input
+    // par batch banata hai). NON-BLOCKING: user jab chahe bhare — koi modal
+    // dialog nahi, kaam park hai (resume state saved). Ek hi card me saare
+    // fields + har field ke liye "kyun chahiye" (simple Hinglish, jargon nahi).
+
+    /** Tab khulne par pending batches dikhao (crash ke baad bhi bache hain). */
+    private fun checkPendingDetailBatches() {
+        try {
+            val batches = DetailBatchStore.pending(context)
+            for (b in batches) {
+                if (!detailBatchCards.containsKey(b.runId)) {
+                    addDetailBatchCard(b)
+                }
+            }
+        } catch (_: Exception) { }
+    }
+
+    /** Ek compact card: saare fields (label + kyun + input) + Bhejo button. */
+    private fun addDetailBatchCard(batch: DetailBatchStore.Batch) {
+        try {
+            if (detailBatchCards.containsKey(batch.runId)) return
+            val card = LinearLayout(context).apply {
+                orientation = VERTICAL
+                val d = GradientDrawable()
+                d.setColor(Color.parseColor("#FFF8E1"))
+                d.setStroke(dp(2), Color.parseColor("#FFB300"))
+                d.cornerRadius = dp(14).toFloat()
+                background = d
+                setPadding(dp(16), dp(14), dp(16), dp(14))
+            }
+            val lp = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(6), 0, dp(6)) }
+
+            card.addView(TextView(context).apply {
+                text = "📝 Kuch details chahiye"
+                textSize = 17f
+                setTypeface(null, Typeface.BOLD)
+                setTextColor(Color.parseColor("#202124"))
+            })
+            if (batch.taskName.isNotEmpty()) {
+                card.addView(TextView(context).apply {
+                    text = batch.taskName
+                    textSize = 13f
+                    setTextColor(Color.parseColor("#5F6368"))
+                    setPadding(0, dp(2), 0, dp(6))
+                })
+            }
+
+            // Har field: label + "kyun chahiye" + input
+            val inputs = LinkedHashMap<String, EditText>()
+            for (f in batch.fields) {
+                card.addView(TextView(context).apply {
+                    text = f.label
+                    textSize = 15f
+                    setTypeface(null, Typeface.BOLD)
+                    setTextColor(Color.parseColor("#202124"))
+                    setPadding(0, dp(8), 0, 0)
+                })
+                card.addView(TextView(context).apply {
+                    // Kyun chahiye — simple Hinglish, jargon nahi
+                    text = "❓ ${f.why}"
+                    textSize = 13f
+                    setTextColor(Color.parseColor("#5F6368"))
+                    setPadding(0, 0, 0, dp(4))
+                })
+                if (f.type == "choice" && f.options.isNotEmpty()) {
+                    // Choice: option buttons (ek tap me select)
+                    val optRow = LinearLayout(context).apply {
+                        orientation = HORIZONTAL
+                    }
+                    var selected = ""
+                    for (opt in f.options) {
+                        val btn = Button(context).apply {
+                            text = opt
+                            textSize = 13f
+                            minimumWidth = 0
+                            setPadding(dp(12), dp(6), dp(12), dp(6))
+                        }
+                        btn.setOnClickListener {
+                            selected = opt
+                            // Sabko reset, isko highlight
+                            for (i in 0 until optRow.childCount) {
+                                (optRow.getChildAt(i) as? Button)?.let {
+                                    it.setBackgroundColor(Color.parseColor("#E0E0E0"))
+                                }
+                            }
+                            btn.setBackgroundColor(Color.parseColor("#C8E6C9"))
+                            inputs[f.key]?.setText(opt)
+                        }
+                        optRow.addView(btn)
+                    }
+                    // Hidden EditText taaki submit uniform rahe
+                    val hidden = EditText(context).apply { visibility = View.GONE }
+                    inputs[f.key] = hidden
+                    card.addView(hidden)
+                    card.addView(optRow)
+                } else {
+                    val et = EditText(context).apply {
+                        hint = f.label
+                        textSize = 15f
+                        inputType = when (f.type) {
+                            "phone" -> android.text.InputType.TYPE_CLASS_PHONE
+                            "email" -> android.text.InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
+                            "number" -> android.text.InputType.TYPE_CLASS_NUMBER
+                            else -> android.text.InputType.TYPE_CLASS_TEXT
+                        }
+                        setPadding(dp(12), dp(10), dp(12), dp(10))
+                        val bg = GradientDrawable()
+                        bg.setColor(Color.WHITE)
+                        bg.setStroke(dp(1), Color.parseColor("#BDBDBD"))
+                        bg.cornerRadius = dp(8).toFloat()
+                        background = bg
+                    }
+                    // Pehle di hui value ho to dikhao (audit se)
+                    val prev = batch.answers[f.key]
+                    if (!prev.isNullOrEmpty()) et.setText(prev)
+                    inputs[f.key] = et
+                    card.addView(et)
+                }
+            }
+
+            card.addView(TextView(context).apply {
+                text = "Bhar ke Bhejo dabao — kaam apne aap aage badhega. ⏳"
+                textSize = 13f
+                setTextColor(Color.parseColor("#5F6368"))
+                setPadding(0, dp(8), 0, 0)
+            })
+
+            val sendBtn = Button(context).apply {
+                text = "Bhejo ➤"
+                textSize = 15f
+                setTextColor(Color.WHITE)
+                val d = GradientDrawable()
+                d.setColor(Color.parseColor("#2E9E5B"))
+                d.cornerRadius = dp(10).toFloat()
+                background = d
+                layoutParams = LayoutParams(
+                    LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+                ).apply { setMargins(0, dp(10), 0, 0) }
+            }
+            val statusView = TextView(context).apply {
+                textSize = 13f
+                setPadding(0, dp(6), 0, 0)
+                visibility = View.GONE
+            }
+            card.addView(statusView)
+            sendBtn.setOnClickListener {
+                submitDetailBatch(batch, inputs, sendBtn, statusView)
+            }
+            card.addView(sendBtn)
+
+            messageList.addView(card, lp)
+            detailBatchCards[batch.runId] = card
+            scrollToBottom()
+        } catch (t: Throwable) {
+            android.util.Log.e("FmDetailBatch", "card failed", t)
+        }
+    }
+
+    /**
+     * POINT 28: line me kaam ho to chat entry par ek baar bubble.
+     * (Har entry par nahi — queue signature badle tabhi.)
+     */
+    private var lastQueueSig: String = ""
+    private fun checkWorkQueue() {
+        Thread({
+            try {
+                val sig = com.formmitra.app.engine.FormRunService
+                    .queueSignature(context)
+                if (sig.isEmpty() || sig == lastQueueSig) return@Thread
+                lastQueueSig = sig
+                val q = com.formmitra.app.engine.FormRunService
+                    .queueSnapshot(context)
+                if (q.isEmpty()) return@Thread
+                val names = q.take(3).joinToString(", ") { "\"${it.name}\"" }
+                val more = if (q.size > 3) " +${q.size - 3} aur" else ""
+                val active = com.formmitra.app.engine.FormRunService
+                    .activeTaskId
+                post {
+                    addBubble(
+                        "📋 Line me ${q.size} kaam: $names$more\n" +
+                            (if (active != null)
+                                "Pehla khatam hote hi apne aap shuru honge."
+                             else "Jald shuru honge."),
+                        false
+                    )
+                    scrollToBottom()
+                }
+            } catch (_: Exception) { }
+        }, "fm-queue-check").start()
+    }
+
+    /**
+     * POINT 25: tracking action-offer card — "Naya certificate nikalun?
+     * [Haan, shuru karo]". Haan → POST /api/agent/runs {goal, url} (koi
+     * auto-run nahi — sirf user ke tap par).
+     */
+    private fun addTrackOfferCard(offer: TrackOffer.Offer) {
+        try {
+            if (trackOfferCards.containsKey(offer.offerId)) return
+            val card = LinearLayout(context).apply {
+                orientation = VERTICAL
+                val d = GradientDrawable()
+                d.setColor(Color.parseColor("#E8F5E9"))
+                d.setStroke(dp(2), Color.parseColor("#2E9E5B"))
+                d.cornerRadius = dp(14).toFloat()
+                background = d
+                setPadding(dp(16), dp(14), dp(16), dp(14))
+            }
+            val lp = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(6), 0, dp(6)) }
+
+            card.addView(TextView(context).apply {
+                text = TrackOfferPolicy.cardText(
+                    offer.title, offer.detail, offer.question
+                )
+                textSize = 15f
+                setTextColor(Color.parseColor("#202124"))
+            })
+
+            val btnRow = LinearLayout(context).apply {
+                orientation = HORIZONTAL
+                setPadding(0, dp(10), 0, 0)
+            }
+            val acceptBtn = Button(context).apply {
+                text = TrackOfferPolicy.acceptLabel()
+                textSize = 14f
+                setTextColor(Color.WHITE)
+                val d = GradientDrawable()
+                d.setColor(Color.parseColor("#2E9E5B"))
+                d.cornerRadius = dp(10).toFloat()
+                background = d
+            }
+            val declineBtn = Button(context).apply {
+                text = TrackOfferPolicy.declineLabel()
+                textSize = 14f
+                layoutParams = LayoutParams(
+                    LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT
+                ).apply { leftMargin = dp(8) }
+            }
+            acceptBtn.setOnClickListener {
+                acceptBtn.isEnabled = false
+                declineBtn.isEnabled = false
+                toast("🚀 Kaam shuru kar raha hun…")
+                Thread({
+                    val runId = try {
+                        AgentApi.startActionRun(context, offer.goal, offer.url)
+                    } catch (_: Exception) { null }
+                    post {
+                        try {
+                            messageList.removeView(card)
+                            trackOfferCards.remove(offer.offerId)
+                        } catch (_: Exception) { }
+                        TrackOffer.dismissUnseen(context, offer.offerId)
+                        if (runId != null) {
+                            addBubble(TrackOfferPolicy.startedText(), false)
+                            VoiceOutput.speak(context, "Kaam shuru ho gaya.")
+                        } else {
+                            addBubble(TrackOfferPolicy.failedText(), false)
+                            toast(TrackOfferPolicy.failedText())
+                        }
+                        scrollToBottom()
+                    }
+                }, "track-offer-accept").start()
+            }
+            declineBtn.setOnClickListener {
+                try {
+                    messageList.removeView(card)
+                    trackOfferCards.remove(offer.offerId)
+                } catch (_: Exception) { }
+                TrackOffer.dismissUnseen(context, offer.offerId)
+                toast("Theek hai — offer hata diya")
+            }
+            btnRow.addView(acceptBtn)
+            btnRow.addView(declineBtn)
+            card.addView(btnRow)
+
+            messageList.addView(card, lp)
+            trackOfferCards[offer.offerId] = card
+            scrollToBottom()
+        } catch (t: Throwable) {
+            android.util.Log.e("FmTrackOffer", "card failed", t)
+        }
+    }
+
+    // ================= POINTS 17 / 20 / 21 / 22 =================
+
+    /** POINT 17: pending handoffs → "Iska status track karu?" cards. */
+    private fun checkTrackHandoff() {
+        Thread({
+            try {
+                val pend = TrackHandoffStore.takePending(context)
+                if (pend.isNotEmpty()) {
+                    post { pend.forEach { addTrackHandoffCard(it) } }
+                }
+            } catch (_: Exception) { }
+        }, "fm-handoff-check").start()
+    }
+
+    private fun addTrackHandoffCard(h: TrackHandoffStore.Handoff) {
+        try {
+            val card = LinearLayout(context).apply {
+                orientation = VERTICAL
+                val d = GradientDrawable()
+                d.setColor(Color.parseColor("#E3F2FD"))
+                d.setStroke(dp(2), Color.parseColor("#1E88E5"))
+                d.cornerRadius = dp(14).toFloat()
+                background = d
+                setPadding(dp(16), dp(14), dp(16), dp(14))
+            }
+            val lp = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(6), 0, dp(6)) }
+            card.addView(TextView(context).apply {
+                text = com.formmitra.app.engine.TrackHandoffPolicy
+                    .cardText(h.workName)
+                textSize = 15f
+                setTextColor(Color.parseColor("#202124"))
+            })
+            val row = LinearLayout(context).apply {
+                orientation = HORIZONTAL
+                setPadding(0, dp(10), 0, 0)
+            }
+            val yesBtn = Button(context).apply {
+                text = com.formmitra.app.engine.TrackHandoffPolicy.acceptLabel()
+                textSize = 14f
+                setTextColor(Color.WHITE)
+                val d = GradientDrawable()
+                d.setColor(Color.parseColor("#1E88E5"))
+                d.cornerRadius = dp(10).toFloat()
+                background = d
+            }
+            val noBtn = Button(context).apply {
+                text = com.formmitra.app.engine.TrackHandoffPolicy.declineLabel()
+                textSize = 14f
+                layoutParams = LayoutParams(
+                    LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT
+                ).apply { leftMargin = dp(8) }
+            }
+            yesBtn.setOnClickListener {
+                yesBtn.isEnabled = false
+                noBtn.isEnabled = false
+                toast("🔍 Tracking shuru kar raha hun…")
+                Thread({
+                    // Server-provided auto-detected category: label se type
+                    // (server jo type bhejta hai wahi store hota hai).
+                    val type = com.formmitra.app.engine.TrackHandoffPolicy
+                        .detectType(h.workName)
+                    val (code, tid) = try {
+                        AgentApi.createTracking(context, h.workName, type)
+                    } catch (_: Exception) { -1 to null }
+                    post {
+                        try { messageList.removeView(card) } catch (_: Exception) { }
+                        if (code in 200..299 && tid != null) {
+                            val typeLabel =
+                                WorkCategories.trackLabelOf(type)
+                            addBubble(
+                                com.formmitra.app.engine.TrackHandoffPolicy
+                                    .trackedText(typeLabel),
+                                false
+                            )
+                            VoiceOutput.speak(context, "Tracking shuru ho gayi.")
+                        } else {
+                            addBubble(
+                                com.formmitra.app.engine.TrackHandoffPolicy
+                                    .failedText(),
+                                false
+                            )
+                        }
+                        scrollToBottom()
+                    }
+                }, "fm-handoff-create").start()
+            }
+            noBtn.setOnClickListener {
+                try { messageList.removeView(card) } catch (_: Exception) { }
+                toast("Theek hai — tracking nahi ki")
+            }
+            row.addView(yesBtn)
+            row.addView(noBtn)
+            card.addView(row)
+            messageList.addView(card, lp)
+            scrollToBottom()
+        } catch (t: Throwable) {
+            android.util.Log.e("FmHandoff", "card failed", t)
+        }
+    }
+
+    /** POINT 21: pending run summaries → end-of-work summary cards. */
+    private fun checkRunSummaries() {
+        Thread({
+            try {
+                val pend = RunSummaryStore.takePending(context)
+                if (pend.isNotEmpty()) {
+                    post { pend.forEach { addRunSummaryCard(it) } }
+                }
+            } catch (_: Exception) { }
+        }, "fm-summary-check").start()
+    }
+
+    private fun addRunSummaryCard(s: RunSummaryStore.Summary) {
+        try {
+            val ok = s.status == "done"
+            val card = LinearLayout(context).apply {
+                orientation = VERTICAL
+                val d = GradientDrawable()
+                d.setColor(
+                    Color.parseColor(if (ok) "#E8F5E9" else "#FFF3E0")
+                )
+                d.setStroke(
+                    dp(2),
+                    Color.parseColor(if (ok) "#2E9E5B" else "#EF6C00")
+                )
+                d.cornerRadius = dp(14).toFloat()
+                background = d
+                setPadding(dp(16), dp(14), dp(16), dp(14))
+            }
+            val lp = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(6), 0, dp(6)) }
+            val sb = StringBuilder()
+            sb.append(if (ok) "✅ Kaam poora: " else "⚠️ Kaam atka: ")
+                .append(s.workName).append("\n\n")
+            sb.append("✓ Ho gaya: ").append(s.doneText).append("\n")
+            sb.append("⏳ Baaki: ").append(s.pendingText).append("\n")
+            sb.append("👉 Tumhara agla kadam: ").append(s.nextAction)
+            if (s.proofCount > 0) {
+                sb.append("\n📸 Proof: ${s.proofCount} screenshots (History me dekho)")
+            }
+            card.addView(TextView(context).apply {
+                text = sb.toString()
+                textSize = 14f
+                setTextColor(Color.parseColor("#202124"))
+            })
+            messageList.addView(card, lp)
+            scrollToBottom()
+        } catch (t: Throwable) {
+            android.util.Log.e("FmSummary", "card failed", t)
+        }
+    }
+
+    /** POINT 22: Card lock → one-tap unlock card (resume apne aap). */
+    private fun addCardUnlockCard(need: CardUnlockNeeded.Need) {
+        try {
+            val key = "${need.runId}:${need.cardId}"
+            if (cardUnlockCards.containsKey(key)) return
+            val card = LinearLayout(context).apply {
+                orientation = VERTICAL
+                val d = GradientDrawable()
+                d.setColor(Color.parseColor("#FFF8E1"))
+                d.setStroke(dp(2), Color.parseColor("#FFB300"))
+                d.cornerRadius = dp(14).toFloat()
+                background = d
+                setPadding(dp(16), dp(14), dp(16), dp(14))
+            }
+            val lp = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(6), 0, dp(6)) }
+            card.addView(TextView(context).apply {
+                text = "🔒 \"${need.taskName}\" ke beech Card lock ho gaya.\n\n" +
+                    "Ek tap me kholo — kaam apne aap wahi se aage badhega, " +
+                    "dobara shuru nahi hoga."
+                textSize = 15f
+                setTextColor(Color.parseColor("#202124"))
+            })
+            val openBtn = Button(context).apply {
+                text = "🔓 Kholo aur resume karo"
+                textSize = 14f
+                setTextColor(Color.WHITE)
+                val d = GradientDrawable()
+                d.setColor(Color.parseColor("#2E9E5B"))
+                d.cornerRadius = dp(10).toFloat()
+                background = d
+                layoutParams = LayoutParams(
+                    LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+                ).apply { setMargins(0, dp(10), 0, 0) }
+            }
+            openBtn.setOnClickListener {
+                openBtn.isEnabled = false
+                val act = context as? Activity ?: return@setOnClickListener
+                val cardJson = org.json.JSONObject()
+                    .put("id", need.cardId)
+                    .put("name", need.cardName)
+                CardFlow.askPinAndUnlock(
+                    act, cardJson,
+                    onUnlocked = { _, cid, _, _ ->
+                        CardUnlockNeeded.resolved(context, need.runId, need.cardId)
+                        try { messageList.removeView(card) } catch (_: Exception) { }
+                        cardUnlockCards.remove(key)
+                        addBubble(
+                            "🔓 Card khul gaya — kaam resume ho raha hai…",
+                            false
+                        )
+                        // Resume: server run re-queue + wake (restart nahi).
+                        Thread({
+                            try {
+                                AgentApi.runNow(context, need.runId)
+                            } catch (_: Exception) { }
+                            try {
+                                com.formmitra.app.WakeWorker.enqueue(context)
+                            } catch (_: Exception) { }
+                        }, "fm-unlock-resume").start()
+                        scrollToBottom()
+                    },
+                    onCreateNew = null
+                )
+                openBtn.isEnabled = true
+            }
+            card.addView(openBtn)
+            messageList.addView(card, lp)
+            cardUnlockCards[key] = card
+            scrollToBottom()
+        } catch (t: Throwable) {
+            android.util.Log.e("FmCardUnlock", "card failed", t)
+        }
+    }
+
+    /**
+     * POINT 20: mid-run correction — active run ho aur message correction
+     * lage to CorrectionStore me dalo, loop agle act() me apply karega.
+     * Same run continue — STOP se alag. @return true = handle ho gaya.
+     */
+    private fun handleMidRunCorrection(text: String): Boolean {
+        val runId =
+            com.formmitra.app.engine.FormRunService.activeTaskId ?: return false
+        if (!com.formmitra.app.engine.CorrectionPolicy.isCorrection(text)) {
+            return false
+        }
+        val candidates = try {
+            DetailExtractor.extract(text)
+        } catch (_: Exception) { emptyMap() }
+        if (candidates.isEmpty()) {
+            post {
+                addBubble(
+                    "📝 Kaunsa field galat hai? Aise likho:\n" +
+                        "\"mobile number galat hai, sahi 98765XXXXX hai\"",
+                    false
+                )
+                scrollToBottom()
+            }
+            return true
+        }
+        for ((field, value) in candidates) {
+            val label = try {
+                DetailExtractor.label(field)
+            } catch (_: Exception) { field }
+            try {
+                CorrectionStore.add(context, runId, field, label, value)
+            } catch (_: Exception) { }
+            post {
+                addBubble(
+                    com.formmitra.app.engine.CorrectionPolicy.notedText(label),
+                    false
+                )
+                scrollToBottom()
+            }
+        }
+        return true
+    }
+
+    /**
+     * Batch submit: DetailStore (local) + server Card auto-save (tag ke
+     * saath) + "save ho gaya" verify + run resume.
+     */
+    private fun submitDetailBatch(
+        batch: DetailBatchStore.Batch,
+        inputs: Map<String, EditText>,
+        sendBtn: Button,
+        statusView: TextView
+    ) {
+        val answers = LinkedHashMap<String, String>()
+        for ((k, et) in inputs) {
+            val v = et.text.toString().trim()
+            if (v.isNotEmpty()) answers[k] = v
+        }
+        if (answers.isEmpty()) {
+            toast("Kuch to bharo ✍️ — khaali nahi bhej sakte")
+            return
+        }
+        sendBtn.isEnabled = false
+        sendBtn.text = "⏳ Bhej rahe hain…"
+        Thread {
+            var savedLocal = false
+            var savedCard = false
+            // (1) Local: DetailStore (agle auto-fill ke liye)
+            try {
+                DetailStore.saveAll(context, answers)
+                savedLocal = true
+            } catch (_: Exception) { }
+            // (2) Server: selected Card me auto-save (tag ke saath).
+            // Server tagging karta hai; app "save ho gaya" verify dikhata hai.
+            try {
+                val cardId = AgentApi.automationCardId
+                val token = AgentApi.automationCardToken
+                if (!cardId.isNullOrEmpty() && !token.isNullOrEmpty()) {
+                    val details = JSONObject()
+                    for ((k, v) in answers) {
+                        // Tag: agent se aaya detail (server tag karega)
+                        details.put(k, JSONObject().put("value", v).put("tag", "agent"))
+                    }
+                    val res = AgentApi.patchCard(context, cardId, token, details)
+                    savedCard = res.code in 200..299
+                }
+            } catch (_: Exception) { }
+            // (3) Batch me answers persist (audit) + pending se hatao
+            try {
+                DetailBatchStore.saveAnswers(context, batch.runId, answers)
+            } catch (_: Exception) { }
+            post {
+                statusView.visibility = View.VISIBLE
+                statusView.text = when {
+                    savedLocal && savedCard -> "✅ Save ho gaya — Card me bhi jod diya"
+                    savedLocal -> "✅ Save ho gaya (Card me jodne me dikkat — baad me try karega)"
+                    else -> "⚠️ Save nahi ho paya — dobara try karo"
+                }
+                statusView.setTextColor(
+                    Color.parseColor(if (savedLocal) "#2E7D32" else "#C62828")
+                )
+                if (savedLocal) {
+                    sendBtn.text = "✅ Bhej diya"
+                    // Card hatao (thodi der me) + run resume trigger
+                    postDelayed({
+                        try {
+                            messageList.removeView(detailBatchCards.remove(batch.runId))
+                        } catch (_: Exception) { }
+                    }, 3000)
+                    resumeAfterDetails(batch.runId)
+                } else {
+                    sendBtn.isEnabled = true
+                    sendBtn.text = "Bhejo ➤"
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * Jawab mil gaya — parked run wapas shuru karo (usi step se).
+     * AgentResume me step saved hai; WakeWorker usi se resume karega.
+     */
+    private fun resumeAfterDetails(runId: String) {
+        Thread {
+            try {
+                // DetailBatchStore already answered mark kar chuka hai
+                // (saveAnswers me). Ab run resume karo.
+                val pending = com.formmitra.app.engine.AgentResume.checkPending(context)
+                if (pending != null) {
+                    // WakeWorker turant chalao — usi step se resume
+                    try {
+                        com.formmitra.app.WakeWorker.enqueue(context)
+                    } catch (_: Exception) {
+                        // Fallback: seedha FormRunService se resume
+                        try {
+                            val task = JSONObject()
+                                .put("name", pending.goal)
+                                .put("target_url", pending.url)
+                                .put("run_id", pending.runId)
+                                .put(
+                                    "steps",
+                                    org.json.JSONArray().put(
+                                        JSONObject()
+                                            .put("type", "agent_run")
+                                            .put("goal", pending.goal)
+                                            .put("url", pending.url)
+                                            .put("start_step", pending.stepsTaken)
+                                    )
+                                )
+                            com.formmitra.app.engine.FormRunService.startWithTask(
+                                context, task
+                            )
+                        } catch (_: Exception) { }
+                    }
+                    post {
+                        addAssistantBubble(
+                            "✅ Details mil gayin — kaam wahi se aage badh raha hai jahan ruka tha. 🔄"
+                        )
+                    }
+                } else {
+                    post {
+                        addAssistantBubble(
+                            "✅ Details save ho gayin. Kaam jald shuru hoga."
+                        )
+                    }
+                }
+            } catch (t: Throwable) {
+                android.util.Log.e("FmDetailBatch", "resume failed", t)
+            }
+        }.start()
+    }
+
     private fun onStartPlanClicked(plan: JSONObject, link: String, startBtn: Button?) {
         // v28 P12: tap par koi crash nahi — kuch gadbad ho to toast.
         try {
@@ -856,6 +1615,44 @@ class AgentChatView(
     fun sendMessage(raw: String) {
         val text = raw.trim()
         if (text.isEmpty() || waiting) return
+        // POINT 20: mid-run correction — active run ho aur user kahe field
+        // galat hai to loop me bhejo, same run continue (STOP se alag).
+        if (handleMidRunCorrection(text)) return
+        // POINT 18: destructive kaam (cancel/withdraw/delete/account-close)
+        // HAMESHA confirmation — permanent automation approval ise bypass
+        // NAHI kar sakta. "Haan karo" par hi aage badho.
+        if (DestructivePolicy.isDestructive(text)) {
+            val act = context as? Activity
+            if (act != null && !act.isFinishing && !act.isDestroyed) {
+                // User ka message pehle dikhao, phir gate.
+                try { addUserBubble(text) } catch (_: Exception) { }
+                DestructiveGate.confirm(act, text.take(80)) {
+                    proceedAfterDestructiveConfirm(text, userBubbleShown = true)
+                }
+                return
+            }
+            // Activity nahi mili to safe side: ruko, user ko batao.
+            post {
+                addBubble(
+                    "⚠️ Ye kaam permanent ho sakta hai — chat khula hone par " +
+                        "dobara bolo, tab confirm karunga.",
+                    false
+                )
+                scrollToBottom()
+            }
+            return
+        }
+        proceedAfterDestructiveConfirm(text)
+    }
+
+    /**
+     * POINT 18: destructive confirm ke baad (ya non-destructive) ka normal
+     * chat flow. Pehle yehi sendMessage ka body tha.
+     */
+    private fun proceedAfterDestructiveConfirm(
+        text: String,
+        userBubbleShown: Boolean = false
+    ) {
         val candidates = DetailExtractor.extract(text)
         // v24-refine (AI-trained agent): sudhar chipke — purana value galat
         // tha (validate fail) ya naya value sahi hai → update karo. Nahi to
@@ -995,6 +1792,12 @@ class AgentChatView(
                             val names =
                                 snapshot.keys.map { TagRegistry.labelOf(it) }
                             toast("✓ Card me save ho gaya: ${names.joinToString(", ")}")
+                            // POINT 24: har auto-write history/note me dikhe
+                            // (toast gayab ho jata hai — bubble rehta hai).
+                            addAssistantBubble(
+                                "💾 Ye detail Card me save ho gayi: " +
+                                    names.joinToString(", ")
+                            )
                         }
                         else -> {
                             // Fail/mismatch → pending me surakshit + LOUD error.
@@ -1035,7 +1838,7 @@ class AgentChatView(
     }
 
     /** Asli send — gate se guzarne ke baad. Retry bhi yahi aata hai. */
-    private fun doSend(text: String) {
+    private fun doSend(text: String, userBubbleShown: Boolean = false) {
         val t = text.trim()
         if (t.isEmpty() || waiting) return
         // v29 zero-crash gate: neeche ka sync UI section agar kahin throw
@@ -1047,7 +1850,8 @@ class AgentChatView(
             input.text.clear()
             clearDraft()
             sendBtn.isEnabled = false
-            addUserBubble(t)
+            // POINT 18: destructive gate par bubble pehle dikh chuka.
+            if (!userBubbleShown) addUserBubble(t)
             history.add("user" to t)
             saveChatHistory() // v28 P6: per-category chat history persist
             showTyping()
@@ -1247,6 +2051,14 @@ class AgentChatView(
                                                     cardCachedDetails.putAll(snapshot)
                                                     persistWorkMemory()
                                                     toast("✓ Details card me save ho gayi")
+                                                    // POINT 24: auto-write
+                                                    // history/note me dikhe.
+                                                    val nm2 = snapshot.keys.joinToString(", ") {
+                                                        TagRegistry.labelOf(it)
+                                                    }
+                                                    addAssistantBubble(
+                                                        "💾 Ye detail Card me save ho gayi: $nm2"
+                                                    )
                                                 }
                                                 else -> {
                                                     CardStore.pendingAddAll(context, snapshot, tag)
@@ -2278,6 +3090,59 @@ class AgentChatView(
     fun onTabShown() {
         // TTS engine warm karo taaki pehla jawab turant bole (lost na ho)
         try { VoiceOutput.init(context) } catch (_: Exception) { }
+        // Point 14: detail batch listener (ek baar) + pending batches dikhao
+        try {
+            if (!detailBatchListenerRegistered) {
+                detailBatchListenerRegistered = true
+                DetailBatchStore.onRaised { batch ->
+                    post { addDetailBatchCard(batch) }
+                }
+            }
+            checkPendingDetailBatches()
+        } catch (_: Exception) { }
+        // POINT 25: tracking action-offer listener (ek baar) + unseen offers.
+        try {
+            if (!trackOfferListenerRegistered) {
+                trackOfferListenerRegistered = true
+                TrackOffer.addListener { offer ->
+                    post { addTrackOfferCard(offer) }
+                }
+            }
+            Thread({
+                try {
+                    val unseen = TrackOffer.takeUnseen(context)
+                    if (unseen.isNotEmpty()) {
+                        post { unseen.forEach { addTrackOfferCard(it) } }
+                    }
+                } catch (_: Exception) { }
+            }, "track-offer-unseen").start()
+        } catch (_: Exception) { }
+        // POINT 28: line me kaam ho to entry par ek baar dikhao.
+        try { checkWorkQueue() } catch (_: Exception) { }
+        // POINT 17: Apply poora → "Iska status track karu?" card.
+        try { checkTrackHandoff() } catch (_: Exception) { }
+        // POINT 21: end-of-work summary cards.
+        try { checkRunSummaries() } catch (_: Exception) { }
+        // POINT 22: run ke beech Card lock → one-tap unlock card.
+        try {
+            if (!cardUnlockListenerRegistered) {
+                cardUnlockListenerRegistered = true
+                CardUnlockNeeded.addListener { need ->
+                    post { addCardUnlockCard(need) }
+                }
+            }
+            Thread({
+                try {
+                    val needs = CardUnlockNeeded.takePending(context)
+                    if (needs.isNotEmpty()) {
+                        post { needs.forEach { addCardUnlockCard(it) } }
+                    }
+                } catch (_: Exception) { }
+            }, "fm-cardunlock-pending").start()
+        } catch (_: Exception) { }
+        // POINT 24 (revised): chat entry par Card PIN (ek baar) —
+        // unlock persistent hai, dobara nahi maangega.
+        try { ensureCardUnlockOnEntry() } catch (_: Exception) { }
         if (polling) return
         polling = true
         pollHandler.post(pollRunnable)
@@ -2287,6 +3152,135 @@ class AgentChatView(
     fun onTabHidden() {
         polling = false
         pollHandler.removeCallbacks(pollRunnable)
+    }
+
+    // ============ POINT 24 (REVISED): PERSISTENT CARD UNLOCK ============
+    //
+    // Chat entry par ek baar PIN → unlock persistent (chat band / app
+    // background / background automation par dobara PIN nahi). Unlock sirf
+    // manual "Lock karo" ya sign-out se tootega — koi auto re-lock nahi.
+
+    /**
+     * Chat entry par card unlock pakka karo. Valid token (memory ya
+     * encrypted restore) ho to kuch nahi; nahi to ek baar PIN dialog
+     * (dismiss kar sakta hai — nag nahi karenge).
+     */
+    private fun ensureCardUnlockOnEntry() {
+        val act = context as? Activity ?: return
+        if (act.isFinishing || act.isDestroyed) return
+        val cid = activeCardId ?: CardStore.selectedCardId(context)
+        if (cid.isNullOrEmpty()) {
+            // POINT 27 EXTEND: koi card hi nahi (PIN set karne ka mauka hi
+            // nahi mila) → chat entry par "Card banao + PIN set karo".
+            try {
+                PinSetupFlow.ensureCardOrSetup(act) { newCardId ->
+                    if (!newCardId.isNullOrEmpty()) {
+                        activeCardId = newCardId
+                        try { ensureCardUnlockOnEntry() } catch (_: Exception) { }
+                    }
+                    try { refreshLockBtn() } catch (_: Exception) { }
+                }
+            } catch (_: Exception) { }
+            try { refreshLockBtn() } catch (_: Exception) { }
+            return
+        }
+        if (activeCardId == null) activeCardId = cid
+        // Token: memory → encrypted persist (app restart ke baad bhi).
+        val tok = activeCardToken ?: CardStore.tokenOrRestore(context, cid)
+        if (!tok.isNullOrEmpty()) {
+            if (activeCardToken == null) {
+                activeCardToken = tok
+                try { AgentApi.setAutomationCard(cid, tok) } catch (_: Exception) { }
+            }
+            maybeShowUnlockNote(cid)
+            try { refreshLockBtn() } catch (_: Exception) { }
+            return
+        }
+        // Token nahi — PIN chahiye (pehli baar, ya 30-min server TTL ke baad).
+        if (pinPromptShownFor == cid) {
+            try { refreshLockBtn() } catch (_: Exception) { }
+            return
+        }
+        pinPromptShownFor = cid
+        val cardJson = JSONObject()
+            .put("id", cid)
+            .put("name", activeCardName ?: "Card")
+        CardFlow.askPinAndUnlock(
+            act, cardJson,
+            onUnlocked = { prefill, id, name, token ->
+                activeCardId = id
+                activeCardName = name
+                activeCardToken = token
+                try { AgentApi.setAutomationCard(id, token) } catch (_: Exception) { }
+                if (prefill.isNotEmpty()) {
+                    cardCachedDetails.clear()
+                    cardCachedDetails.putAll(prefill)
+                }
+                maybeShowUnlockNote(id)
+                try { refreshLockBtn() } catch (_: Exception) { }
+            }
+        )
+        try { refreshLockBtn() } catch (_: Exception) { }
+    }
+
+    /** Unlock ke baad subtle note — EK BAAR per unlock (revised text). */
+    private fun maybeShowUnlockNote(cardId: String) {
+        if (cardId.isEmpty()) return
+        try {
+            if (CardStore.unlockNoteShown(context, cardId)) return
+            CardStore.markUnlockNoteShown(context, cardId)
+            addAssistantBubble(CardUnlockPolicy.unlockNoteText())
+        } catch (_: Exception) { }
+    }
+
+    /** Header lock button ka state (prominent manual lock). */
+    private fun refreshLockBtn() {
+        if (!::lockBtn.isInitialized) return
+        val cid = activeCardId ?: CardStore.selectedCardId(context)
+        if (cid.isNullOrEmpty()) {
+            lockBtn.visibility = View.GONE
+            return
+        }
+        lockBtn.visibility = View.VISIBLE
+        lockBtn.text =
+            if (CardStore.isUnlocked(context, cid)) "🔒 Lock karo"
+            else "🔓 Card kholo"
+    }
+
+    private fun onLockBtnTapped() {
+        val cid = activeCardId ?: CardStore.selectedCardId(context)
+        if (cid.isNullOrEmpty()) return
+        if (!CardStore.isUnlocked(context, cid)) {
+            // Locked → kholne ka rasta.
+            pinPromptShownFor = null
+            try { ensureCardUnlockOnEntry() } catch (_: Exception) { }
+            return
+        }
+        val act = context as? Activity ?: return
+        AlertDialog.Builder(act)
+            .setTitle("🔒 Card lock karu?")
+            .setMessage(
+                "Card lock ho jayega — dobara kholne ke liye PIN lagega.\n" +
+                    "Background kaam me Card chahiye hoga to ruk jayega."
+            )
+            .setPositiveButton("🔒 Haan, lock karo") { _, _ -> lockCardNow(cid) }
+            .setNegativeButton("Rehne do", null)
+            .show()
+    }
+
+    private fun lockCardNow(cardId: String) {
+        CardStore.lock(context, cardId)
+        // CONTRACT SYNC: server ko bhi lock batao (token server par mare).
+        Thread({
+            try { AgentApi.lockCard(context, cardId) } catch (_: Exception) { }
+        }, "fm-card-lock").start()
+        activeCardToken = null
+        pinPromptShownFor = null
+        try { AgentApi.setAutomationCard(cardId, null) } catch (_: Exception) { }
+        try { refreshLockBtn() } catch (_: Exception) { }
+        val nm = activeCardName ?: "Card"
+        toast("🔒 Card lock ho gaya")
+        addAssistantBubble(CardUnlockPolicy.lockDoneText(nm))
     }
 
     private fun pollTaskStatus() {
@@ -2710,11 +3704,15 @@ class AgentChatView(
         if (resultCode != Activity.RESULT_OK) return
         val uri = data?.data ?: return
         Thread {
-            val savedName = try { DocsStore.saveDoc(context, uri) }
-            catch (_: Exception) { null }
+            // POINT 16: compress note bhi lo — picker result me dikhega.
+            val (savedName, docNote) = try {
+                DocsStore.saveDocWithNote(context, uri)
+            } catch (_: Exception) { null to "" }
             post {
                 if (!savedName.isNullOrEmpty()) {
-                    toast("Document save ho gaya ✅ — agent upload step me istemaal hoga")
+                    val msg = if (docNote.isNotEmpty()) docNote
+                    else "Document save ho gaya ✅ — agent upload step me istemaal hoga"
+                    toast(msg)
                     // v20 Task 3: "Kaun sa document hai?" — type device-local
                     // save hota hai, server ko kabhi nahi jata (doc-privacy).
                     val act = context as? Activity

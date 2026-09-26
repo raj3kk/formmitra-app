@@ -316,7 +316,11 @@ object AgentApi {
 
     /**
      * v28 P5: POST /api/app/trackings — unified tracking banao.
-     * {label, tracking_type, params} → (code, trackingId).
+     * {label, type, details} → (code, trackingId).
+     * Server contract: /api/app/trackings expects `type`, `label`,
+     * `details` — purane `tracking_type`/`params` aliases bhi bhejte
+     * hain (server purana build ho to bhi chale). Root-cause: pehle
+     * sirf aliases bhejte the, server ignore kar deta tha.
      * Example: ("Zameen — Khata 569", "zameen",
      *           {khata:"569", khesra:"1563", mauza:"Damgara"}).
      */
@@ -328,12 +332,12 @@ object AgentApi {
     ): Pair<Int, String?> {
         val body = JSONObject()
             .put("label", label)
+            .put("type", trackingType)
             .put("tracking_type", trackingType)
-        if (params.isNotEmpty()) {
-            val p = JSONObject()
-            for ((k, v) in params) p.put(k, v)
-            body.put("params", p)
-        }
+        val p = JSONObject()
+        for ((k, v) in params) p.put(k, v)
+        body.put("details", p)
+        body.put("params", p)
         val res = post("/api/app/trackings", ctx, body)
         val id = res.json?.let { j ->
             val nested = j.optJSONObject("tracking")?.optString("id", "").orEmpty()
@@ -345,6 +349,53 @@ object AgentApi {
             }
         }
         return res.code to id
+    }
+
+    /**
+     * POINT 25: POST /api/agent/runs {goal, url} — tracking action-offer
+     * tap par operator action shuru karo. @return run_id ya null.
+     * (Payment/checkout goal server khud reject karta hai.)
+     */
+    fun startActionRun(ctx: Context, goal: String, url: String): String? {
+        val body = JSONObject().put("goal", goal)
+        if (url.isNotEmpty()) body.put("url", url)
+        val res = try { post("/api/agent/runs", ctx, body) }
+        catch (_: Exception) { return null }
+        if (res.code !in 200..299) return null
+        return res.json?.optString("run_id", null)?.ifEmpty { null }
+    }
+
+    /**
+     * POINT 27: POST /api/cards/[id]/pin-reset/request — PIN bhool gaye?
+     * Account email + devices par OTP. @return (code, errorOrNull).
+     */
+    fun requestCardPinOtp(ctx: Context, cardId: String): Pair<Int, String?> {
+        val res = try { post("/api/cards/$cardId/pin-reset/request", ctx, JSONObject()) }
+        catch (_: Exception) { return -1 to "Network dikkat — dobara try karo" }
+        if (res.code in 200..299) return res.code to null
+        val err = res.json?.optString("error", "").orEmpty()
+            .ifEmpty { "OTP nahi bheja ja saka (code ${res.code})" }
+        return res.code to err
+    }
+
+    /**
+     * POINT 27: POST /api/cards/[id]/pin-reset/confirm {otp, new_pin}.
+     * (Server confirm endpoint pending ho to 404 → saaf message.)
+     * @return (code, errorOrNull).
+     */
+    fun confirmCardPinReset(
+        ctx: Context, cardId: String, otp: String, newPin: String
+    ): Pair<Int, String?> {
+        val body = JSONObject().put("otp", otp).put("new_pin", newPin)
+        val res = try { post("/api/cards/$cardId/pin-reset/confirm", ctx, body) }
+        catch (_: Exception) { return -1 to "Network dikkat — dobara try karo" }
+        if (res.code in 200..299) return res.code to null
+        if (res.code == 404) {
+            return 404 to "⚠️ Ye suvidha server par jald aa rahi hai — thodi der me try karo"
+        }
+        val err = res.json?.optString("error", "").orEmpty()
+            .ifEmpty { "PIN set nahi ho paya (code ${res.code})" }
+        return res.code to err
     }
 
     /** v28 P5: GET /api/app/trackings — meri saari trackings (active + cancelled). */
@@ -640,6 +691,22 @@ object AgentApi {
     /** POST /api/cards/[id]/unlock {pin} → 200 {ok, card_token, expires_at}. */
     fun unlockCard(ctx: Context, cardId: String, pin: String): ApiResult =
         post("/api/cards/$cardId/unlock", ctx, JSONObject().put("pin", pin))
+
+    /**
+     * CONTRACT SYNC (2026-09-26): server card lock endpoints.
+     * POST /api/cards/[id]/lock → server-side lock (token invalidate).
+     * POST /api/cards/lock-all → saare cards lock.
+     * Local CardStore.lockAll ke SAATH server ko bhi batao taaki token
+     * server par bhi mar jaye (sirf local lock aadha kaam hai).
+     */
+    fun lockCard(ctx: Context, cardId: String): ApiResult =
+        post(
+            com.formmitra.app.engine.CardEndpoints.lock(cardId),
+            ctx, JSONObject()
+        )
+
+    fun lockAllCards(ctx: Context): ApiResult =
+        post(com.formmitra.app.engine.CardEndpoints.LOCK_ALL, ctx, JSONObject())
 
     /** GET /api/cards/[id] — full card + details (x-card-token). */
     fun cardDetail(ctx: Context, cardId: String, token: String): ApiResult =

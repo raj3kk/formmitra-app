@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Build
 import android.util.Log
 import com.formmitra.app.WakeWorker
+import com.formmitra.app.engine.TrackOfferPolicy
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 
@@ -46,7 +47,9 @@ class FmMessagingService : FirebaseMessagingService() {
         super.onMessageReceived(msg)
         try {
             val data = msg.data
-            val type = (data["type"] ?: "").lowercase()
+            // POINT 25: server action-offer push me "kind":"action_offer"
+            // bhejta hai (type nahi) — dono dekho.
+            val type = (data["type"] ?: data["kind"] ?: "").lowercase()
             val title = data["title"] ?: msg.notification?.title ?: "FormMitra"
             val body = data["body"] ?: msg.notification?.body ?: ""
             val runId = data["run_id"] ?: data["task_id"] ?: ""
@@ -148,6 +151,37 @@ class FmMessagingService : FirebaseMessagingService() {
                     deepTab = deepTab,
                     deepRunId = runId
                 )
+                // POINT 25: tracking → action offer. Offer card + notification
+                // (tap → /agent tab). Koi auto-run NAHI.
+                // FCM data me sirf ids hoti hain; poora text notification
+                // title/body me hota hai (realtime path me full payload).
+                "action_offer" -> {
+                    try {
+                        val pushTitle = title.removePrefix("FormMitra — ")
+                            .removePrefix("FormMitra - ").ifEmpty {
+                                TrackOfferPolicy.defaultTitle(
+                                    data["offer_kind"] ?: ""
+                                )
+                            }
+                        val offer = TrackOffer.fromMap(
+                            mapOf(
+                                "offer_id" to data["offer_id"],
+                                "offer_kind" to data["offer_kind"],
+                                "title" to pushTitle,
+                                "question" to body,
+                                "goal" to data["goal"],
+                                "url" to data["url"]
+                            )
+                        )
+                        if (offer != null) {
+                            TrackOffer.receive(applicationContext, offer)
+                        } else {
+                            Log.w(TAG, "action_offer invalid, ignore")
+                        }
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "action_offer handle failed", t)
+                    }
+                }
                 else -> {
                     // Bina type ke notification-payload → seedha dikhao.
                     if (msg.notification != null || title.isNotEmpty()) {

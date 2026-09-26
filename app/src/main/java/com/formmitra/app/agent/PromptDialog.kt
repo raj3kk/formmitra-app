@@ -28,6 +28,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import com.formmitra.app.engine.PaymentFlow
+import com.formmitra.app.engine.SmsOtpPolicy
 import com.formmitra.app.engine.UserPrompt
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
@@ -70,7 +71,8 @@ object PromptDialog {
             try {
                 when (req.kind) {
                     "payment" -> showPayment(activity, req)
-                    "choice" -> showChoice(activity, req)
+                    "choice", "option_choice" -> showChoice(activity, req)
+                    "destructive_confirm" -> showDestructiveConfirm(activity, req)
                     "document" -> showDocument(activity, req)
                     "login" -> showLogin(activity, req)
                     "device_auth" -> showDeviceAuth(activity, req)
@@ -137,12 +139,15 @@ object PromptDialog {
             setOnClickListener {
                 pendingDocPick = { uri ->
                     Thread({
-                        val saved = if (uri != null) {
-                            try { DocsStore.saveDoc(activity, uri) } catch (_: Exception) { null }
-                        } else null
+                        val (saved, docNote) = if (uri != null) {
+                            try { DocsStore.saveDocWithNote(activity, uri) }
+                            catch (_: Exception) { null to "" }
+                        } else null to ""
                         activity.runOnUiThread {
                             if (!saved.isNullOrEmpty()) {
-                                toast(activity, "Save ho gaya: $saved")
+                                val msg = if (docNote.isNotEmpty()) docNote
+                                else "Save ho gaya: $saved"
+                                toast(activity, msg)
                                 answer(activity, req, mapOf("approved" to true, "doc" to saved))
                                 try { dlg?.dismiss() } catch (_: Exception) { }
                             } else {
@@ -453,14 +458,22 @@ object PromptDialog {
         // L1-UPGRADE (OTP maximum assistance): SMS User Consent — koi
         // permission nahi. Dialog khulne par listener start; OTP SMS aate
         // hi consent dialog auto-launch (ek tap), OTP field me auto-bharo.
+        //
+        // POINT 26: auto-read SIRF jab user opted-in HO aur deny NA kiya ho
+        // (NO-NAGGING: ek baar deny → hamesha manual popup, dobara prompt
+        // nahi). Consent ke bina SMS kabhi nahi padhte.
         val isOtpPrompt = req.kind == "otp" ||
             fields.any { it.type == "otp" || it.key.lowercase().contains("otp") }
+        val smsAuto = isOtpPrompt && SmsOtpAutoRead.shouldAttempt(activity)
         var smsBtn: Button? = null
         var otpEdit: EditText? = null
+        var otpAutoFilled = false
         if (isOtpPrompt) {
             otpEdit = fields.firstOrNull {
                 it.type == "otp" || it.key.lowercase().contains("otp")
             }?.let { edits[it.key] } ?: edits.values.firstOrNull()
+        }
+        if (smsAuto) {
             smsBtn = Button(activity).apply {
                 text = "📩 SMS ka intezar hai…"
                 textSize = 14f
@@ -494,6 +507,17 @@ object PromptDialog {
                 val map = mutableMapOf<String, Any?>("approved" to true)
                 edits.forEach { (k, et) -> map[k] = et.text.toString().trim() }
                 if (isOtpPrompt) SmsOtpConsent.stop()
+                // POINT 26: audit — auto-read ya manual?
+                if (isOtpPrompt) {
+                    try {
+                        GateAudit.log(
+                            activity, req.runId, "otp",
+                            if (otpAutoFilled) "auto_read" else "manual",
+                            if (otpAutoFilled) SmsOtpPolicy.autoReadNote()
+                            else SmsOtpPolicy.manualNote()
+                        )
+                    } catch (_: Exception) { }
+                }
                 answer(activity, req, map)
                 dlg.dismiss()
             }
@@ -503,13 +527,14 @@ object PromptDialog {
                 showingFor = ""
                 dlg.dismiss()
             }
-            if (isOtpPrompt) {
+            if (smsAuto) {
                 // SMS consent flow start
                 SmsOtpConsent.setActivity(activity)
                 val et = otpEdit
                 val btn = smsBtn
                 SmsOtpConsent.onOtp = { otp ->
                     activity.runOnUiThread {
+                        otpAutoFilled = true
                         et?.setText(otp)
                         toast(activity, "✓ OTP SMS se bhar diya")
                         // L1: user ne consent me OTP dekh liya hai — ab
@@ -534,6 +559,20 @@ object PromptDialog {
                         // Dialog foreground me hai — consent turant launch
                         // karo taaki user ko ek hi tap karna pade
                         SmsOtpConsent.launchConsent()
+                    }
+                }
+                // POINT 26 (no-nagging): consent deny/cancel → persist +
+                // manual flow (dobara auto prompt nahi).
+                SmsOtpConsent.onDenied = {
+                    activity.runOnUiThread {
+                        try {
+                            SmsOtpAutoRead.recordDenied(activity)
+                            GateAudit.log(
+                                activity, req.runId, "otp", "denied",
+                                SmsOtpPolicy.deniedNote()
+                            )
+                        } catch (_: Exception) { }
+                        toast(activity, "📩 SMS auto-read band — OTP haath se bharo")
                     }
                 }
                 SmsOtpConsent.startListening(activity)
@@ -606,6 +645,36 @@ object PromptDialog {
             }
             .create()
         dlg.show()
+    }
+
+    // ---------- destructive_confirm (contract sync 2026-09-26) ----------
+
+    /**
+     * Server ka destructive gate (cancel/withdraw/delete/account-close).
+     * HAMESHA explicit confirmation — koi "hamesha allow" nahi, koi bypass
+     * nahi. "Haan karo" → {approved:true}; "Mat karo"/Cancel → {approved:false}.
+     */
+    private fun showDestructiveConfirm(
+        activity: Activity,
+        req: UserPrompt.Request
+    ) {
+        val what = req.message.ifEmpty { "ye kaam" }
+        AlertDialog.Builder(activity)
+            .setTitle("⚠️ Pakka karna hai?")
+            .setMessage(
+                "\"$what\"\n\nYe kaam PERMANENT ho sakta hai — wapas nahi hoga.\n" +
+                    "Soch lo, phir dabao."
+            )
+            .setPositiveButton("Haan karo") { _, _ ->
+                answer(activity, req, mapOf("approved" to true))
+                showingFor = ""
+            }
+            .setNegativeButton("Mat karo") { _, _ ->
+                answer(activity, req, mapOf("approved" to false))
+                showingFor = ""
+            }
+            .setCancelable(false)
+            .show()
     }
 
     // ---------- payment (2 stage) ----------

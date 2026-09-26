@@ -1,6 +1,8 @@
 package com.formmitra.app.agent
 
 import android.content.Context
+import com.formmitra.app.engine.CardUnlockPolicy
+import com.formmitra.app.engine.CryptoVault
 import org.json.JSONObject
 import java.time.Instant
 
@@ -135,5 +137,167 @@ object CardStore {
     private fun saveRaw(ctx: Context, o: JSONObject) {
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString(KEY_PENDING, o.toString()).apply()
+    }
+
+    // ============ POINT 24 (REVISED): PERSISTENT CARD UNLOCK ============
+    //
+    // User ka faisla: unlock persistent hai — chat band / app background /
+    // background automation par dobara PIN NAHI. Unlock SIRF tootega jab
+    // (a) user khud "Lock karo" kare, ya (b) sign-out ho. KOI auto re-lock
+    // nahi (idle-timeout rule hata diya gaya).
+    //
+    // Note: server ka signed card_token (30-min TTL) existing mechanism hi
+    // hai — naya crypto nahi. Token ko CryptoVault (existing) me encrypted
+    // persist karte hain taaki app restart par bhi 30-min window me PIN na
+    // lage. Token expire ho jaye to unlock FLAG phir bhi ON rehta hai;
+    // agla card access PIN se naya token banayega (server boundary).
+
+    private const val KEY_UNLOCKED_SET = "unlocked_card_ids"
+    private const val KEY_PINFAIL_PREFIX = "pin_fail_"
+    private const val KEY_NOTE_PREFIX = "unlock_note_shown_"
+
+    private fun prefs(ctx: Context) =
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    private fun unlockedIds(ctx: Context): MutableSet<String> = try {
+        HashSet(prefs(ctx).getStringSet(KEY_UNLOCKED_SET, emptySet()) ?: emptySet())
+    } catch (_: Exception) { HashSet() }
+
+    private fun saveUnlockedIds(ctx: Context, ids: Set<String>) {
+        try {
+            prefs(ctx).edit().putStringSet(KEY_UNLOCKED_SET, HashSet(ids)).apply()
+        } catch (_: Exception) { }
+    }
+
+    /** PIN se unlock safal → persistent unlock ON (note flag reset). */
+    fun setUnlocked(ctx: Context, cardId: String) {
+        if (cardId.isEmpty()) return
+        val ids = unlockedIds(ctx)
+        ids.add(cardId)
+        saveUnlockedIds(ctx, ids)
+        // Naya unlock → note ek baar phir dikhega.
+        try { prefs(ctx).edit().remove(KEY_NOTE_PREFIX + cardId).apply() } catch (_: Exception) { }
+    }
+
+    /** Persistent unlock ON hai? (manual lock / sign-out ne toda nahi). */
+    fun isUnlocked(ctx: Context, cardId: String): Boolean =
+        cardId.isNotEmpty() && unlockedIds(ctx).contains(cardId)
+
+    /**
+     * Manual "Lock karo" — unlock FLAG + token (memory + encrypted) saaf.
+     * Dobara kholne par PIN lagega.
+     */
+    fun lock(ctx: Context, cardId: String) {
+        if (cardId.isEmpty()) return
+        val ids = unlockedIds(ctx)
+        ids.remove(cardId)
+        saveUnlockedIds(ctx, ids)
+        clearToken(cardId)
+        try {
+            CryptoVault.clearSecure(ctx, "card_token_$cardId")
+            CryptoVault.clearSecure(ctx, "card_token_exp_$cardId")
+            prefs(ctx).edit().remove(KEY_NOTE_PREFIX + cardId).apply()
+        } catch (_: Exception) { }
+    }
+
+    /** Sign-out → SAARE cards lock (koi unlock persist nahi). */
+    fun lockAll(ctx: Context) {
+        val ids = unlockedIds(ctx)
+        for (id in ids) {
+            clearToken(id)
+            try {
+                CryptoVault.clearSecure(ctx, "card_token_$id")
+                CryptoVault.clearSecure(ctx, "card_token_exp_$id")
+                prefs(ctx).edit().remove(KEY_NOTE_PREFIX + id).apply()
+            } catch (_: Exception) { }
+        }
+        saveUnlockedIds(ctx, emptySet())
+    }
+
+    private fun parseExpMs(expiresAtIso: String?): Long = try {
+        if (expiresAtIso.isNullOrEmpty()) System.currentTimeMillis() + 30 * 60 * 1000L
+        else Instant.parse(expiresAtIso).toEpochMilli()
+    } catch (_: Exception) {
+        System.currentTimeMillis() + 30 * 60 * 1000L
+    }
+
+    /**
+     * putToken + encrypted persist (app restart par bhi token bache).
+     * CardFlow.unlock safal hone par yahi call karo.
+     */
+    fun putToken(ctx: Context, cardId: String, token: String, expiresAtIso: String?) {
+        putToken(cardId, token, expiresAtIso)
+        try {
+            val expMs = parseExpMs(expiresAtIso)
+            CryptoVault.putSecureSync(ctx, "card_token_$cardId", token)
+            CryptoVault.putSecureSync(ctx, "card_token_exp_$cardId", expMs.toString())
+        } catch (_: Exception) { }
+    }
+
+    /**
+     * Valid token: pehle memory, phir encrypted persist (app restart ke
+     * baad). Expired/missing → null (PIN se naya token chahiye).
+     */
+    fun tokenOrRestore(ctx: Context, cardId: String): String? {
+        token(cardId)?.let { return it }
+        return try {
+            val tok = CryptoVault.getSecure(ctx, "card_token_$cardId")
+            val expMs = CryptoVault.getSecure(ctx, "card_token_exp_$cardId")?.toLongOrNull() ?: 0L
+            if (tok.isNullOrEmpty() ||
+                !CardUnlockPolicy.isTokenFresh(expMs, System.currentTimeMillis())
+            ) {
+                // Expired/corrupt → saaf karo, dobara PIN lagega.
+                try {
+                    CryptoVault.clearSecure(ctx, "card_token_$cardId")
+                    CryptoVault.clearSecure(ctx, "card_token_exp_$cardId")
+                } catch (_: Exception) { }
+                null
+            } else {
+                // Memory me wapas rakho (60s skew ke saath).
+                val iso = try {
+                    Instant.ofEpochMilli(expMs).toString()
+                } catch (_: Exception) { null }
+                putToken(cardId, tok, iso)
+                tok
+            }
+        } catch (_: Exception) { null }
+    }
+
+    // ---------- PIN attempt guard (5 galat / 15 min → temporary lock) ----------
+
+    /** Abhi PIN blocked hai? → blocked-until ms, ya 0. */
+    fun pinBlockedUntilMs(ctx: Context, cardId: String): Long = try {
+        val raw = prefs(ctx).getString(KEY_PINFAIL_PREFIX + cardId, null)
+        CardUnlockPolicy.blockedUntilMs(
+            CardUnlockPolicy.parseAttemptState(raw), System.currentTimeMillis()
+        )
+    } catch (_: Exception) { 0L }
+
+    /** PIN attempt ka result darj karo (sahi → counter reset). */
+    fun recordPinAttempt(ctx: Context, cardId: String, ok: Boolean) {
+        try {
+            val raw = prefs(ctx).getString(KEY_PINFAIL_PREFIX + cardId, null)
+            val next = CardUnlockPolicy.recordAttempt(
+                CardUnlockPolicy.parseAttemptState(raw),
+                System.currentTimeMillis(), ok
+            )
+            val e = prefs(ctx).edit()
+            val k = KEY_PINFAIL_PREFIX + cardId
+            val f = CardUnlockPolicy.formatAttemptState(next)
+            if (f == null) e.remove(k) else e.putString(k, f)
+            e.apply()
+        } catch (_: Exception) { }
+    }
+
+    // ---------- unlock note (ek baar per unlock) ----------
+
+    fun unlockNoteShown(ctx: Context, cardId: String): Boolean = try {
+        prefs(ctx).getBoolean(KEY_NOTE_PREFIX + cardId, false)
+    } catch (_: Exception) { false }
+
+    fun markUnlockNoteShown(ctx: Context, cardId: String) {
+        try {
+            prefs(ctx).edit().putBoolean(KEY_NOTE_PREFIX + cardId, true).apply()
+        } catch (_: Exception) { }
     }
 }

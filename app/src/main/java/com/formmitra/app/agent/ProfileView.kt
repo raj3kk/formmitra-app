@@ -235,6 +235,41 @@ class ProfileView(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
             ).apply { setMargins(0, 0, 0, dp(4)) }
         })
+        // POINT 26: SMS OTP auto-read toggle (no-nagging: deny persist hota
+        // hai; yahan se wapas ON karne par reset).
+        val smsRow = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = with(UiKit) { context.cardBg() }
+            setPadding(dp(9), dp(6), dp(9), dp(6))
+        }
+        smsRow.addView(TextView(context).apply {
+            text = "📩 SMS se OTP auto-padho\n" +
+                "ON: OTP SMS ek tap me khud bharega • OFF: hamesha manual popup"
+            textSize = 11f
+            setTextColor(Color.parseColor("#202124"))
+            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+        })
+        val smsSwitch = Switch(context).apply {
+            isChecked = try { SmsOtpAutoRead.shouldAttempt(context) }
+            catch (_: Exception) { true }
+            setOnCheckedChangeListener { _, on ->
+                try {
+                    // ON → denied bhi reset (user ne khud chalu kiya).
+                    SmsOtpAutoRead.setOptedIn(context, on)
+                    toast(
+                        if (on) "SMS OTP auto-read ON 📩"
+                        else "SMS OTP auto-read OFF — ab manual popup aayega"
+                    )
+                } catch (_: Exception) { }
+            }
+        }
+        smsRow.addView(smsSwitch)
+        content.addView(smsRow.apply {
+            layoutParams = LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, 0, 0, dp(4)) }
+        })
         // Notifications
         val notifBtn = Button(context).apply {
             text = "🔔 Notifications (सूचनाएं)"

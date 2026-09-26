@@ -2,9 +2,13 @@ package com.formmitra.app.agent
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.OpenableColumns
 import com.formmitra.app.engine.CryptoVault
+import com.formmitra.app.engine.DocCompressPolicy
+import java.io.ByteArrayOutputStream
 import java.io.File
 import org.json.JSONObject
 
@@ -20,9 +24,12 @@ object DocsStore {
 
     /**
      * Content URI → filesDir/docs/ me copy karo.
-     * @return saved file ka naam, ya null (fail).
+     * POINT 16: badi photo ho to DocCompressPolicy ladder se 400KB tak
+     * compress (Bitmap, OOM-safe) — upload tez, data bachat. Note batata
+     * hai kya hua (picker result me dikhao).
+     * @return (saved file ka naam, user note) — fail par (null, reason).
      */
-    fun saveDoc(ctx: Context, uri: Uri): String? {
+    fun saveDocWithNote(ctx: Context, uri: Uri): Pair<String?, String> {
         return try {
             val cr = ctx.contentResolver
             var name: String? = null
@@ -46,7 +53,31 @@ object DocsStore {
             }
             cr.openInputStream(uri)?.use { ins ->
                 dest.outputStream().use { outs -> ins.copyTo(outs) }
-            } ?: return null
+            } ?: return null to "File khul nahi payi"
+            // POINT 16: actual bitmap compression (policy-driven).
+            var note = ""
+            try {
+                val bytes = dest.readBytes()
+                val kind = DocCompressPolicy.detectKind(bytes)
+                when (val d = DocCompressPolicy.decide(bytes.size.toLong(), kind)) {
+                    is DocCompressPolicy.Decision.Compress -> {
+                        val compressed = compressLadder(bytes, d.steps)
+                        if (compressed != null) {
+                            dest.writeBytes(compressed)
+                            note = DocCompressPolicy.compressedNote()
+                        } else {
+                            note = d.giveUpNote
+                        }
+                    }
+                    is DocCompressPolicy.Decision.Keep -> {
+                        note = d.note
+                    }
+                }
+            } catch (_: OutOfMemoryError) {
+                note = "Photo bahut badi thi — original hi rakhi hai."
+            } catch (_: Exception) {
+                // compress fail → original rakho, note khali
+            }
             // Vault encryption (fail-closed): file ko Keystore AES-256-GCM se
             // encrypt karo. Fail ho to plaintext file DELETE karo aur null
             // wapas do — aadhi-encrypted ya plaintext vault me kabhi nahi.
@@ -56,7 +87,7 @@ object DocsStore {
                 CryptoVault.encryptFile(ctx, plain, dest)
             } catch (_: Exception) {
                 try { dest.delete() } catch (_: Exception) { }
-                return null
+                return null to "Encrypt nahi ho paya"
             }
             // Engine baad me bhi padh sake — permission persist karo
             try {
@@ -64,10 +95,76 @@ object DocsStore {
                     uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
                 )
             } catch (_: Exception) { }
-            dest.name
+            dest.name to note
         } catch (_: Exception) {
-            null
+            null to "File save nahi hui — dobara try karo"
         }
+    }
+
+    /**
+     * Content URI → filesDir/docs/ me copy karo.
+     * @return saved file ka naam, ya null (fail).
+     */
+    fun saveDoc(ctx: Context, uri: Uri): String? =
+        saveDocWithNote(ctx, uri).first
+
+    /**
+     * POINT 16: DocCompressPolicy ladder ko Bitmap par chalao.
+     * Pehla step jo 400KB ke andar aaye wahi lo. OOM-safe (inSampleSize +
+     * OutOfMemoryError catch). @return compressed JPEG bytes ya null.
+     */
+    private fun compressLadder(
+        bytes: ByteArray,
+        steps: List<DocCompressPolicy.Step>
+    ): ByteArray? {
+        val bound = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        try {
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bound)
+        } catch (_: Exception) { return null }
+        val w = bound.outWidth
+        val h = bound.outHeight
+        if (w <= 0 || h <= 0) return null
+        for (s in steps) {
+            var bmp: Bitmap? = null
+            var scaled: Bitmap? = null
+            try {
+                val targetW = (w * s.scale).toInt().coerceAtLeast(1)
+                val targetH = (h * s.scale).toInt().coerceAtLeast(1)
+                // Power-of-2 sample jo target se bada rahe.
+                var sample = 1
+                while (w / (sample * 2) >= targetW &&
+                    h / (sample * 2) >= targetH
+                ) {
+                    sample *= 2
+                }
+                val opts = BitmapFactory.Options().apply {
+                    inSampleSize = sample
+                }
+                bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+                    ?: continue
+                scaled = if (s.scale < 1.0 &&
+                    (bmp.width != targetW || bmp.height != targetH)
+                ) {
+                    Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
+                } else {
+                    bmp
+                }
+                val out = ByteArrayOutputStream()
+                scaled.compress(Bitmap.CompressFormat.JPEG, s.quality, out)
+                val result = out.toByteArray()
+                if (result.size <= DocCompressPolicy.MAX_BYTES) return result
+            } catch (_: OutOfMemoryError) {
+                // Agla (chhota) step try karo.
+            } catch (_: Exception) {
+                // Agla step try karo.
+            } finally {
+                try {
+                    if (scaled != null && scaled !== bmp) scaled.recycle()
+                    bmp?.recycle()
+                } catch (_: Exception) { }
+            }
+        }
+        return null
     }
 
     /** Save ki hui files ke naam (sorted). */

@@ -13,6 +13,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import com.formmitra.app.engine.CardUnlockPolicy
 import org.json.JSONObject
 
 /**
@@ -190,6 +191,16 @@ object CardFlow {
             fetchDetailAndProceed(act, cardId, cardName, tok, onUnlocked)
             return
         }
+        // POINT 24 (revised): 5 galat PIN / 15 min → temporary lock.
+        val blockedUntil = CardStore.pinBlockedUntilMs(act, cardId)
+        if (blockedUntil > System.currentTimeMillis()) {
+            AlertDialog.Builder(act)
+                .setTitle("🔒 Card Lock Hai")
+                .setMessage(CardUnlockPolicy.pinBlockedText())
+                .setPositiveButton("Samajh gaya", null)
+                .show()
+            return
+        }
         val et = EditText(act).apply {
             inputType = InputType.TYPE_CLASS_NUMBER or
                 InputType.TYPE_NUMBER_VARIATION_PASSWORD
@@ -210,9 +221,27 @@ object CardFlow {
             .setTitle("🔒 Card Unlock (कार्ड खोलें)")
             .setView(wrap)
             .setPositiveButton("🔓 Kholo", null)
+            // POINT 27: PIN bhool gaye? → reset flow (OTP email par).
+            .setNeutralButton("PIN bhool gaye?", null)
             .setNegativeButton("Band karo", null)
             .create()
         dlg.setOnShowListener {
+            dlg.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                dlg.dismiss()
+                toast(act, "Email la raha hun…")
+                Thread({
+                    val email = try {
+                        AgentApi.profile(act)?.optString("email", "").orEmpty()
+                    } catch (_: Exception) { "" }
+                    act.runOnUiThread {
+                        try {
+                            PinResetFlow.show(act, cardId, cardName, email)
+                        } catch (t: Throwable) {
+                            android.util.Log.e("FmCardFlow", "pin reset failed", t)
+                        }
+                    }
+                }, "fm-pinreset-email").start()
+            }
             dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 val pin = et.text.toString().trim()
                 if (!pin.matches(Regex("\\d{4,8}"))) {
@@ -234,14 +263,26 @@ object CardFlow {
                                     toast(act, "⚠️ Token nahi mila — dobara try karo")
                                     return@runOnUiThread
                                 }
-                                CardStore.putToken(cardId, token, exp)
+                                // POINT 24 (revised): safal unlock → persistent
+                                // unlock ON + token encrypted persist.
+                                CardStore.recordPinAttempt(act, cardId, true)
+                                CardStore.setUnlocked(act, cardId)
+                                CardStore.putToken(act, cardId, token, exp)
                                 dlg.dismiss()
                                 fetchDetailAndProceed(
                                     act, cardId, cardName, token, onUnlocked
                                 )
                             }
-                            res.code == 403 ->
-                                et.error = "❌ Galat PIN — dobara dalo"
+                            res.code == 403 -> {
+                                // POINT 24: galat PIN gino — 5 par temporary lock.
+                                CardStore.recordPinAttempt(act, cardId, false)
+                                val b = CardStore.pinBlockedUntilMs(act, cardId)
+                                et.error = if (b > System.currentTimeMillis()) {
+                                    "🔒 " + CardUnlockPolicy.pinBlockedText()
+                                } else {
+                                    "❌ Galat PIN — dobara dalo"
+                                }
+                            }
                             res.code == -1 ->
                                 toast(act, "📡 Internet nahi — dobara try karo")
                             else -> toast(act, "⚠️ Unlock nahi hua — dobara try karo")
@@ -545,8 +586,12 @@ object CardFlow {
                             val token = u.json?.optString("card_token", "").orEmpty()
                             act.runOnUiThread {
                                 if (u.code == 200 && token.isNotEmpty()) {
+                                    // POINT 24 (revised): naya card turant
+                                    // persistent unlock + token persist.
+                                    CardStore.recordPinAttempt(act, id, true)
+                                    CardStore.setUnlocked(act, id)
                                     CardStore.putToken(
-                                        id, token,
+                                        act, id, token,
                                         u.json?.optString("expires_at", "")
                                     )
                                     CardStore.setSelectedCardId(act, id)

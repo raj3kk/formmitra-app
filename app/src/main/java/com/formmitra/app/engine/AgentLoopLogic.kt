@@ -15,19 +15,22 @@ package com.formmitra.app.engine
  */
 object AgentActions {
     /** Server se aane wale allowed actions (contract whitelist).
-     *  v21: server brain ab scroll/screenshot/captcha_* bhi bhej sakta hai
-     *  (BRAIN_ALLOWED_ACTIONS) — ye set usi se sync hai. */
+     *  AUTHORITATIVE (server act.ts, 2026-09-26 sync):
+     *    fill, select, toggle, press, click, upload, scroll, back,
+     *    screenshot, captcha_solve, set_desktop, research, goto,
+     *    wait_for_text, wait_for_element, wait_for_navigation,
+     *    done, needs_user
+     *  App-internal extensions (server kabhi nahi bhejta, loop khud
+     *  use karta hai — whitelist me rehna safe hai):
+     *    forward, captcha_detect, verify_submit, vetoed
+     */
     val ALL = setOf(
-        "fill", "select", "toggle", "press", "click", "goto",
-        "wait_for_text", "wait_for_element", "wait_for_navigation",
-        "back", "forward",
-        "upload", "scroll", "screenshot", "captcha_detect", "captcha_solve",
-        // v24 C15: final submit — click se pehle AI image-verification
-        // (POST /api/agent/verify) ke baad hi execute hota hai.
-        "verify_submit",
-        // v31: server brain ke naye actions — contract sync (server act.ts).
-        "set_desktop", "research",
-        "done", "needs_user", "vetoed"
+        "fill", "select", "toggle", "press", "click", "upload", "scroll",
+        "back", "screenshot", "captcha_solve", "set_desktop", "research",
+        "goto", "wait_for_text", "wait_for_element", "wait_for_navigation",
+        "done", "needs_user",
+        // App-internal extensions (neeche dekho).
+        "forward", "captcha_detect", "verify_submit", "vetoed"
     )
     /** Terminal actions — execute nahi hote, loop finish karte hain. */
     val TERMINAL = setOf("done", "needs_user", "vetoed")
@@ -108,6 +111,145 @@ object AgentActions {
     const val STUCK_REPEATS = 3
     /** stuck_count itna ho to user ko handoff. */
     const val STUCK_MAX = 4
+}
+
+/**
+ * ServerKinds — needs_user ke kinds (AUTHORITATIVE, server 2026-09-26).
+ * Server "choice" ko "option_choice" me canonicalize karta hai — app
+ * dono accept kare (purana server "choice" bheje to bhi chale).
+ */
+object ServerKinds {
+    const val OTP = "otp"
+    const val LOGIN = "login"
+    const val PAYMENT = "payment"
+    const val OPTION_CHOICE = "option_choice"
+    const val DESTRUCTIVE_CONFIRM = "destructive_confirm"
+    const val INPUT = "input"
+
+    /** needs_user ke saare valid kinds. */
+    val NEEDS_USER_KINDS = setOf(
+        OTP, LOGIN, PAYMENT, OPTION_CHOICE, DESTRUCTIVE_CONFIRM, INPUT
+    )
+
+    /**
+     * Kind canonicalize karo: "choice" → "option_choice" (server bhi
+     * yehi karta hai). GateLogic.normKind ke choice aliases
+     * (option/options/select_option) bhi chalte hain — yahan inline hai
+     * taaki ye file selftest me akele compile ho sake (GateLogic par
+     * dependency nahi). Unknown kind → null (caller reject karega).
+     */
+    fun canonicalize(raw: String?): String? {
+        val k = raw?.trim()?.ifEmpty { null } ?: return null
+        val lower = k.lowercase()
+        // choice family → option_choice (server canonicalization).
+        if (lower == "choice" || lower == "option" || lower == "options" ||
+            lower == "select_option"
+        ) return OPTION_CHOICE
+        // App-internal kinds (server nahi bhejta, loop khud use karta hai).
+        if (lower == "document" || lower == "device_auth" ||
+            lower == "card_unlock" || lower == "card_unlock_needed"
+        ) return lower
+        return if (lower in NEEDS_USER_KINDS) lower else null
+    }
+
+    /** Kya ye valid needs_user kind hai (canonical form me)? */
+    fun isValid(kind: String?): Boolean = canonicalize(kind) != null
+}
+
+/**
+ * PlanDetails — plan ke detail fields (AUTHORITATIVE, server 2026-09-26).
+ * Plan me: details_needed (canonical detail keys ki list),
+ * blocking_details (wo keys jinke bina kaam aage nahi badhega).
+ */
+object PlanDetails {
+    /**
+     * Plan map se keys nikalo. List<String> ya comma-string dono chalenge.
+     */
+    fun keysOf(plan: Map<String, Any?>, field: String): List<String> {
+        val raw = plan[field] ?: return emptyList()
+        return when (raw) {
+            is List<*> -> raw.mapNotNull { (it as? String)?.trim() }
+                .filter { it.isNotEmpty() }
+            is String -> raw.split(",").map { it.trim() }
+                .filter { it.isNotEmpty() }
+            else -> emptyList()
+        }
+    }
+
+    fun neededKeys(plan: Map<String, Any?>): List<String> =
+        keysOf(plan, "details_needed")
+
+    fun blockingKeys(plan: Map<String, Any?>): List<String> =
+        keysOf(plan, "blocking_details")
+
+    /**
+     * Keys ko baanto: pehle se pata (known map me non-empty) vs missing.
+     * @return (knownKeys, missingKeys)
+     */
+    fun partition(
+        keys: List<String>,
+        known: Map<String, String>
+    ): Pair<List<String>, List<String>> {
+        val knownKeys = ArrayList<String>()
+        val missing = ArrayList<String>()
+        for (k in keys) {
+            if (known[k].orEmpty().isNotEmpty()) knownKeys.add(k)
+            else missing.add(k)
+        }
+        return knownKeys to missing
+    }
+}
+
+/**
+ * PinActions — PIN lifecycle actions (AUTHORITATIVE, server 2026-09-26).
+ */
+object PinActions {
+    const val SETUP = "pin_setup"
+    const val CHANGE = "pin_change"
+    const val RESET_REQUEST = "pin_reset_request"
+    const val RESET_CONFIRM = "pin_reset_confirm"
+
+    val ALL = setOf(SETUP, CHANGE, RESET_REQUEST, RESET_CONFIRM)
+}
+
+/**
+ * OperatorCommands — /api/agent/operator/command ke commands
+ * (AUTHORITATIVE, server 2026-09-26).
+ */
+object OperatorCommands {
+    val ALL = setOf(
+        "tap", "scroll", "swipe", "type", "fill", "select",
+        "back", "forward", "reload", "screenshot", "set_desktop",
+        "captcha_request"
+    )
+
+    fun isValid(cmd: String?): Boolean =
+        cmd?.trim()?.lowercase() in ALL
+}
+
+/**
+ * ServerEvents — server→app broadcast events (AUTHORITATIVE, 2026-09-26).
+ */
+object ServerEvents {
+    const val ACTION_OFFER = "action_offer"
+    const val CARD_UNLOCK_NEEDED = "card_unlock_needed"
+
+    val ALL = setOf(ACTION_OFFER, CARD_UNLOCK_NEEDED)
+}
+
+/**
+ * CardEndpoints — card/operator REST endpoints (AUTHORITATIVE, 2026-09-26).
+ * {id} ko actual card id se replace karo.
+ */
+object CardEndpoints {
+    const val LOCK = "/api/cards/{id}/lock"
+    const val LOCK_ALL = "/api/cards/lock-all"
+    const val UNLOCK = "/api/cards/{id}/unlock"
+    const val OP_COMMAND = "/api/agent/operator/command"
+    const val OP_STATE = "/api/agent/operator/state"
+
+    fun lock(cardId: String): String = LOCK.replace("{id}", cardId)
+    fun unlock(cardId: String): String = UNLOCK.replace("{id}", cardId)
 }
 
 /**

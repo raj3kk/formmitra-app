@@ -167,6 +167,19 @@ object FmRealtime {
                     Log.e(TAG, "onTaskEvent failed (non-fatal)", t)
                 }
             }
+            // POINT 25: tracking → action offer (full payload realtime par).
+            "action_offer" -> {
+                try {
+                    val offer = TrackOffer.fromMap(payload)
+                    if (offer != null) {
+                        TrackOffer.receive(appCtx, offer)
+                    } else {
+                        Log.w(TAG, "action_offer invalid, ignore")
+                    }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "action_offer failed (non-fatal)", t)
+                }
+            }
             "operator_command" -> {
                 // Fullscreen operator console ke commands → automation
                 // WebView par execute (OperatorSession ka FormEngine).

@@ -717,6 +717,20 @@ class MainActivity : Activity() {
         try {
             com.formmitra.app.agent.FmRealtime.stop()
         } catch (_: Exception) { }
+        // POINT 24 (revised): sign-out → SAARE cards lock (persistent
+        // unlock tootega) + chat ka card state saaf.
+        // CONTRACT SYNC: server ko bhi lock-all batao (tokens server par marein).
+        try {
+            com.formmitra.app.agent.CardStore.lockAll(this)
+        } catch (_: Exception) { }
+        Thread({
+            try {
+                com.formmitra.app.agent.AgentApi.lockAllCards(this)
+            } catch (_: Exception) { }
+        }, "fm-card-lockall").start()
+        try {
+            if (::agentChatView.isInitialized) agentChatView.onLoggedOut()
+        } catch (_: Exception) { }
         try {
             if (::profileView.isInitialized) profileView.onLoggedOut()
         } catch (_: Exception) { }

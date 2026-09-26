@@ -2,7 +2,7 @@ package com.formmitra.app;
 
 // BuildConfig.java — build-apk.sh syncs these (source of truth = script vars).
 public final class BuildConfig {
-    public static final int VERSION_CODE = 30;
-    public static final String VERSION_NAME = "1.0.30-v30";
+    public static final int VERSION_CODE = 31;
+    public static final String VERSION_NAME = "1.0.31-v31";
     public static final String SITE_URL = "https://formmitra-git-main-webbuilder1.vercel.app/";
 }
