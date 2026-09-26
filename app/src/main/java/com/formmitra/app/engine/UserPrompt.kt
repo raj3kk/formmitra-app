@@ -131,6 +131,57 @@ object UserPrompt {
         }
     }
 
+    /**
+     * v34 (Phase 2A, non-blocking OTP): prompt UTHAO par wait mat karo.
+     * pending set + raised listeners (notification + PendingPromptStore) —
+     * run park ho jayega, queue ka agla kaam chalega. Jawab aane par
+     * OtpPark.onAnswered() resume karega; resumed loop consumeAnswer()
+     * se jawab turant lega.
+     */
+    fun raiseOnly(req: Request) {
+        synchronized(lock) {
+            pending = req
+            answerJson = null
+            answeredRun = ""
+            (lock as Object).notifyAll()
+        }
+        try {
+            fireRaised(req)
+        } catch (_: Exception) { }
+    }
+
+    /**
+     * v34: pehle se aaya jawab lo (parked-resume / SMS auto-fill).
+     * Mila to use + clear karke wapas; nahi to null. Consume-once.
+     */
+    fun consumeAnswer(runId: String): String? {
+        synchronized(lock) {
+            if (answeredRun == runId && answerJson != null) {
+                val a = answerJson
+                answerJson = null
+                answeredRun = ""
+                return a
+            }
+            return null
+        }
+    }
+
+    /** v34: bina consume kiye check — parked-finish race me resume trigger ke liye. */
+    fun hasAnswer(runId: String): Boolean = synchronized(lock) {
+        answeredRun == runId && answerJson != null
+    }
+
+    /** v34: parked-resume par jawab consume ho gaya — pending saaf + resolved fire. */
+    fun resolveConsumed(runId: String) {
+        synchronized(lock) {
+            if (pending?.runId == runId) pending = null
+            (lock as Object).notifyAll()
+        }
+        try {
+            fireResolved(runId)
+        } catch (_: Exception) { }
+    }
+
     /** UI thread se: user ne jawab diya. */
     fun answer(runId: String, answer: String) {
         synchronized(lock) {
@@ -172,7 +223,8 @@ object UserPrompt {
     fun autoFillOtp(ctx: android.content.Context, otp: String): Boolean {
         val req = synchronized(lock) { pending } ?: return false
         if (req.kind != "otp") return false
-        if (!otp.matches(Regex("\\d{4,8}"))) return false
+        // v34: OtpParser.looksLikeOtp — "12-34-56" jaise format bhi.
+        if (!com.formmitra.app.engine.OtpParser.looksLikeOtp(otp)) return false
         val ans = try {
             org.json.JSONObject()
                 .put("approved", true)
@@ -180,6 +232,10 @@ object UserPrompt {
                 .toString()
         } catch (_: Exception) { return false }
         answer(req.runId, ans)
+        // v34: parked ho to turant resume; format check OtpParser se.
+        try {
+            com.formmitra.app.engine.OtpPark.onAnswered(ctx, req.runId)
+        } catch (_: Exception) { }
         return true
     }
 

@@ -55,24 +55,7 @@ class WakeWorker(appContext: Context, params: WorkerParameters) :
                     "WakeWorker",
                     "resuming pending run at step ${pending.stepsTaken} (task=${pending.taskId})"
                 )
-                val task = JSONObject()
-                    .put("id", pending.taskId)
-                    .put("task_id", pending.taskId)
-                    .put("run_id", pending.runId.ifEmpty { pending.taskId })
-                    .put("name", pending.goal.take(80))
-                    .put("resumed", true)
-                    .put(
-                        "steps",
-                        JSONArray().put(
-                            JSONObject()
-                                .put("type", "agent_run")
-                                .put("goal", pending.goal)
-                                .put("url", pending.url)
-                                .put("category", pending.category)
-                                .put("start_step", pending.stepsTaken)
-                                .put("resume_summary", pending.summary)
-                        )
-                    )
+                val task = buildResumeTask(pending)
                 try {
                     FormRunService.startWithTask(ctx, task)
                 } catch (e: Exception) {
@@ -103,6 +86,32 @@ class WakeWorker(appContext: Context, params: WorkerParameters) :
     }
 
     companion object {
+        /**
+         * v34: parked-OTP resume ke liye synthetic task — WakeWorker wali
+         * hi path (usi step se resume). OtpPark.onAnswered se reuse hota hai.
+         */
+        fun buildResumeTask(
+            pending: com.formmitra.app.engine.AgentResume.PendingRun
+        ): org.json.JSONObject =
+            org.json.JSONObject()
+                .put("id", pending.taskId)
+                .put("task_id", pending.taskId)
+                .put("run_id", pending.runId.ifEmpty { pending.taskId })
+                .put("name", pending.goal.take(80))
+                .put("resumed", true)
+                .put(
+                    "steps",
+                    org.json.JSONArray().put(
+                        org.json.JSONObject()
+                            .put("type", "agent_run")
+                            .put("goal", pending.goal)
+                            .put("url", pending.url)
+                            .put("category", pending.category)
+                            .put("start_step", pending.stepsTaken)
+                            .put("resume_summary", pending.summary)
+                    )
+                )
+
         /** Turant wake — network constraint ke saath (battery-friendly). */
         fun enqueue(ctx: Context) {
             try {

@@ -555,21 +555,37 @@ object AgentLoop {
                         val promptObj = stepMap["user_prompt"] as? Map<String, Any?>
                         if (promptObj != null) {
                             val runIdNow = agentRunId ?: effectiveRunId
-                            val ok = handleServerPrompt(
+                            // v34: 0 = continue, 1 = needs_user, 2 = OTP parked
+                            // (non-blocking — queue aage badhegi, jawab par auto-resume).
+                            val pr = handleServerPrompt(
                                 ctx, engine, promptObj,
                                 runIdNow, userProvided, sensitiveKeys, history
                             )
-                            if (!ok) {
+                            if (pr == 2) {
+                                val site = OtpPark.parkedSite(ctx).ifEmpty { "site" }
+                                return finish(
+                                    "needs_user",
+                                    "[otp_parked] OTP ka intezaar hai ($site) — SMS aate hi apne aap bhar jayega, " +
+                                        "ya app me bhar do. Baaki kaam chalta rahega; jawab milte hi ye kaam " +
+                                        "apne aap aage badhega."
+                                )
+                            }
+                            if (pr != 0) {
                                 // Batch utha? (non-blocking) → park message.
                                 // Nahi → purana timeout/decline message.
                                 val batched = try {
                                     com.formmitra.app.agent.DetailBatchStore
                                         .get(ctx, runIdNow) != null
                                 } catch (_: Exception) { false }
+                                val pkind = (promptObj["kind"] as? String).orEmpty()
                                 return finish(
                                     "needs_user",
-                                    if (batched) "[details_batch] Kuch details chahiye — app me bhar dein, kaam apne aap aage badhega"
-                                    else "Aapka jawab nahi mila / mana kiya — kaam ruka hai, app khol ke dekhein"
+                                    when {
+                                        batched -> "[details_batch] Kuch details chahiye — app me bhar dein, kaam apne aap aage badhega"
+                                        pkind == "otp" -> "OTP verify nahi ho saka — galat/expire OTP ya jawab nahi mila. " +
+                                            "App khol ke sahi OTP do, kaam wahin se aage badhega."
+                                        else -> "Aapka jawab nahi mila / mana kiya — kaam ruka hai, app khol ke dekhein"
+                                    }
                                 )
                             }
                             consecErrors = 0
@@ -1145,8 +1161,9 @@ object AgentLoop {
 
     /**
      * Server ke structured user_prompt ko popup me badlo.
-     * true = jawab mila aur apply ho gaya (loop continue kare);
-     * false = timeout / cancel / mana.
+     * v34: Int return — 0 = jawab mila aur apply ho gaya (loop continue);
+     * 1 = timeout / cancel / mana (needs_user finish);
+     * 2 = OTP parked (non-blocking — run park, queue aage, jawab par auto-resume).
      */
     private fun handleServerPrompt(
         ctx: Context,
@@ -1156,40 +1173,42 @@ object AgentLoop {
         userProvided: JSONObject,
         sensitiveKeys: MutableSet<String>,
         history: ArrayList<JSONObject>
-    ): Boolean {
+    ): Int {
         // CONTRACT SYNC (2026-09-26): kind canonicalize — server "choice"
         // ko "option_choice" bhejta hai; purana "choice" bhi accept.
         val kind = ServerKinds.canonicalize(prompt["kind"] as? String)
             ?: "input"
-        val req = buildPromptRequest(runId, kind, prompt)
+        // v34: OTP popup me site ka naam — engine se host nikalo.
+        val otpSite = if (kind == "otp") siteHost(engine) else ""
+        val req = buildPromptRequest(runId, kind, prompt, otpSite)
         // NOTE: duplicate notification nahi — UserPrompt.ask par FmApp ka
         // raised-listener NotifCenter se notify + PendingPrompt persist
         // karta hai (K1/K4). Yahan sirf automation logic.
         if (kind == "payment") {
-            return doPaymentFlow(ctx, engine, req, runId) == "verified"
+            return if (doPaymentFlow(ctx, engine, req, runId) == "verified") 0 else 1
         }
         // ---- L1-UPGRADE: puchhne se PEHLE permanent automation ----
         if (kind == "login") {
             // Saved credentials ho to apne aap login — user se mat puchho
-            if (tryAutoLogin(ctx, engine, runId, sensitiveKeys, history)) return true
+            if (tryAutoLogin(ctx, engine, runId, sensitiveKeys, history)) return 0
             // POINT 19: saved login hai par auto-fill nahi hua → user ko
             // CHOICE do (retry / naya login / saved hatao). true = ho gaya.
             if (offerSavedLoginChoice(ctx, engine, runId, sensitiveKeys, history)) {
-                return true
+                return 0
             }
         }
         if (kind == "document") {
             // Vault me sahi document ho to apne aap attach
-            if (tryAutoDocument(ctx, engine, req.docType, userProvided, history)) return true
+            if (tryAutoDocument(ctx, engine, req.docType, userProvided, history)) return 0
         }
         if (kind == "choice" || kind == ServerKinds.OPTION_CHOICE) {
-            return handleChoicePrompt(ctx, engine, req, userProvided, history)
+            return if (handleChoicePrompt(ctx, engine, req, userProvided, history)) 0 else 1
         }
         // CONTRACT SYNC (2026-09-26): destructive_confirm — server ka
         // destructive gate. HAMESHA user confirmation; permanent automation
         // approval ise bypass NAHI kar sakta. Background-safe (UserPrompt).
         if (kind == ServerKinds.DESTRUCTIVE_CONFIRM) {
-            return handleDestructiveConfirm(ctx, runId, prompt, history)
+            return if (handleDestructiveConfirm(ctx, runId, prompt, history)) 0 else 1
         }
         if (kind == "device_auth") {
             // User-gated #2 (biometric/device PIN): sirf user de sakta hai.
@@ -1198,14 +1217,14 @@ object AgentLoop {
                 ctx,
                 "Ab aapko apne phone par fingerprint ya PIN dena hai — baaki sab taiyar hai."
             )
-            val devStr = UserPrompt.ask(req) ?: return false
-            val devAns = try { JSONObject(devStr) } catch (_: Exception) { return false }
+            val devStr = UserPrompt.ask(req) ?: return 1
+            val devAns = try { JSONObject(devStr) } catch (_: Exception) { return 1 }
             val ok = devAns.optBoolean("approved", false)
             history.add(
                 JSONObject().put("action", "device_auth")
                     .put("result", if (ok) "ok" else "cancelled")
             )
-            return ok
+            return if (ok) 0 else 1
         }
         // POINT 22: run ke beech Card lock → chat me one-tap unlock popup.
         // Run park hota hai (false); unlock par apne aap resume — restart nahi.
@@ -1229,7 +1248,7 @@ object AgentLoop {
                         .put("detail", "card $cardId lock — user unlock karega to resume")
                 )
             } catch (_: Exception) { }
-            return false
+            return 1
         }
         // ---- L1-UPGRADE: input — DetailStore (device-local saved details)
         // se jo pata ho wo seedha bharo; sirf jo NA mile uske liye puchho.
@@ -1241,22 +1260,50 @@ object AgentLoop {
         var askReq = req
         if (kind == "input") {
             if (tryAutoFillInput(ctx, engine, req, prompt, userProvided, sensitiveKeys, history)) {
-                return true
+                return 0
             }
             val fields = DetailBatchLogic.parseFields(prompt["fields"])
             if (fields.isNotEmpty()) {
                 raiseDetailBatch(ctx, runId, req.title, fields, history)
-                return false
+                return 1
             }
             val prefill = collectKnownInputValues(ctx, req)
             if (prefill.isNotEmpty()) askReq = req.copy(prefill = prefill)
         }
-        val ansStr = UserPrompt.ask(askReq) ?: return false
-        val ans = try { JSONObject(ansStr) } catch (_: Exception) { return false }
-        if (!ans.optBoolean("approved", false)) return false
+        // v34 (Phase 2A, point 6): OTP gate NON-BLOCKING.
+        // Pehle: UserPrompt.ask run-thread ko 600s tak block karta tha —
+        // queue ka agla kaam atka rehta tha.
+        // Ab: jawab pehle se aaya ho (parked answer / SMS auto-fill) to
+        // turant apply; nahi to prompt uthao + run PARK (2) — queue aage
+        // badhegi, jawab (manual dialog / SMS) aate hi OtpPark.onAnswered
+        // usi step se resume karega.
+        if (kind == "otp") {
+            val site = otpSite
+            val pre = UserPrompt.consumeAnswer(runId)
+            if (pre != null) {
+                UserPrompt.resolveConsumed(runId)
+                OtpPark.unpark(ctx)
+                val preAns = try { JSONObject(pre) } catch (_: Exception) { return 1 }
+                if (!preAns.optBoolean("approved", false)) return 1
+                return applyOtpAnswer(
+                    ctx, engine, prompt, runId, askReq, preAns,
+                    userProvided, sensitiveKeys, history, site
+                )
+            }
+            OtpPark.park(ctx, runId, site, 0)
+            UserPrompt.raiseOnly(askReq)
+            history.add(
+                JSONObject().put("action", "otp_parked").put("result", "parked")
+                    .put("detail", "OTP ka intezaar ($site) — queue aage badhegi, jawab par auto-resume")
+            )
+            return 2
+        }
+        val ansStr = UserPrompt.ask(askReq) ?: return 1
+        val ans = try { JSONObject(ansStr) } catch (_: Exception) { return 1 }
+        if (!ans.optBoolean("approved", false)) return 1
         when (kind) {
-            "login" -> return handleLoginPrompt(ctx, engine, req, ans, sensitiveKeys, history)
-            "document" -> return handleDocumentPrompt(ctx, engine, req, ans, userProvided, history)
+            "login" -> return if (handleLoginPrompt(ctx, engine, req, ans, sensitiveKeys, history)) 0 else 1
+            "document" -> return if (handleDocumentPrompt(ctx, engine, req, ans, userProvided, history)) 0 else 1
             else -> { // otp | input
                 // field key -> type (sensitive = otp/password: KABHI server/AI
                 // ko mat bhejo, sirf page me locally bharo)
@@ -1348,7 +1395,7 @@ object AgentLoop {
                 }
             }
         }
-        return true
+        return 0
     }
 
     // =====================================================================
@@ -1954,10 +2001,20 @@ object AgentLoop {
             k.contains("cvv") || k.contains("card_pin") || k == "pin"
     }
 
+
+    /**
+     * v34 (Phase 2A): OTP target — single field ya multi-box digit group.
+     */
+    private sealed class OtpTarget {
+        data class Single(val mode: String, val value: String) : OtpTarget()
+        data class Boxes(val boxes: List<Pair<String, String>>) : OtpTarget()
+    }
+
     /**
      * OTP/password ko page me LOCAL bharo (server/AI ko value kabhi nahi bheji jati).
-     * fill_selector (server ne diya) → nahi to page par OTP field auto-detect.
-     * true = bhara + verified.
+     * fill_selector (server ne diya) → nahi to OtpFieldDetect auto-detect
+     * (single field + multi-box per-digit fill).
+     * true = bhara; verify alag step (submitOtpAndVerify).
      */
     private fun fillSecretLocally(
         engine: FormEngine,
@@ -1966,60 +2023,251 @@ object AgentLoop {
     ): Boolean {
         @Suppress("UNCHECKED_CAST")
         val sel = prompt["fill_selector"] as? Map<String, Any?>
-        var mode = sel?.get("mode") as? String ?: ""
-        var selVal = sel?.get("value") as? String ?: ""
-        if (mode.isEmpty() || selVal.isEmpty()) {
-            val found = findOtpField(engine)
-            if (found == null) return false
-            mode = found.first
-            selVal = found.second
+        val mode = sel?.get("mode") as? String ?: ""
+        val selVal = sel?.get("value") as? String ?: ""
+        if (mode.isNotEmpty() && selVal.isNotEmpty()) return fillOne(engine, mode, selVal, value)
+        return when (val target = findOtpTarget(engine)) {
+            null -> false
+            is OtpTarget.Single -> fillOne(engine, target.mode, target.value, value)
+            is OtpTarget.Boxes -> {
+                // OTP lamba ho boxes se → fit nahi hoga (saaf fail).
+                if (value.length > target.boxes.size) return false
+                var ok = true
+                target.boxes.forEachIndexed { i, b ->
+                    val digit = if (i < value.length) value[i].toString() else ""
+                    if (digit.isNotEmpty() && !fillOne(engine, b.first, b.second, digit)) ok = false
+                }
+                ok
+            }
         }
-        return try {
+    }
+
+    private fun fillOne(engine: FormEngine, mode: String, selVal: String, text: String): Boolean =
+        try {
             val detail = engine.runAgentStep(
                 JSONObject().put("type", "fill")
                     .put(
                         "selector",
                         JSONObject().put("mode", mode).put("value", selVal)
                     )
-                    .put("text", value)
+                    .put("text", text)
             )
             detail.optBoolean("verified", true)
         } catch (_: Exception) {
             false
         }
-    }
 
-    /** Page par OTP field dhoondho (label/placeholder/aria/name/id me "otp"). */
-    private fun findOtpField(engine: FormEngine): Pair<String, String>? {
+    /** v34: OtpFieldDetect adapter — page par OTP field (single/multi-box) dhoondho. */
+    private fun findOtpTarget(engine: FormEngine): OtpTarget? {
         val snap = try { engine.domSnapshot() } catch (_: Exception) { return null }
         val fields = snap.optJSONArray("fields") ?: return null
-        for (i in 0 until fields.length()) {
-            val f = fields.optJSONObject(i) ?: continue
-            val tag = f.optString("tag", "")
-            if (tag != "input" && tag != "textarea") continue
-            val t = f.optString("type", "").lowercase()
-            if (t == "hidden" || t == "submit" || t == "button" ||
-                t == "checkbox" || t == "radio" || t == "file"
-            ) continue
-            val blob = (f.optString("label", "") + " " + f.optString("placeholder", "") +
-                " " + f.optString("aria", "") + " " + f.optString("name", "") +
-                " " + f.optString("id", "")).lowercase()
-            if (!blob.contains("otp")) continue
-            val id = f.optString("id", "")
-            val nm = f.optString("name", "")
-            val ph = f.optString("placeholder", "")
-            val label = f.optString("label", "")
-            val aria = f.optString("aria", "")
-            return when {
-                id.isNotEmpty() -> "id" to id
-                nm.isNotEmpty() -> "name" to nm
-                ph.isNotEmpty() -> "placeholder" to ph
-                label.isNotEmpty() -> "label" to label
-                aria.isNotEmpty() -> "aria" to aria
-                else -> continue
+        val fs = (0 until fields.length()).mapNotNull { i ->
+            val f = fields.optJSONObject(i) ?: return@mapNotNull null
+            OtpFieldDetect.Field(
+                tag = f.optString("tag", ""),
+                type = f.optString("type", ""),
+                label = f.optString("label", ""),
+                placeholder = f.optString("placeholder", ""),
+                aria = f.optString("aria", ""),
+                name = f.optString("name", ""),
+                id = f.optString("id", ""),
+                maxLen = f.optInt("maxlength", -1)
+            )
+        }
+        // Multi-box pehle (common OTP UI), phir best single field.
+        val boxes = OtpFieldDetect.boxGroup(fs)
+        if (boxes != null) {
+            return OtpTarget.Boxes(boxes.map { selectorMode(it) to selectorValue(it) })
+        }
+        val best = OtpFieldDetect.bestField(fs) ?: return null
+        return OtpTarget.Single(selectorMode(best), selectorValue(best))
+    }
+
+    private fun selectorMode(f: OtpFieldDetect.Field): String = when {
+        f.id.isNotEmpty() -> "id"
+        f.name.isNotEmpty() -> "name"
+        f.placeholder.isNotEmpty() -> "placeholder"
+        f.label.isNotEmpty() -> "label"
+        f.aria.isNotEmpty() -> "aria"
+        else -> "id"
+    }
+
+    private fun selectorValue(f: OtpFieldDetect.Field): String = when {
+        f.id.isNotEmpty() -> f.id
+        f.name.isNotEmpty() -> f.name
+        f.placeholder.isNotEmpty() -> f.placeholder
+        f.label.isNotEmpty() -> f.label
+        f.aria.isNotEmpty() -> f.aria
+        else -> ""
+    }
+
+    /** Current page ka host — OTP popup me site pehchan ke liye ("example.gov.in ke liye OTP"). */
+    private fun siteHost(engine: FormEngine): String = try {
+        val h = java.net.URL(engine.pageUrl()).host.orEmpty().lowercase()
+        h.removePrefix("www.")
+    } catch (_: Exception) { "" }
+
+    /**
+     * v34 (Phase 2A, points 4+5): OTP bharne ke baad Verify/Submit dabao,
+     * result classify karo; FAILURE par 1 retry (total 2 attempts).
+     * true = success confirm; false = failure/unknown.
+     */
+    private fun submitOtpAndVerify(engine: FormEngine): Boolean {
+        repeat(2) { attempt ->
+            val before = try { engine.domSnapshot() } catch (_: Exception) { return false }
+            val beforeUrl = before.optString("url", "")
+            val beforeText = before.optString("page_text", "")
+            val btns = before.optJSONArray("buttons")
+            val btnTexts = (0 until (btns?.length() ?: 0))
+                .mapNotNull { btns?.optJSONObject(it)?.optString("text", "") }
+            val btnText = OtpFieldDetect.submitButtonText(btnTexts)
+            val clicked = if (btnText != null) {
+                try {
+                    engine.runAgentStep(
+                        JSONObject().put("type", "click").put(
+                            "selector",
+                            JSONObject().put("mode", "text").put("value", btnText)
+                        )
+                    )
+                    true
+                } catch (_: Exception) { false }
+            } else {
+                // Koi button na mile → Enter dabao (OTP forms aksar Enter par submit hote hain).
+                engine.dispatchEnterKey()
+            }
+            if (!clicked) return false
+            try { Thread.sleep(3000) } catch (_: Exception) { }
+            val after = try { engine.domSnapshot() } catch (_: Exception) { null }
+            val result = OtpFieldDetect.classifyResult(
+                beforeUrl, after?.optString("url", "") ?: "",
+                beforeText, after?.optString("page_text", "") ?: ""
+            )
+            if (result == OtpFieldDetect.Result.SUCCESS) return true
+            if (result == OtpFieldDetect.Result.FAILURE && attempt == 0) {
+                try { Thread.sleep(1500) } catch (_: Exception) { }
+                return@repeat
+            }
+            return false
+        }
+        return false
+    }
+
+    /**
+     * v34: aaye hue OTP jawab ko apply karo — field bharo → verify dabao →
+     * result check → galat OTP par 1 baar dobara maango.
+     * Return: 0 = success (loop continue), 1 = needs_user finish, 2 = dobara parked.
+     */
+    private fun applyOtpAnswer(
+        ctx: Context,
+        engine: FormEngine,
+        prompt: Map<String, Any?>,
+        runId: String,
+        askReq: UserPrompt.Request,
+        ans: JSONObject,
+        userProvided: JSONObject,
+        sensitiveKeys: MutableSet<String>,
+        history: ArrayList<JSONObject>,
+        site: String
+    ): Int {
+        // field key -> type (sensitive = otp/password: KABHI server/AI ko
+        // mat bhejo, sirf page me locally bharo) — else-branch wala pattern.
+        val fieldTypes = ((prompt["fields"] as? List<*>) ?: emptyList<Any?>())
+            .mapNotNull { it as? Map<String, Any?> }
+            .associate {
+                ((it["key"] as? String) ?: "value") to
+                    ((it["type"] as? String) ?: "text")
+            }
+        var otpValue = ""
+        var otpKey = ""
+        val keys = ans.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            val t = fieldTypes[k].orEmpty()
+            if (isSensitiveField(k, t)) {
+                otpValue = ans.optString(k, "")
+                otpKey = k
+                break
             }
         }
-        return null
+        // Fallback: pehli non-empty string value.
+        if (otpValue.isEmpty()) {
+            val keys2 = ans.keys()
+            while (keys2.hasNext()) {
+                val k = keys2.next()
+                if (k == "approved") continue
+                val v = ans.optString(k, "")
+                if (v.isNotEmpty()) { otpValue = v; otpKey = k; break }
+            }
+        }
+        if (otpValue.isEmpty()) {
+            history.add(
+                JSONObject().put("action", "otp_fill").put("result", "empty")
+                    .put("detail", "OTP jawab khaali mila — dobara maanga jayega")
+            )
+            return reaskOtp(ctx, runId, askReq, history, site)
+        }
+        if (otpKey.isNotEmpty()) sensitiveKeys.add(otpKey)
+        // OTP kabhi server/AI/history/notifications me nahi jata — sirf local fill.
+        if (!OtpParser.looksLikeOtp(otpValue)) {
+            history.add(
+                JSONObject().put("action", "otp_fill").put("result", "invalid")
+                    .put("detail", "OTP format theek nahi laga — dobara maanga jayega")
+            )
+            return reaskOtp(ctx, runId, askReq, history, site)
+        }
+        if (!fillSecretLocally(engine, prompt, otpValue)) {
+            history.add(
+                JSONObject().put("action", "otp_fill").put("result", "field_not_found")
+                    .put("detail", "Page par OTP field nahi mila ($site)")
+            )
+            return 1
+        }
+        history.add(
+            JSONObject().put("action", "otp_fill").put("result", "ok")
+                .put("detail", "OTP bhara ($site) — verify dabakar result check ho raha hai")
+        )
+        if (submitOtpAndVerify(engine)) {
+            history.add(
+                JSONObject().put("action", "otp_verify").put("result", "success")
+                    .put("detail", "OTP verify ho gaya ($site)")
+            )
+            return 0
+        }
+        // Verify fail → 1 baar dobara OTP maango (parked), phir needs_user.
+        history.add(
+            JSONObject().put("action", "otp_verify").put("result", "failed")
+                .put("detail", "OTP galat/expire lag raha hai ($site)")
+        )
+        return reaskOtp(ctx, runId, askReq, history, site)
+    }
+
+    /**
+     * Galat/expire OTP par 1 baar dobara maango (site ka naam saaf dikhe).
+     * Limit khatam → 1 (needs_user, caller saaf message dega).
+     */
+    private fun reaskOtp(
+        ctx: Context,
+        runId: String,
+        askReq: UserPrompt.Request,
+        history: ArrayList<JSONObject>,
+        site: String
+    ): Int {
+        val retry = OtpPark.parkedRetry(ctx)
+        if (retry >= 1) {
+            OtpPark.unpark(ctx)
+            return 1
+        }
+        val again = askReq.copy(
+            message = "Pichla OTP galat tha ya expire ho gaya — naya OTP do.\n" +
+                "Site: $site"
+        )
+        OtpPark.park(ctx, runId, site, retry + 1)
+        UserPrompt.raiseOnly(again)
+        history.add(
+            JSONObject().put("action", "otp_reask").put("result", "parked")
+                .put("detail", "Naya OTP maanga gaya ($site)")
+        )
+        return 2
     }
 
     /** user_provided ka filtered copy — sensitive keys kabhi server/AI ko nahi jate. */
@@ -2183,7 +2431,8 @@ object AgentLoop {
     private fun buildPromptRequest(
         runId: String,
         kind: String,
-        prompt: Map<String, Any?>
+        prompt: Map<String, Any?>,
+        site: String = ""
     ): UserPrompt.Request {
         var fields = ((prompt["fields"] as? List<*>) ?: emptyList<Any>())
             .mapNotNull { it as? Map<String, Any?> }
@@ -2220,12 +2469,17 @@ object AgentLoop {
                 (payMap?.get("upi_id") as? String) ?: ""
             )
         } else null
+        // v34: OTP popup me site saaf dikhe — "example.gov.in ke liye OTP".
+        val baseMsg = (prompt["message"] as? String)?.ifEmpty { null }
+            ?: "Agent ko aapki zaroorat hai"
+        val fullMsg = if (kind == "otp" && site.isNotEmpty() &&
+            !baseMsg.contains(site)
+        ) "$baseMsg\nSite: $site" else baseMsg
         return UserPrompt.Request(
             runId = runId,
             kind = kind,
             title = (prompt["title"] as? String)?.ifEmpty { null } ?: "Madad chahiye",
-            message = (prompt["message"] as? String)?.ifEmpty { null }
-                ?: "Agent ko aapki zaroorat hai",
+            message = fullMsg,
             fields = fields,
             options = options,
             payment = payment,

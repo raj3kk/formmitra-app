@@ -167,6 +167,12 @@ run_test_settings() {
 }
 run_test_settings
 
+# v34 (Phase 2A): OtpParser + OtpFieldDetect (pure Kotlin, no Android)
+run_test selftest_otp SelfTestOtpKt \
+  "$SRC/engine/OtpParser.kt" \
+  "$SRC/engine/OtpFieldDetect.kt" \
+  "$APP/tools/selftest/SelfTestOtp.kt"
+
 echo "==============================="
 echo "TOTAL PASS: $TOTAL_PASS"
 echo "TOTAL FAILURES: $TOTAL_FAIL"

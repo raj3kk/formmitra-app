@@ -906,6 +906,10 @@ object PromptDialog {
 
     private fun answer(activity: Activity, req: UserPrompt.Request, map: Map<String, Any?>) {
         UserPrompt.answer(req.runId, PaymentFlow.answerJson(map))
+        // v34: parked-OTP jawab — run turant usi step se resume ho.
+        try {
+            com.formmitra.app.engine.OtpPark.onAnswered(activity, req.runId)
+        } catch (_: Exception) { }
         showingFor = ""
         VoiceOutput.stop()
     }

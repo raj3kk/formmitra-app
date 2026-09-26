@@ -300,6 +300,14 @@ class FormRunService : Service() {
                 runTask(task, name)
             } finally {
                 releaseClaim(claimId)
+                // v34 (Phase 2A): parked-OTP race — jawab park→finish ke
+                // beech aa gaya ho to turant resume (claim ab free hai).
+                try {
+                    val pid = OtpPark.parkedRunId(this)
+                    if (pid.isNotEmpty() && UserPrompt.hasAnswer(pid)) {
+                        OtpPark.onAnswered(this, pid)
+                    }
+                } catch (_: Exception) { }
                 // POINT 28: line ka agla kaam shuru karo (ho to).
                 try {
                     if (pumpQueue(this)) {

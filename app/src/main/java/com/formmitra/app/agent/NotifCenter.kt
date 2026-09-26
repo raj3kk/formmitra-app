@@ -111,7 +111,15 @@ object NotifCenter {
             }
             val appCtx = ctx.applicationContext
             ensureChannels(appCtx)
-            val id = notifId(cat, if (key.isNotEmpty()) key else "$title|$body")
+            // v34 (Phase 2A, point 8): OTP kabhi notification preview me
+            // poora nahi dikhega — central mask (sab notifications isi se guzarte hain).
+            val safeTitle = try {
+                com.formmitra.app.engine.GateLogic.maskOtp(title)
+            } catch (_: Exception) { title }
+            val safeBody = try {
+                com.formmitra.app.engine.GateLogic.maskOtp(body)
+            } catch (_: Exception) { body }
+            val id = notifId(cat, if (key.isNotEmpty()) key else "$safeTitle|$safeBody")
             val tap = deepPendingIntent(appCtx, id, deepTab, deepRunId, openPromptRunId, deepUrl)
             val nb = if (Build.VERSION.SDK_INT >= 26) {
                 Notification.Builder(appCtx, cat.channelId)
@@ -119,9 +127,9 @@ object NotifCenter {
                 @Suppress("DEPRECATION")
                 Notification.Builder(appCtx)
             }
-            nb.setContentTitle(title.take(60))
-                .setContentText(body.take(240))
-                .setStyle(Notification.BigTextStyle().bigText(body.take(400)))
+            nb.setContentTitle(safeTitle.take(60))
+                .setContentText(safeBody.take(240))
+                .setStyle(Notification.BigTextStyle().bigText(safeBody.take(400)))
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .setContentIntent(tap)
                 .setAutoCancel(true)

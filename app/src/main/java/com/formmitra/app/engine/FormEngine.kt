@@ -290,7 +290,8 @@ class FormEngine(private val appContext: Context) {
           try{ nm=(el.getAttribute('name')||'').slice(0,60); }catch(e){}
           var val='';
           try{ val = (t==='password') ? '' : ((el.value||'')+'').slice(0,120); }catch(e){}
-          fields.push({tag:tag,type:t,label:labelText(el),placeholder:ph,aria:ar,id:id,name:nm,rect:rect(el),value:val});
+          try{ ml=parseInt(el.getAttribute('maxlength')||'0',10)||0; }catch(e){ ml=0; }
+          fields.push({tag:tag,type:t,label:labelText(el),placeholder:ph,aria:ar,id:id,name:nm,maxlength:ml,rect:rect(el),value:val});
         });
       });
       var buttons=[];
@@ -518,6 +519,27 @@ class FormEngine(private val appContext: Context) {
     fun pageUrl(): String = try {
         unwrapJsString(evalJsSync("location.href", 10_000))
     } catch (_: Exception) { "" }
+
+    /**
+     * v34 (Phase 2A): Enter key WebView ko bhejo — OTP submit fallback
+     * (koi Verify/Submit button na mile to). Main thread par chalta hai.
+     */
+    fun dispatchEnterKey(): Boolean = try {
+        onMain {
+            val wv = webView ?: return@onMain false
+            val down = android.view.KeyEvent(
+                android.view.KeyEvent.ACTION_DOWN,
+                android.view.KeyEvent.KEYCODE_ENTER
+            )
+            val up = android.view.KeyEvent(
+                android.view.KeyEvent.ACTION_UP,
+                android.view.KeyEvent.KEYCODE_ENTER
+            )
+            wv.dispatchKeyEvent(down)
+            wv.dispatchKeyEvent(up)
+            true
+        }
+    } catch (_: Exception) { false }
 
     private fun unwrapJsObject(raw: String): JSONObject {
         return try {

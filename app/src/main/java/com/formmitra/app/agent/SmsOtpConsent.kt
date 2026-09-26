@@ -122,7 +122,8 @@ object SmsOtpConsent {
         try {
             if (resCode == Activity.RESULT_OK && data != null) {
                 val msg = data.getStringExtra(SmsRetriever.EXTRA_SMS_MESSAGE)
-                val otp = parseOtp(msg)
+                // v34: robust parser (OtpParser) — "12-34-56" jaise format bhi.
+                val otp = com.formmitra.app.engine.OtpParser.extract(msg)
                 if (otp != null) {
                     Log.i(TAG, "OTP parsed from consented SMS")
                     try { onOtp?.invoke(otp) } catch (_: Exception) { }
@@ -141,21 +142,9 @@ object SmsOtpConsent {
         return true
     }
 
-    /** 4–8 digit OTP nikalo; "otp/code/verification" ke paas wala prefer karo. */
-    fun parseOtp(msg: String?): String? {
-        if (msg.isNullOrBlank()) return null
-        val lower = msg.lowercase()
-        val keywordIdx = listOf("otp", "code", "verification", "verify", "passcode")
-            .map { lower.indexOf(it) }.filter { it >= 0 }.minOrNull()
-        val re = Regex("(?<!\\d)(\\d{4,8})(?!\\d)")
-        val matches = re.findAll(msg).toList()
-        if (matches.isEmpty()) return null
-        if (keywordIdx == null) return matches.first().groupValues[1]
-        // Keyword ke sabse nazdeek wala number
-        return matches.minByOrNull {
-            kotlin.math.abs(it.range.first - keywordIdx)
-        }?.groupValues?.get(1)
-    }
+    /** 4–8 digit OTP nikalo (v34: OtpParser — robust, separators handle karta hai). */
+    fun parseOtp(msg: String?): String? =
+        com.formmitra.app.engine.OtpParser.extract(msg)
 
     fun stop() {
         consentIntent = null
