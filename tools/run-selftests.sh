@@ -233,6 +233,44 @@ run_test_catcher() {
 }
 run_test_catcher
 
+# v37: crash-fix pins — WorkManager/ArchTaskExecutor NoClassDefFoundError.
+# artifacts.txt closure (har entry: file maujood + valid zip + version label
+# sahi), core-runtime me ArchTaskExecutor.class, transitive version floors,
+# aur (pichla build dex ho to) dex DEFINITION check. Dex gate ka authoritative
+# roop build-apk.sh step 4b me hai (build fail karta hai).
+run_test_v37() {
+  local name="selftest_v37"
+  echo "== $name =="
+  "$KOTLINC" -J-Xmx1g -cp "$ANDR_JAR" \
+    "$APP/tools/selftest/SelfTestV37.kt" \
+    "$SRC/agent/GlobalPlaybook.kt" \
+    "$SRC/agent/WorkPatternStore.kt" \
+    "$SRC/agent/RepeatRun.kt" \
+    "$SRC/engine/DestructivePolicy.kt" \
+    "$SRC/engine/RunMemory.kt" \
+    "$SRC/engine/StateInference.kt" \
+    "$SRC/engine/MemoryWiring.kt" \
+    "$SRC/engine/ErrorCatcher.kt" \
+    "$SRC/agent/CardJson.kt" \
+    "$SRC/agent/AgentApi.kt" \
+    "$SRC/engine/AgentLoopLogic.kt" \
+    "$SRC/engine/FormApi.kt" \
+    "$SRC/BuildConfig.java" \
+    -d "$OUT/$name" >"$OUT/$name.log" 2>&1
+  if [ $? -ne 0 ]; then echo "COMPILE FAILED:"; tail -20 "$OUT/$name.log"; TOTAL_FAIL=$((TOTAL_FAIL+1)); return; fi
+  # v37 PART 2: real org.json (android.jar ke stubs runtime par "Stub!"
+  # throw karte hain); -Dfm.app.dir se source-pin checks ko app tree milta hai.
+  ORGJSON=$APP/tools/lib/json-20231013.jar
+  java -Dfm.app.dir="$APP" -cp "$OUT/$name:$ORGJSON:$STDLIB" SelfTestV37Kt 2>&1 | tee "$OUT/$name.out" | grep -E "^(PASS|FAIL|SKIP)" | tail -5
+  local fails passes
+  fails=$(grep -cE "^(FAIL|Exception in thread)" "$OUT/$name.out" || true)
+  passes=$(grep -cE "^PASS" "$OUT/$name.out" || true)
+  echo "-> $name PASS: $passes FAIL: $fails"
+  TOTAL_FAIL=$((TOTAL_FAIL+fails))
+  TOTAL_PASS=$((TOTAL_PASS+passes))
+}
+run_test_v37
+
 echo "==============================="
 echo "TOTAL PASS: $TOTAL_PASS"
 echo "TOTAL FAILURES: $TOTAL_FAIL"

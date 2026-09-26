@@ -118,6 +118,77 @@ object ErrorCatcher {
         maskSecrets(t.javaClass.simpleName + (t.message?.let { ": $it" } ?: ""))
 
     /**
+     * v37: "... N more" EXPANSION — full technical detail me cause chain
+     * ke frames printStackTrace ke "... N more" se chhupe NAHI rehte.
+     *
+     * printStackTrace() cause ke trailing common frames ko "... N more"
+     * likhkar chhupa deta hai. Yahan har cause ke frames uske apne
+     * `stackTrace` array se KHUD render hote hain — poori chain, koi line
+     * chhupi nahi. Cycle-safe (cause cycle par pehle dekha cause dobara
+     * nahi) + suppressed exceptions bhi. Sab secrets masked.
+     *
+     * Pure (JVM-testable).
+     */
+    fun fullStackTrace(t: Throwable): String {
+        return try {
+            val sb = StringBuilder()
+            val seen = java.util.Collections.newSetFromMap(
+                java.util.IdentityHashMap<Throwable, Boolean>()
+            )
+            renderThrowable(sb, t, "", seen)
+            maskSecrets(sb.toString())
+        } catch (_: Exception) {
+            try {
+                maskSecrets(t.javaClass.name + ": " + (t.message ?: ""))
+            } catch (_: Exception) {
+                t.javaClass.name
+            }
+        }
+    }
+
+    private fun renderThrowable(
+        sb: StringBuilder,
+        t: Throwable,
+        prefix: String,
+        seen: MutableSet<Throwable>
+    ) {
+        if (!seen.add(t)) {
+            sb.append(prefix).append("[CIRCULAR: ").append(t.javaClass.name)
+                .append("]\n")
+            return
+        }
+        sb.append(prefix).append(t.javaClass.name)
+        val msg = try { t.message } catch (_: Exception) { null }
+        if (!msg.isNullOrEmpty()) sb.append(": ").append(msg)
+        sb.append('\n')
+        // Frames KHUD render — printStackTrace wala "... N more" yahan
+        // kabhi nahi aata (expansion hi point hai).
+        val frames = try { t.stackTrace } catch (_: Exception) { emptyArray() }
+        for (f in frames) {
+            sb.append(prefix).append("    at ").append(f.toString()).append('\n')
+        }
+        // Suppressed bhi poore
+        val sup = try { t.suppressed } catch (_: Exception) { emptyArray() }
+        for (s in sup) {
+            renderThrowable(sb, s, prefix + "    Suppressed: ", seen)
+        }
+        // Cause chain — frames poore (common frames bhi repeat hote hain;
+        // chhupana nahi hai — user order: "kuch chhupana nahi").
+        // "Caused by:" separator APNI line par aata hai; prefix accumulate
+        // NAHI hota (nahi to har level "Caused by: Caused by: ..." ban jata
+        // aur count toot jata — v37 selftest pin).
+        val c = try { t.cause } catch (_: Exception) { null }
+        if (c != null) {
+            if (c === t) {
+                sb.append(prefix).append("[CIRCULAR CAUSE]\n")
+            } else {
+                sb.append(prefix).append("Caused by: ")
+                renderThrowable(sb, c, prefix, seen)
+            }
+        }
+    }
+
+    /**
      * v36 catcher order: POORA technical detail — kuch chhupana nahi.
      * Sirf secrets mask (maskSecrets) — baaki sab RAW.
      *
@@ -132,9 +203,9 @@ object ErrorCatcher {
      * Pure (JVM-testable).
      */
     fun technicalDetail(t: Throwable, maxLines: Int = Int.MAX_VALUE): String {
-        val sw = StringWriter()
-        t.printStackTrace(PrintWriter(sw))
-        val fullTrace = maskSecrets(sw.toString())
+        // v37: fullStackTrace — printStackTrace wala "... N more" kabhi
+        // nahi aata; cause chain ke frames poore render hote hain.
+        val fullTrace = fullStackTrace(t)
         val lines = fullTrace.lines()
         val trace = if (lines.size > maxLines) {
             lines.take(maxLines).joinToString("\n") +
@@ -165,11 +236,8 @@ object ErrorCatcher {
      */
     fun errorCode(t: Throwable, maskedTrace: String? = null): String {
         return try {
-            val trace = maskedTrace ?: run {
-                val sw = StringWriter()
-                t.printStackTrace(PrintWriter(sw))
-                maskSecrets(sw.toString())
-            }
+            // v37: fullStackTrace (printStackTrace ka "... N more" nahi).
+            val trace = maskedTrace ?: fullStackTrace(t)
             val hash = trace.hashCode().toUInt().toString(16).padStart(8, '0').take(6)
             "${t.javaClass.simpleName.uppercase(Locale.US).take(12)}-$hash"
         } catch (_: Exception) {
@@ -392,13 +460,8 @@ object ErrorCatcher {
                 appendLine("Asli wajah: ${shortCause(t)}")
                 appendLine()
                 appendLine("--- Stack (pehli 25 lines) ---")
-                append(
-                    maskSecrets(
-                        StringWriter().also {
-                            t.printStackTrace(PrintWriter(it))
-                        }.toString()
-                    ).lines().take(25).joinToString("\n")
-                )
+                // v37: fullStackTrace (printStackTrace ka "... N more" nahi).
+                append(fullStackTrace(t).lines().take(25).joinToString("\n"))
             }
         } catch (_: Exception) {
             "Asli wajah: ${t.javaClass.simpleName}"

@@ -18,8 +18,8 @@ rm -rf $OUT && mkdir -p $OUT/{aar,classes,dex,res}
 export JAVA_HOME=$PTOOLS/jdk-17
 export PATH=$JAVA_HOME/bin:$PATH
 APPID="com.formmitra.app"
-VERSION_CODE=36
-VERSION_NAME="1.0.36-v36"
+VERSION_CODE=37
+VERSION_NAME="1.0.37-v37"
 SITE_URL="https://formmitra-git-main-webbuilder1.vercel.app/"
 # Output APK name parameterized — v1 APK (formmitra-v1.apk) untouched rehta hai.
 APK_NAME="formmitra-v${VERSION_CODE}.apk"
@@ -181,6 +181,32 @@ D8_JARS+=("$PTOOLS/kotlinc/lib/kotlin-stdlib.jar")
 echo "d8 jars: ${#D8_JARS[@]} (kotlin-stdlib = compiler bundled)"
 $BT/d8 --min-api 26 --lib $SDK/platforms/android-34/android.jar \
   --output $OUT/dex $(find $OUT/classes -name "*.class") "${D8_JARS[@]}" 2>&1 | tail -5
+
+echo "== 4b. dex-content gate (transitive-dep pin) =="
+# v36 REAL-PHONE crash: "Kaam shuru karte waqt"
+#   NoClassDefFoundError: Landroidx/arch/core/executor/ArchTaskExecutor
+#   (Scheduler.kickNow -> WorkManager.enqueue -> LiveData.postValue -> ArchTaskExecutor)
+# Root cause: core-runtime AAR d8 inputs me nahi tha — d8 dangling references par
+# fail NAHI karta, isliye selftest/JVM par dikha nahi, phone par crash hua.
+# Ye gate har build par verify karta hai ki zaroori transitive classes dex me
+# DEFINITION ke roop me maujood hain (sirf reference nahi). NOTE: dexdump me
+# "Class descriptor" ke baad DO space hain — single-space grep false alarm dega.
+DEX_GATE_FAIL=0
+for _dexclass in \
+  "Landroidx/arch/core/executor/ArchTaskExecutor;" \
+  "Landroidx/arch/core/executor/DefaultTaskExecutor;" \
+  "Lkotlin/enums/EnumEntriesKt;" ; do
+  if $BT/dexdump -d $OUT/dex/classes*.dex 2>/dev/null | grep -q "Class descriptor  : '$_dexclass'"; then
+    echo "dex-gate OK: $_dexclass"
+  else
+    echo "DEX-GATE-FAIL: $_dexclass dex me DEFINITION ke roop me nahi mila"
+    DEX_GATE_FAIL=1
+  fi
+done
+if [ "$DEX_GATE_FAIL" -ne 0 ]; then
+  echo "DEX-GATE: transitive dependency dex se missing — build ROKA gaya (v36 crash dobara nahi)"
+  exit 1
+fi
 
 echo "== 5. package + sign =="
 cd $OUT

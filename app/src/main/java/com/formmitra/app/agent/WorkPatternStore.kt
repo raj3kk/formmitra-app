@@ -259,4 +259,50 @@ object WorkPatternStore {
             prefs(ctx).edit().remove("patterns").apply()
         } catch (_: Exception) { }
     }
+
+    // ============ v37: Global Playbook LOCAL CACHE ============
+    // Server se aaye global patterns ka device-local cache.
+    // Key = task+site+state+district (GlobalPlaybook.Logic.cacheKey).
+    // Local pattern store (upar) se ALAG prefs — local behavior bilkul
+    // unchanged. Entry: {pattern:{...}, cached_at}.
+
+    private const val PREFS_GLOBAL = "formmitra_global_playbook"
+
+    private fun globalPrefs(ctx: Context) =
+        ctx.getSharedPreferences(PREFS_GLOBAL, Context.MODE_PRIVATE)
+
+    private fun loadGlobal(ctx: Context): JSONObject {
+        return try {
+            JSONObject(globalPrefs(ctx).getString("global_patterns", "{}") ?: "{}")
+        } catch (_: Exception) {
+            JSONObject()
+        }
+    }
+
+    /** Global cache me pattern entry save karo. */
+    fun saveGlobal(ctx: Context, key: String, entry: JSONObject) {
+        if (key.isEmpty()) return
+        try {
+            val all = loadGlobal(ctx)
+            all.put(key, entry)
+            globalPrefs(ctx).edit()
+                .putString("global_patterns", all.toString()).apply()
+        } catch (_: Exception) { }
+    }
+
+    /** Global cache se entry (freshness check caller karega). */
+    fun findGlobal(ctx: Context, key: String): JSONObject? {
+        if (key.isEmpty()) return null
+        return try {
+            loadGlobal(ctx).optJSONObject(key)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun clearGlobal(ctx: Context) {
+        try {
+            globalPrefs(ctx).edit().remove("global_patterns").apply()
+        } catch (_: Exception) { }
+    }
 }

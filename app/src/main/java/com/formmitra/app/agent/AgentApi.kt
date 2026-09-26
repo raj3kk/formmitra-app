@@ -672,6 +672,87 @@ object AgentApi {
         return res.json?.optJSONArray("memories")
     }
 
+    // ---------------- v37: Global Playbook + AI Mind ----------------
+    //
+    //  GET   /api/agent/playbook?task=&site=&state=&district=
+    //        → {pattern: {...} | null}
+    //  POST  /api/agent/playbook {proposal:{...}} → {ok}
+    //        (outcome: {outcome:{pattern_id, success}} — best-effort)
+    //  GET   /api/agent/run-memory?run_id= → working memory JSON
+    //  PATCH /api/agent/run-memory {run_id, append:{...}}
+    //  GET   /api/agent/user-memory → private memory (sirf apna)
+    //  PATCH /api/agent/user-memory {facts:{...}}
+    //
+    // Auth: wahi session cookie + X-Device-Id (open() pattern).
+
+    /** v37: GET /api/agent/playbook — global pattern lao. */
+    fun playbookGet(
+        ctx: Context,
+        task: String,
+        site: String,
+        state: String,
+        district: String
+    ): ApiResult {
+        fun enc(s: String) = try {
+            java.net.URLEncoder.encode(s, "UTF-8")
+        } catch (_: Exception) {
+            ""
+        }
+        val q = "?task=${enc(task)}&site=${enc(site)}" +
+            "&state=${enc(state)}&district=${enc(district)}"
+        return try {
+            get("/api/agent/playbook$q", ctx)
+        } catch (_: Exception) {
+            ApiResult(-1, null)
+        }
+    }
+
+    /** v37: POST /api/agent/playbook — proposal ya outcome report. */
+    fun playbookPost(ctx: Context, body: JSONObject): ApiResult =
+        try {
+            post("/api/agent/playbook", ctx, body)
+        } catch (_: Exception) {
+            ApiResult(-1, null)
+        }
+
+    /** v37: GET /api/agent/run-memory?run_id= — working memory. */
+    fun runMemoryGet(ctx: Context, runId: String): ApiResult {
+        val q = try {
+            "?run_id=" + java.net.URLEncoder.encode(runId, "UTF-8")
+        } catch (_: Exception) {
+            "?run_id="
+        }
+        return try {
+            get("/api/agent/run-memory$q", ctx)
+        } catch (_: Exception) {
+            ApiResult(-1, null)
+        }
+    }
+
+    /** v37: PATCH /api/agent/run-memory {run_id, append}. */
+    fun runMemoryPatch(ctx: Context, body: JSONObject): ApiResult =
+        try {
+            patch("/api/agent/run-memory", ctx, body)
+        } catch (_: Exception) {
+            ApiResult(-1, null)
+        }
+
+    /** v37: GET /api/agent/user-memory — private memory (sirf apna). */
+    fun userMemoryGet(ctx: Context): ApiResult =
+        try {
+            get("/api/agent/user-memory", ctx)
+        } catch (_: Exception) {
+            ApiResult(-1, null)
+        }
+
+    /** v37: PATCH /api/agent/user-memory {facts:{...}}. */
+    fun userMemoryPatch(ctx: Context, body: JSONObject): ApiResult =
+        try {
+            patch("/api/agent/user-memory", ctx, body)
+        } catch (_: Exception) {
+            ApiResult(-1, null)
+        }
+
     /**
      * PATCH /api/agent/runs — payment status update (device verify ke baad).
      * payment: {status, amount, merchant, upi_id, txn_ref, verified_at}

@@ -621,6 +621,26 @@ class HistoryView(context: Context) : LinearLayout(context) {
             textSize = 12f
             setTextColor(Color.GRAY)
         })
+        // v37 ONE-TAP REPEAT — "🔁 Phir se karo": naya run, same goal +
+        // card/device details reuse; pattern ho to seedha replay
+        // (planning/sawal nahi). Chal rahe (pending) run par nahi — uske
+        // liye detail me "Yahi se resume karo" hai.
+        if (!isPendingStatus(status)) {
+            val repeatBtn = Button(context).apply {
+                text = "🔁 Phir se karo"
+                textSize = 13f
+                setTextColor(Color.parseColor("#1A73E8"))
+                background = with(UiKit) { context.softBtnBg() }
+                layoutParams = LayoutParams(
+                    LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+                ).apply {
+                    setMargins(0, dp(6), 0, 0)
+                }
+                setOnClickListener { repeatRun(r) }
+            }
+            with(UiKit) { pressFeedback(repeatBtn) }
+            row.addView(repeatBtn)
+        }
         row.setOnClickListener { showDetail(r) }
         return row
     }
@@ -697,6 +717,12 @@ class HistoryView(context: Context) : LinearLayout(context) {
                 d.dismiss()
                 resumeRun(r, runId, taskId)
             }
+        } else {
+            // v37 ONE-TAP REPEAT — poore/purane kaam ko ek tap me dobara.
+            b.setNegativeButton("🔁 Phir se karo") { d, _ ->
+                d.dismiss()
+                repeatRun(r)
+            }
         }
         b.show()
     }
@@ -764,6 +790,176 @@ class HistoryView(context: Context) : LinearLayout(context) {
             }
             .setNegativeButton("Rehne do", null)
             .show()
+    }
+
+    // ---------- v37: ONE-TAP REPEAT ("🔁 Phir se karo") ----------
+    //
+    // History entry se naya run:
+    //  - same goal + card/device/user-memory details reuse (knownDetails —
+    //    pata wali details dobara NAHI poochhi jayengi)
+    //  - learned (local) ya global (playbook) pattern ho → AgentLoop seedha
+    //    replay karega (planning/sawal nahi); hash mismatch → verify-then-
+    //    adapt; nayi value → EK baar batch me poochhega
+    //  - payment/destructive → gate (confirm dialog; loop me existing
+    //    PaymentFlow/DestructiveGate)
+    //  - IdempotencyGuard: double-tap/duplicate run nahi
+
+    private fun repeatRun(r: JSONObject) {
+        val goal = r.optString("goal", r.optString("task_name", "")).trim()
+        val url = r.optString("url", r.optString("target_url", "")).trim()
+        if (goal.isEmpty() || url.isEmpty()) {
+            toast("Ye entry dobara nahi ho sakti — goal/link missing hai")
+            return
+        }
+        // Double-tap guard (resumeInFlight shared set).
+        val flightKey = "repeat:$goal|$url"
+        if (!resumeInFlight.add(flightKey)) return
+        toast("Phir se taiyaar ho raha hai…")
+        Thread({
+            try {
+                // known details: device-saved + user-memory facts (card
+                // values unlock ke baad loop khud uthayega).
+                val known = LinkedHashMap<String, String>()
+                try {
+                    known.putAll(DetailStore.loadAll(context))
+                } catch (_: Exception) { }
+                try {
+                    known.putAll(
+                        com.formmitra.app.engine.RunMemory.userFacts(context)
+                    )
+                } catch (_: Exception) { }
+                // Pattern eligibility (local + global) — background thread.
+                val host = try {
+                    java.net.URL(url).host.lowercase()
+                } catch (_: Exception) {
+                    ""
+                }
+                val localEligible = try {
+                    val pk = LearnLogic.workPatternKey(goal, host)
+                    val e = if (pk.isNotEmpty()) WorkPatternStore.find(context, pk) else null
+                    e != null && LearnLogic.shouldReplay(
+                        e.optInt("success", 0), e.optInt("fail", 0),
+                        e.optLong("updated_at", 0), System.currentTimeMillis()
+                    )
+                } catch (_: Exception) {
+                    false
+                }
+                val globalEligible = try {
+                    GlobalPlaybook.resolve(context, goal, host, "", "") != null
+                } catch (_: Exception) {
+                    false
+                }
+                val plan = RepeatRun.decide(r, known, localEligible, globalEligible)
+                post {
+                    resumeInFlight.remove(flightKey)
+                    if (plan == null) {
+                        toast("Dobara nahi ho paya — entry me kami hai")
+                        return@post
+                    }
+                    startRepeat(plan)
+                }
+            } catch (t: Throwable) {
+                post {
+                    resumeInFlight.remove(flightKey)
+                    try {
+                        com.formmitra.app.engine.ErrorCatcher.show(
+                            context, "Phir se karte waqt", t,
+                            sessionId = "rpt" + System.currentTimeMillis().toString(36)
+                        )
+                    } catch (_: Exception) {
+                        toast("⚠️ Dobara shuru me dikkat — phir try karo")
+                    }
+                }
+            }
+        }, "fm-repeat").start()
+    }
+
+    /**
+     * Repeat plan ko run me badlo. Gate ho to confirm dialog (payment →
+     * loop ka existing PaymentFlow/DestructiveGate sambhalega).
+     */
+    private fun startRepeat(plan: RepeatRun.RepeatPlan) {
+        val go: () -> Unit = go@{
+            // IdempotencyGuard — duplicate run nahi (nayi runId).
+            val acquired = try {
+                com.formmitra.app.engine.IdempotencyGuard.tryAcquire(
+                    context, "", plan.goal, plan.url
+                )
+            } catch (_: Exception) {
+                true
+            }
+            if (!acquired) {
+                toast("Ye kaam abhi-abhi shuru hua hai — duplicate nahi banaya")
+                return@go
+            }
+            toast("🔁 Phir se shuru ho raha hai…")
+            Thread({
+                try {
+                    val (code, taskId) = AgentApi.createTask(
+                        context, plan.goal, plan.url, plan.category, plan.knownDetails
+                    )
+                    if (taskId.isNullOrEmpty()) {
+                        post {
+                            toast(
+                                if (code == 401) "Pehle Profile tab me login karo 🔑"
+                                else "Kaam shuru nahi ho paya — dobara try karo"
+                            )
+                        }
+                        return@Thread
+                    }
+                    val runCode = try {
+                        AgentApi.runNow(context, taskId)
+                    } catch (_: Exception) {
+                        -1
+                    }
+                    try {
+                        WorkingMode.setEnabled(context, true)
+                    } catch (_: Exception) { }
+                    try {
+                        WakeWorker.enqueue(context)
+                    } catch (_: Exception) { }
+                    try {
+                        com.formmitra.app.Scheduler.kickNow(context)
+                    } catch (_: Exception) { }
+                    post {
+                        toast(
+                            if (runCode in 200..299)
+                                "🔁 Phir se shuru ho gaya — History me track karo"
+                            else "Task ban gaya — jald shuru hoga",
+                            long = true
+                        )
+                        load()
+                    }
+                } catch (t: Throwable) {
+                    post {
+                        try {
+                            com.formmitra.app.engine.ErrorCatcher.show(
+                                context, "Phir se karte waqt", t,
+                                sessionId = "rpt" + System.currentTimeMillis().toString(36)
+                            )
+                        } catch (_: Exception) {
+                            toast("⚠️ Dobara shuru me dikkat — phir try karo")
+                        }
+                    }
+                }
+            }, "fm-repeat-start").start()
+        }
+        if (plan.needsGate) {
+            // Payment/destructive repeat → shuru se pehle confirm.
+            AlertDialog.Builder(context)
+                .setTitle("🔁 Phir se karo?")
+                .setMessage(
+                    "\"${plan.goal.take(60)}\"\n\n${plan.gateReason}\n\nJari rakhu?"
+                )
+                .setPositiveButton("✅ Haan, karo") { d, _ ->
+                    d.dismiss()
+                    go()
+                }
+                .setNegativeButton("Rehne do", null)
+                .show()
+        } else {
+            go()
+        }
     }
 
     // ---------- relative time ----------

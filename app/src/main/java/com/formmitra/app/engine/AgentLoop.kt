@@ -2,6 +2,7 @@ package com.formmitra.app.engine
 
 import android.content.Context
 import com.formmitra.app.agent.AgentApi
+import com.formmitra.app.agent.CardJson
 import com.formmitra.app.agent.ChoiceMemory
 import com.formmitra.app.agent.DetailStore
 import com.formmitra.app.agent.DocumentAutoPick
@@ -149,6 +150,24 @@ object AgentLoop {
         // v36: is run ke verified steps — done par work-pattern save hoga
         // (sirf source KEYs, personal values kabhi nahi).
         val patternStepsCollected = JSONArray()
+        // v37 GLOBAL PLAYBOOK + AI MIND state.
+        // runMemory: server working memory (run start par GET — kya ho chuka).
+        // userFacts: user-memory facts (private, sirf apna — dobara sawal nahi).
+        // inferredState/District: playbook key ke liye (card/device/memory se).
+        // globalPatternId: global pattern use hua to outcome report ke liye.
+        // memDecisions/memEvidence/memFailures/memGates: PATCH append ke liye
+        // jama (har call-site par read+write — MemoryWiring pin).
+        var runMemory: JSONObject? = null
+        var userFacts: Map<String, String> = emptyMap()
+        var inferredState = ""
+        var inferredDistrict = ""
+        var globalPatternId = ""
+        // v37: run-memory se kitne steps pehle ho chuke (pattern replay inhe skip karega)
+        var memoryResumeSteps = 0
+        val memDecisions = JSONArray()
+        val memEvidence = JSONArray()
+        val memFailures = JSONArray()
+        val memGates = JSONArray()
 
         // Local task: runId khaali ho to local-<timestamp> (standalone mode —
         // UI agent local task banate waqt khud bhi yehi format bhej sakta hai)
@@ -171,6 +190,7 @@ object AgentLoop {
         // Server-side run record (best-effort — fail ho to bina reporting chalao)
         var agentRunId: String? = null
         try { agentRunId = RunReporter.createRun(ctx, goal, startUrl, effectiveRunId) } catch (_: Exception) { }
+        // (v37 AI MIND memory read — local funs ke BAAD, finish() se pehle)
 
         fun logStep(i: Int, action: String, ok: Boolean, detail: String) {
             stepsLog.put(
@@ -198,6 +218,104 @@ object AgentLoop {
                     .put("detail", detail.take(300))
             )
         }
+
+        /**
+         * v37 AI MIND — har call-site par outcome wapas likho (PATCH append).
+         * Accumulate bhi hota hai (finish par final append) + turant server
+         * ko bhi bheja jata hai — BEST-EFFORT, fail ho to chup-chaap.
+         * kind: "ai_decisions" | "evidence" | "failures" | "gates".
+         */
+        fun memoryNote(kind: String, entry: JSONObject) {
+            try {
+                val arr = when (kind) {
+                    "ai_decisions" -> memDecisions
+                    "evidence" -> memEvidence
+                    "failures" -> memFailures
+                    "gates" -> memGates
+                    else -> return
+                }
+                arr.put(entry)
+                // v37: memory ka STABLE key = effectiveRunId (task ka run_id —
+                // WakeWorker resume par wahi task aata hai). agentRunId har
+                // resume par NAYA server run banata hai, isliye us par
+                // likha memory resume par kabhi wapas nahi milta.
+                val rid = effectiveRunId
+                if (rid.isNotEmpty()) {
+                    RunMemory.appendRun(
+                        ctx, rid, JSONObject().put(kind, JSONArray().put(entry))
+                    )
+                }
+            } catch (_: Exception) { }
+        }
+
+        // v37 AI MIND — run start par memory READ (MemoryWiring "run_start":
+        // read+write pin). Yahan:
+        //  - run-memory GET: completed_steps pehle ho chuke hon to skip
+        //    karke wahin se continue (resume).
+        //  - user-memory facts: pata hai to dobara mat poochho (detail
+        //    collection + preflight missing-filter me use).
+        //  - state/district inference (playbook key): card → known →
+        //    device → user-memory. Genuinely missing → preflight missing
+        //    me EK baar poochha jayega.
+        // Sab best-effort: memory na mile to run waise bhi chalta hai.
+        try {
+            val mem = RunMemory.getRun(ctx, effectiveRunId)
+            if (mem != null) {
+                runMemory = mem
+                val done = RunMemory.completedSteps(mem)
+                memoryResumeSteps = RunMemory.resumeFrom(mem)
+                if (done.isNotEmpty()) {
+                    logStep(
+                        0, "memory", true,
+                        "run-memory: pehle ${done.size} steps ho chuke (resume) — yahan se continue"
+                    )
+                    if (stepsTaken < memoryResumeSteps) stepsTaken = memoryResumeSteps
+                }
+            }
+            val uf = RunMemory.userFacts(ctx)
+            if (uf.isNotEmpty()) userFacts = uf
+        } catch (_: Exception) { }
+        try {
+            val detailMap = LinkedHashMap<String, String>()
+            // (1) Card details (unlock ke baad ka active card) — NESTED
+            // {card:{details}} shape → CardJson.detailsOf (AGENTS.md lesson).
+            try {
+                val cid = AgentApi.automationCardId
+                val ctok = AgentApi.automationCardToken
+                if (!cid.isNullOrEmpty() && !ctok.isNullOrEmpty()) {
+                    val res = AgentApi.cardDetail(ctx, cid, ctok)
+                    if (res.code in 200..299) {
+                        val det = CardJson.detailsOf(res.json)
+                        detailMap.putAll(StateInference.flattenDetails(det))
+                    }
+                }
+            } catch (_: Exception) { }
+            // (2) is work me pehle mili details (3) device-saved (4) user-memory
+            for ((k, v) in knownDetails) {
+                if (v.isNotEmpty()) detailMap.putIfAbsent(k, v)
+            }
+            try {
+                for ((k, v) in com.formmitra.app.agent.DetailStore.loadAll(ctx)) {
+                    if (v.isNotEmpty()) detailMap.putIfAbsent(k, v)
+                }
+            } catch (_: Exception) { }
+            for ((k, v) in userFacts) detailMap.putIfAbsent(k, v)
+            val (st, dt) = StateInference.fromSources(detailMap)
+            inferredState = st
+            inferredDistrict = dt
+        } catch (_: Exception) { }
+        // v37: run open — memory me darj (run_start ka WRITE side).
+        try {
+            RunMemory.appendRun(
+                ctx, effectiveRunId,
+                JSONObject().put(
+                    "run_start", JSONObject()
+                        .put("goal", goal.take(120))
+                        .put("at", System.currentTimeMillis())
+                        .put("resume_steps", memoryResumeSteps)
+                )
+            )
+        } catch (_: Exception) { }
 
         fun finish(status: String, summary: String): FormEngine.RunResult {
             // v36 — LIVE ACTIVITY INDICATOR: kaam khatam/ruka/fail →
@@ -234,9 +352,64 @@ object AgentLoop {
                             stepsTaken, "pattern_learned", true,
                             "tareeka seekh liya — agli baar bina AI ke (${patternStepsCollected.length()} steps)"
                         )
+                        // v37 GLOBAL PLAYBOOK — seekha hua tareeka server ko
+                        // propose karo (sanitizer andar: PII/value mile to
+                        // propose HI nahi hota). Best-effort.
+                        val proposed = try {
+                            com.formmitra.app.agent.GlobalPlaybook.proposePattern(
+                                ctx, goal,
+                                SiteCredentialStore.domainOf(startUrl),
+                                inferredState, inferredDistrict,
+                                patternStepsCollected,
+                                preflightPlan?.expectedProofs ?: emptyList(),
+                                verified = true, retries = 0, userCorrected = false
+                            )
+                        } catch (_: Exception) {
+                            false
+                        }
+                        logStep(
+                            stepsTaken, "playbook_propose", proposed,
+                            if (proposed) "shared playbook me bheja"
+                            else "propose nahi hua (sanitizer/network) — local pattern bana raha"
+                        )
                     }
                 } catch (_: Exception) { }
             }
+            // v37: global pattern use hua tha → server ko outcome batao
+            // (success/fail) — best-effort.
+            try {
+                if (globalPatternId.isNotEmpty()) {
+                    com.formmitra.app.agent.GlobalPlaybook.reportOutcome(
+                        ctx, globalPatternId, status == "done"
+                    )
+                    logStep(
+                        stepsTaken, "playbook_outcome", true,
+                        "global pattern outcome: ${if (status == "done") "success" else "fail"}"
+                    )
+                    globalPatternId = ""
+                }
+            } catch (_: Exception) { }
+            // v37 AI MIND — run finish par final memory append (read+write):
+            // jama ki hui ai_decisions/evidence/failures/gates + terminal.
+            // Key = effectiveRunId (run-start read ke barabar — stable).
+            try {
+                val rid = effectiveRunId
+                if (rid.isNotEmpty()) {
+                    RunMemory.appendRun(
+                        ctx, rid, JSONObject()
+                            .put("ai_decisions", memDecisions)
+                            .put("evidence", memEvidence)
+                            .put("failures", memFailures)
+                            .put("gates", memGates)
+                            .put(
+                                "terminal", JSONObject()
+                                    .put("status", status)
+                                    .put("steps_taken", stepsTaken)
+                                    .put("summary", summary.take(300))
+                            )
+                    )
+                }
+            } catch (_: Exception) { }
             // G2: needs_user / failed / needs_admin par resume state RAKHO —
             // WakeWorker ya user-jawab par usi step se continue hoga.
             // Sirf true terminal (done/cancelled/vetoed) par clear.
@@ -270,6 +443,13 @@ object AgentLoop {
                 consecErrors = 0
             }
             logStep(i, action, false, msg)
+            // v37: failure wapas memory me (failures) — agli baar wahi
+            // galti na dohrao.
+            memoryNote(
+                "failures", JSONObject()
+                    .put("step", i).put("action", action)
+                    .put("reason", msg.take(200))
+            )
             // v24-refine: agla act() dobara-plan reason ke saath logged hoga.
             actReason = AiUsage.R_REPLAN_FAIL
             // v36 LADDER: pehli stuck → agent_plan se ai_single_step
@@ -393,8 +573,11 @@ object AgentLoop {
          * DetailStore) — value_src sirf KEY hai, value kabhi store nahi hui.
          * Ek step fail → repairPatternStep (single-step AI); repair bhi
          * fail → false (caller normal AI loop par jayega).
+         *
+         * v37: skipDone — run-memory resume: pehle N steps ho chuke hon to
+         * wahin se continue (shuru se replay nahi).
          */
-        fun replayWorkPattern(pageUrl: String): Boolean {
+        fun replayWorkPattern(pageUrl: String, skipDone: Int = 0): Boolean {
             val steps = patternSteps ?: return false
             // Aaj ke value sources (OTP/password kabhi nahi — filtered)
             val valueSources = LinkedHashMap<String, String>()
@@ -407,7 +590,13 @@ object AgentLoop {
                 valueSources.putAll(DetailStore.loadAll(ctx))
             } catch (_: Exception) { }
             val total = steps.length()
-            var idx = 0
+            var idx = skipDone.coerceIn(0, total)
+            if (idx > 0) {
+                logStep(
+                    idx, "pattern_replay", true,
+                    "resume: pehle $idx steps ho chuke — yahan se continue"
+                )
+            }
             while (idx < total) {
                 val s = steps.optJSONObject(idx) ?: return false
                 val type = s.optString("type", "")
@@ -526,6 +715,35 @@ object AgentLoop {
                 )
             }
         } catch (_: Exception) { }
+        // v37 GLOBAL PLAYBOOK — local eligible pattern nahi → server ka
+        // shared pattern (confidence > 0.5 ya status live/trial) → replay.
+        // Nahi to null → AI path (preflight). Sirf network fail par skip.
+        if (patternSteps == null) {
+            try {
+                val site = SiteCredentialStore.domainOf(startUrl)
+                val gp = com.formmitra.app.agent.GlobalPlaybook.resolve(
+                    ctx, goal, site, inferredState, inferredDistrict
+                )
+                if (gp != null) {
+                    patternSteps = gp.steps
+                    patternEntryHash = gp.pageHash
+                    globalPatternId = gp.id
+                    AiUsage.logPatternHit("global_playbook")
+                    ladderLevel = EscalationLadder.L_PATTERN
+                    logStep(
+                        0, "ladder", true,
+                        "global playbook: shared tareeka mila — bina AI ke replay (${gp.steps.length()} steps)"
+                    )
+                    memoryNote(
+                        "ai_decisions", JSONObject()
+                            .put("kind", "global_pattern")
+                            .put("pattern_id", gp.id)
+                            .put("steps", gp.steps.length())
+                            .put("confidence", gp.confidence)
+                    )
+                }
+            } catch (_: Exception) { }
+        }
         if (patternSteps == null) {
             try {
                 val kdObj = JSONObject()
@@ -557,7 +775,39 @@ object AgentLoop {
                     try {
                         onPlan(summ)
                     } catch (_: Exception) { }
-                    planMissingDetails = plan.missingDetails.filter { it !in knownDetails }
+                    planMissingDetails = run {
+                        // v37 AI MIND — pata hai to dobara mat poochho:
+                        // knownDetails + device DetailStore + user-memory
+                        // facts. Sirf GENUINELY missing keys hi missing.
+                        val knownKeys = LinkedHashSet<String>()
+                        knownKeys.addAll(knownDetails.keys)
+                        try {
+                            knownKeys.addAll(
+                                com.formmitra.app.agent.DetailStore.loadAll(ctx).keys
+                            )
+                        } catch (_: Exception) { }
+                        knownKeys.addAll(userFacts.keys)
+                        val out = plan.missingDetails
+                            .filter { it !in knownKeys }.toMutableList()
+                        // v37: playbook key ke liye state/district chahiye —
+                        // genuinely missing ho to EK baar poochho (batch
+                        // mechanism — dobara-dobara sawal nahi).
+                        if (inferredState.isEmpty() && "state" !in knownKeys && "state" !in out) {
+                            out.add("state")
+                        }
+                        if (inferredDistrict.isEmpty() && "district" !in knownKeys && "district" !in out) {
+                            out.add("district")
+                        }
+                        out
+                    }
+                    // v37: preflight AI call ka outcome memory me (ai_decisions).
+                    memoryNote(
+                        "ai_decisions", JSONObject()
+                            .put("kind", "preflight_plan")
+                            .put("steps", plan.steps.size)
+                            .put("gates", plan.gates.map { it.kind }.joinToString(",").take(100))
+                            .put("missing", planMissingDetails.joinToString(",").take(200))
+                    )
                 } else if (forceStandalone && Standalone.isConfigured(ctx)) {
                     // Standalone/offline task: server by design unreachable —
                     // preflight ho hi nahi sakta; step-by-step standalone
@@ -652,6 +902,13 @@ object AgentLoop {
                         val payRes = handlePaymentPrompt(
                             ctx, engine, startUrl, agentRunId ?: effectiveRunId
                         )
+                        // v37: payment gate memory me (gates).
+                        memoryNote(
+                            "gates", JSONObject()
+                                .put("kind", "payment")
+                                .put("at_step", 0)
+                                .put("result", payRes.take(40))
+                        )
                         if (payRes == "verified") {
                             engine.paymentVerifiedOnce = true
                             pushHistory(
@@ -714,8 +971,9 @@ object AgentLoop {
                 }
             }
             if (patternSteps != null && patternKey.isNotEmpty()) {
+                // v37: memory-resume — pehle ho chuke steps skip.
                 val replayOk = try {
-                    replayWorkPattern(startUrl)
+                    replayWorkPattern(startUrl, memoryResumeSteps)
                 } catch (_: Exception) {
                     false
                 }
@@ -859,6 +1117,12 @@ object AgentLoop {
                     }
                     // OTP/password yahan se filtered — AI/server ko kabhi nahi jate
                     .put("user_provided", filteredUserProvided(userProvided, sensitiveKeys))
+                    // v37 AI MIND — har act() call me memory summary (read):
+                    // brain ko yaad rahe kya ho chuka, kaun se gates aaye.
+                    .apply {
+                        val ms = try { RunMemory.summary(runMemory) } catch (_: Exception) { "" }
+                        if (ms.isNotEmpty()) put("memory_summary", ms)
+                    }
                     // v36: pre-flight plan context — SIRF pehle act() call me
                     // (brain plan ke hisaab se chale; VALUES nahi bhejte
                     // taaki AI invent na kare).
@@ -1037,6 +1301,15 @@ object AgentLoop {
                                 ctx, engine, promptObj,
                                 runIdNow, userProvided, sensitiveKeys, history
                             )
+                            // v37: user gate (otp/login/payment/device_auth/
+                            // destructive) memory me (gates) — kya manga gaya.
+                            if (pr != 0) {
+                                memoryNote(
+                                    "gates", JSONObject()
+                                        .put("kind", (promptObj["kind"] as? String).orEmpty())
+                                        .put("at_step", i)
+                                )
+                            }
                             if (pr == 2) {
                                 val site = OtpPark.parkedSite(ctx).ifEmpty { "site" }
                                 return finish(
@@ -1139,9 +1412,15 @@ object AgentLoop {
                         val runIdNow = agentRunId ?: effectiveRunId
                         val handled = handleDetailsNeeded(
                             ctx, engine, fields, runIdNow, goal,
-                            userProvided, history
+                            userProvided, history, extraKnown = userFacts
                         )
                         if (!handled) {
+                            // v37: detail gate memory me (gates) — kya manga gaya.
+                            memoryNote(
+                                "gates", JSONObject()
+                                    .put("kind", "details_needed")
+                                    .put("fields", fields.map { it.key }.joinToString(",").take(200))
+                            )
                             // Batch uth gaya — run park (resume state rakha).
                             // UI ko batane ke liye summary me marker.
                             return finish(
@@ -1149,6 +1428,12 @@ object AgentLoop {
                                 "[details_batch] Kuch details chahiye — app me bhar dein, kaam apne aap aage badhega"
                             )
                         }
+                        // v37: auto-fill hua (user-memory/device se) — evidence.
+                        memoryNote(
+                            "evidence", JSONObject()
+                                .put("kind", "details_autofill")
+                                .put("fields", fields.map { it.key }.joinToString(",").take(200))
+                        )
                         consecErrors = 0
                         continue
                     }
@@ -1327,6 +1612,13 @@ object AgentLoop {
                     }
                     logStep(i, "verify_submit", vok, vnote.take(200))
                     pushHistory(action, stepMap, if (vok) "ok" else "rejected", vnote.take(300))
+                    // v37: AI verify call ka outcome memory me (evidence).
+                    memoryNote(
+                        "evidence", JSONObject()
+                            .put("kind", "verify_submit")
+                            .put("step", i).put("ok", vok)
+                            .put("note", vnote.take(150))
+                    )
                     if (!vok) {
                         return finish(
                             "needs_user",
@@ -1408,6 +1700,13 @@ object AgentLoop {
                     val dStr = detail.toString().take(300)
                     logStep(i, action, true, dStr)
                     pushHistory(action, stepMap, "ok", dStr)
+                    // v37: safal act-step ka outcome memory me (ai_decisions).
+                    memoryNote(
+                        "ai_decisions", JSONObject()
+                            .put("kind", "act_step")
+                            .put("step", i).put("action", action)
+                            .put("ok", true).put("detail", dStr.take(150))
+                    )
                     // v24-refine (AI-training): fill VERIFIED → seekho:
                     // (domain|selector) → source key. Agli baar wahi
                     // situation me pattern match → consistency local
@@ -1452,6 +1751,25 @@ object AgentLoop {
                     stepFailCounts.clear()
                 } catch (e: FormEngine.VetoException) {
                     logStep(i, action, false, "VETO: ${e.message}")
+                    // v37 AI MIND — payment gate: READ — memory me pichla
+                    // payment gate tha? (dobara gate par bhi prompt HOGA —
+                    // safety kabhi skip nahi; sirf note me darj hota hai.)
+                    val prevPayGate = try {
+                        val gates = runMemory?.optJSONArray("gates")
+                        (0 until (gates?.length() ?: 0)).any {
+                            gates?.optJSONObject(it)?.optString("kind") == "payment"
+                        }
+                    } catch (_: Exception) {
+                        false
+                    }
+                    // v37 AI MIND — payment gate memory me (gates). WRITE.
+                    memoryNote(
+                        "gates", JSONObject()
+                            .put("kind", "payment")
+                            .put("at_step", i)
+                            .put("url", url.take(150))
+                            .put("repeat_gate", prevPayGate)
+                    )
                     // Payment page beech me aaya → user se approval lo (assisted
                     // payment). Agent KHUD kabhi pay nahi karta — user apne UPI
                     // app se karta hai, phir agent site par verify karta hai.
@@ -1571,9 +1889,15 @@ object AgentLoop {
         runId: String,
         taskName: String,
         userProvided: JSONObject,
-        history: ArrayList<JSONObject>
+        history: ArrayList<JSONObject>,
+        /**
+         * v37: extra known values (user-memory facts) — pata hai to dobara
+         * mat poochho. Default khaali (purane callers unchanged).
+         */
+        extraKnown: Map<String, String> = emptyMap()
     ): Boolean {
-        // (1) Kya sab kuch pehle se pata hai? (DetailStore + userProvided)
+        // (1) Kya sab kuch pehle se pata hai? (userProvided + DetailStore +
+        //     v37 user-memory facts)
         val known = LinkedHashMap<String, String>()
         try {
             val ks = userProvided.keys()
@@ -1590,6 +1914,10 @@ object AgentLoop {
                 if (v.isNotEmpty() && !known.containsKey(k)) known[k] = v
             }
         } catch (_: Exception) { }
+        // v37: user-memory facts (private, sirf apna) — pata hai to sawal nahi
+        for ((k, v) in extraKnown) {
+            if (v.isNotEmpty() && !known.containsKey(k)) known[k] = v
+        }
         val missing = DetailBatchLogic.missingFields(fields, known)
         if (missing.isEmpty()) {
             // Sab mil gaya — userProvided me dalo (agle act() me jayega)
