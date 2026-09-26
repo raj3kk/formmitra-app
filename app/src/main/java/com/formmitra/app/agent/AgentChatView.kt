@@ -1568,7 +1568,8 @@ class AgentChatView(
     }
 
     private fun onStartPlanClicked(plan: JSONObject, link: String, startBtn: Button?) {
-        // v28 P12: tap par koi crash nahi — kuch gadbad ho to toast.
+        // v28 P12: tap par koi crash nahi — kuch gadbad ho to popup.
+        // v35: generic toast nahi — ErrorCatcher me asli wajah + copy.
         try {
             startBtn?.isEnabled = false
             startBtn?.text = "⏳ Task ban raha hai…"
@@ -1578,7 +1579,15 @@ class AgentChatView(
             beginEnqueue(plan, link, startBtn)
         } catch (t: Throwable) {
             android.util.Log.e("FmStart", "onStartPlanClicked failed", t)
-            toast("⚠️ Shuru nahi ho paya — dobara try karo")
+            try {
+                com.formmitra.app.engine.ErrorCatcher.show(
+                    context, "Kaam shuru karte waqt", t,
+                    workName = try { plan.optString("title", "Form") } catch (_: Exception) { "" },
+                    sessionId = "ui" + System.currentTimeMillis().toString(36)
+                )
+            } catch (_: Exception) {
+                toast("⚠️ Shuru nahi ho paya — dobara try karo")
+            }
             post { startBtn?.text = "▶ Shuru karo"; startBtn?.isEnabled = true }
         }
     }
@@ -1600,7 +1609,15 @@ class AgentChatView(
         )
         } catch (t: Throwable) {
             android.util.Log.e("FmStart", "beginEnqueue failed", t)
-            toast("⚠️ Shuru nahi ho paya — dobara try karo")
+            try {
+                com.formmitra.app.engine.ErrorCatcher.show(
+                    context, "Kaam shuru karte waqt", t,
+                    workName = try { plan.optString("title", "Form") } catch (_: Exception) { "" },
+                    sessionId = "ui" + System.currentTimeMillis().toString(36)
+                )
+            } catch (_: Exception) {
+                toast("⚠️ Shuru nahi ho paya — dobara try karo")
+            }
             post { startBtn?.text = "▶ Shuru karo"; startBtn?.isEnabled = true }
         }
     }
@@ -2199,7 +2216,15 @@ class AgentChatView(
         sendMessage(sb.toString())
         } catch (t: Throwable) {
             android.util.Log.e("FmCat", "startCategoryChat failed", t)
-            toast("⚠️ Kaam khulne me dikkat aayi — dobara try karo")
+            try {
+                com.formmitra.app.engine.ErrorCatcher.show(
+                    context, "Kaam khulne me", t,
+                    workName = label,
+                    sessionId = "cat" + System.currentTimeMillis().toString(36)
+                )
+            } catch (_: Exception) {
+                toast("⚠️ Kaam khulne me dikkat aayi — dobara try karo")
+            }
         }
     }
 
@@ -2972,9 +2997,15 @@ class AgentChatView(
                     if (runCode in 200..299) {
                         // I3 (app-first): 30-min periodic ka wait nahi — turant
                         // claim ke liye one-time poll kick karo.
-                        com.formmitra.app.Scheduler.kickNow(context)
+                        // v35: kick fail ho to user ko batao (pehle silent tha —
+                        // session band rehta tha). 30-min poll backup hai.
+                        val kicked = com.formmitra.app.Scheduler.kickNow(context)
                         "Background me shuru ho gaya ✅ — phone turant uthayega. " +
-                            "History tab me progress dekho."
+                            "History tab me progress dekho." +
+                            if (!kicked)
+                                "\n\n(Turant wala signal nahi gaya — 30 min wali " +
+                                    "check me uthega.)"
+                            else ""
                     } else if (runCode == -1) {
                         "Internet nahi hai 📡"
                     } else {
@@ -2989,13 +3020,29 @@ class AgentChatView(
             }
             // v28 P12: try/finally me CATCH nahi tha — andar koi bhi
             // exception = uncaught = app crash. Ab pakdo + user ko batao.
+            // v35: GENERIC message nahi — ErrorCatcher popup me ASLI wajah +
+            // Copy button + Dobara-try (user ka order: har dikkat pakdo).
             } catch (t: Throwable) {
                 android.util.Log.e("FmEnqueue", "enqueueTask failed", t)
+                val sid = "q" + System.currentTimeMillis().toString(36)
                 post {
-                    addErrorBubble(
-                        "⚠️ Kaam shuru karte waqt dikkat aayi — dobara try karo.",
-                        "🔁 Dobara try karo"
-                    ) { enqueueTask(title, url, category, knownDetails, askedAlready, onDone) }
+                    try {
+                        com.formmitra.app.engine.ErrorCatcher.show(
+                            context,
+                            "Kaam shuru karte waqt",
+                            t,
+                            workName = title,
+                            sessionId = sid,
+                            retry = {
+                                enqueueTask(title, url, category, knownDetails, askedAlready, onDone)
+                            }
+                        )
+                    } catch (_: Exception) {
+                        addErrorBubble(
+                            "⚠️ Kaam shuru karte waqt dikkat aayi — dobara try karo.",
+                            "🔁 Dobara try karo"
+                        ) { enqueueTask(title, url, category, knownDetails, askedAlready, onDone) }
+                    }
                     onDone()
                 }
             } finally {

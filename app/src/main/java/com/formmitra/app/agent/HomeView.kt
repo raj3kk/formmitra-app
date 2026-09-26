@@ -246,7 +246,14 @@ class HomeView(
         dlg.show()
         } catch (t: Throwable) {
             android.util.Log.e("FmHome", "showTrackTypePicker failed", t)
-            toast("⚠️ Kaam khulne me dikkat aayi — dobara try karo")
+            try {
+                com.formmitra.app.engine.ErrorCatcher.show(
+                    context, "Kaam khulne me", t,
+                    sessionId = "home" + System.currentTimeMillis().toString(36)
+                )
+            } catch (_: Exception) {
+                toast("⚠️ Kaam khulne me dikkat aayi — dobara try karo")
+            }
         }
     }
 
@@ -275,13 +282,29 @@ class HomeView(
                     )
                 } catch (t: Throwable) {
                     android.util.Log.e("FmHome", "onStartCategory failed", t)
-                    toast("⚠️ Kaam khulne me dikkat aayi — dobara try karo")
+                    try {
+                        com.formmitra.app.engine.ErrorCatcher.show(
+                            context, "Kaam khulne me", t,
+                            workName = cat.label,
+                            sessionId = "home" + System.currentTimeMillis().toString(36)
+                        )
+                    } catch (_: Exception) {
+                        toast("⚠️ Kaam khulne me dikkat aayi — dobara try karo")
+                    }
                 }
             }
         )
         } catch (t: Throwable) {
             android.util.Log.e("FmHome", "startCardFirst failed", t)
-            toast("⚠️ Kaam khulne me dikkat aayi — dobara try karo")
+            try {
+                com.formmitra.app.engine.ErrorCatcher.show(
+                    context, "Kaam khulne me", t,
+                    workName = cat.label,
+                    sessionId = "home" + System.currentTimeMillis().toString(36)
+                )
+            } catch (_: Exception) {
+                toast("⚠️ Kaam khulne me dikkat aayi — dobara try karo")
+            }
         }
     }
 

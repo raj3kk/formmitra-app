@@ -103,11 +103,23 @@ class FormEngine(private val appContext: Context) {
 
     /** Engine thread start + hidden WebView. Blocking; caller background pe ho. */
     fun start() {
-        if (thread != null) return
+        // v35: pichli start() adhuri reh gayi ho (thread hai, webView nahi)
+        // to saaf karke dobara shuru karo — silent stuck kabhi nahi
+        // ("session band rehta hai" ka ek root cause yehi tha).
+        if (thread != null && webView != null) return
+        if (thread != null) {
+            try { thread?.quitSafely() } catch (_: Exception) { }
+            thread = null
+            handler = null
+        }
         val t = HandlerThread("formmitra-engine").also { it.start() }
         thread = t
         handler = Handler(t.looper)
         val latch = CountDownLatch(1)
+        // v35: handler-thread se main-thread tak asli exception — pehle
+        // `catch (_: Exception) {}` ise NIGAL jata tha, user ko sirf
+        // generic "create failed" milta tha.
+        var startError: Throwable? = null
         handler!!.post {
             try {
                 // v33: poori creation + setup MAIN thread par (WebView ka
@@ -146,12 +158,27 @@ class FormEngine(private val appContext: Context) {
                     wv.layout(0, 0, 1080, 1920)
                     webView = wv
                 }
-            } catch (_: Exception) {
+            } catch (t: Throwable) {
+                // v35: ASLI wajah rakho — neeche caller ko milegi.
+                startError = t
             }
             latch.countDown()
         }
-        latch.await(30, TimeUnit.SECONDS)
-        if (webView == null) throw Exception("FormEngine WebView create failed")
+        val latchOpened = latch.await(30, TimeUnit.SECONDS)
+        if (webView == null) {
+            // v35: adhura state saaf karo taaki agli start() stuck na rahe,
+            // aur asli wajah message me do (ErrorCatcher contract).
+            try { thread?.quitSafely() } catch (_: Exception) { }
+            thread = null
+            handler = null
+            val err: Throwable? = startError
+                ?: if (!latchOpened)
+                    java.util.concurrent.TimeoutException(
+                        "engine init 30s me poora nahi hua (latch timeout)"
+                    )
+                else null
+            throw Exception(ErrorCatcher.startFailureMessage(err), err)
+        }
     }
 
     fun stop() {

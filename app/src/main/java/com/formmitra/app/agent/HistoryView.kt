@@ -542,9 +542,16 @@ class HistoryView(context: Context) : LinearLayout(context) {
                         )
                     }
                 }
-            } catch (_: Exception) {
+            } catch (t: Throwable) {
                 post {
-                    toast("⚠️ Resume me dikkat — dobara try karo")
+                    try {
+                        com.formmitra.app.engine.ErrorCatcher.show(
+                            context, "Resume karte waqt", t,
+                            sessionId = "hst" + System.currentTimeMillis().toString(36)
+                        )
+                    } catch (_: Exception) {
+                        toast("⚠️ Resume me dikkat — dobara try karo")
+                    }
                 }
             } finally {
                 resumeInFlight.remove(flightKey)
@@ -740,10 +747,17 @@ class HistoryView(context: Context) : LinearLayout(context) {
                             )
                             load()
                         }
-                    } catch (_: Exception) {
+                    } catch (t: Throwable) {
                         resumeInFlight.remove(flightKey)
                         post {
-                            toast("⚠️ Resume me dikkat — dobara try karo")
+                            try {
+                                com.formmitra.app.engine.ErrorCatcher.show(
+                                    context, "Resume karte waqt", t,
+                                    sessionId = "hst" + System.currentTimeMillis().toString(36)
+                                )
+                            } catch (_: Exception) {
+                                toast("⚠️ Resume me dikkat — dobara try karo")
+                            }
                         }
                     }
                 }, "fm-run-resume").start()

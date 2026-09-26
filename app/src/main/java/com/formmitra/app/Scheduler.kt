@@ -75,9 +75,13 @@ object Scheduler {
      * I3 (app-first): chat se task banne ke turant baad server-claim ke liye
      * turant ek one-time poll — 30-min periodic ka wait nahi. Server ka
      * "permission" nahi, sirf claim API; fail ho to periodic poll pakdega.
+     *
+     * v35: pehle saare exceptions SILENT nigal jata tha — kick fail ho to
+     * session kabhi start nahi hota tha aur pata bhi nahi chalta tha
+     * ("session band rehta hai" ka ek root cause). Ab Boolean + loud log.
      */
-    fun kickNow(ctx: Context) {
-        try {
+    fun kickNow(ctx: Context): Boolean {
+        return try {
             val constraints = Constraints.Builder()
                 .setRequiredNetworkType(NetworkType.CONNECTED)
                 .build()
@@ -85,6 +89,10 @@ object Scheduler {
                 .setConstraints(constraints)
                 .build()
             WorkManager.getInstance(ctx).enqueue(req)
-        } catch (_: Exception) { }
+            true
+        } catch (e: Exception) {
+            android.util.Log.e("FmScheduler", "kickNow FAILED — 30-min periodic poll pakdega", e)
+            false
+        }
     }
 }

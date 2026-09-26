@@ -245,13 +245,29 @@ class FormRunService : Service() {
         val name = task.optString("name", "form")
         ensureChannel()
         // v24 N3: live work status — "working, don't close (बंद मत करो)".
-        startForeground(
-            NOTIF_ID,
-            buildNotif(
-                "Form bhar raha hai: $name",
-                "Kaam chal raha hai — band mat karo (don't close)"
+        // v35: startForeground kabhi silently na mare — throw hua to LOUD
+        // notification (asli wajah ke saath) + stopSelf ("session band"
+        // ka ek aur root cause: yahan ka crash bina khabar ke hota tha).
+        try {
+            startForeground(
+                NOTIF_ID,
+                buildNotif(
+                    "Form bhar raha hai: $name",
+                    "Kaam chal raha hai — band mat karo (don't close)"
+                )
             )
-        )
+        } catch (t: Throwable) {
+            android.util.Log.e("FormRunService", "startForeground FAILED", t)
+            try {
+                notifySimple(
+                    NOTIF_ID + 40,
+                    "Kaam shuru nahi ho paya ⚠️ $name",
+                    "Asli wajah: ${com.formmitra.app.engine.ErrorCatcher.shortCause(t)}"
+                )
+            } catch (_: Exception) { }
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         notifySimple(NOTIF_ID + 10, "Form bharna shuru: $name", "FormMitra automation kaam kar raha hai")
         // L4: flow milestone — TTS + notification
         try {
