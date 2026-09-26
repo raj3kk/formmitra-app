@@ -320,7 +320,9 @@ class FormRunService : Service() {
                 getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             val dekh = PendingIntent.getActivity(
                 this, 9101,
-                Intent(this, MainActivity::class.java).apply {
+                // v42: "Chal raha kaam dekho" → seedha LIVE view (OperatorView).
+                // Pehle MainActivity khulta tha — user kaam wali jagah nahi pahunch pata tha.
+                Intent(this, com.formmitra.app.agent.OperatorView::class.java).apply {
                     flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
                 },
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
@@ -943,8 +945,11 @@ class FormRunService : Service() {
         }
     }
 
+    /** v42: notification tap → LIVE view (OperatorView), taaki user seedha
+     * wahan pahunche jahan kaam ho raha hai. Pehle MainActivity khulta tha —
+     * user "kaam chalu hai" dekhkar tap karta tha par live page nahi dikhta tha. */
     private fun tapIntent(): PendingIntent {
-        val i = Intent(this, MainActivity::class.java).apply {
+        val i = Intent(this, com.formmitra.app.agent.OperatorView::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         return PendingIntent.getActivity(

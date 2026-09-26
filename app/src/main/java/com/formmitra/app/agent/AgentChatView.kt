@@ -28,6 +28,7 @@ import com.formmitra.app.engine.CardUnlockPolicy
 import com.formmitra.app.engine.TrackOfferPolicy
 import com.formmitra.app.engine.DestructivePolicy
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -2798,7 +2799,19 @@ class AgentChatView(
                 try { AgentApi.listTrackings(context) }
                 catch (_: Exception) { emptyList<JSONObject>() }
             } else emptyList<JSONObject>()
-            post { showPastWorkDialog(act, cat, tasks, trackings) }
+            // v42 ARRANGE: chal raha kaam sabse upar, phir taaza se purana.
+            // Status rank ascending (running=0 pehle), phir updated_at/created_at
+            // descending (taaza pehle). Na ho to original order.
+            fun rank(t: JSONObject) = when (t.optString("status", "").lowercase()) {
+                "running", "in_progress", "started" -> 0
+                else -> 1
+            }
+            fun ts(t: JSONObject) = t.optString("updated_at", "")
+                .ifEmpty { t.optString("created_at", "") }
+            val sorted = tasks.sortedWith(
+                compareBy<JSONObject> { rank(it) }.thenByDescending { ts(it) }
+            )
+            post { showPastWorkDialog(act, cat, sorted, trackings) }
         }, "fm-past-work").start()
     }
 
@@ -2831,17 +2844,129 @@ class AgentChatView(
                 setPadding(dp(4), dp(8), dp(4), dp(8))
             })
         }
+        // v42: BULK DELETE — sab select karke ek baar me delete.
+        // Deletable = sirf non-running tasks (chal raha kaam kabhi nahi).
+        fun isRunning(t: JSONObject) = t.optString("status", "").lowercase() in
+            setOf("running", "in_progress", "started")
+        val deletable = tasks.filter { !isRunning(it) }
+        val selected = mutableSetOf<String>() // runId set
+        fun runIdOf(t: JSONObject) =
+            t.optString("run_id").ifEmpty { t.optString("id") }.ifEmpty { t.toString().hashCode().toString() }
+        var deleteBtn: Button? = null
+        fun refreshDeleteBtn() {
+            deleteBtn?.apply {
+                text = if (selected.isEmpty()) "🗑️ Select karke delete karo"
+                       else "🗑️ Delete karo (${selected.size})"
+                isEnabled = selected.isNotEmpty()
+                alpha = if (selected.isNotEmpty()) 1f else 0.5f
+            }
+        }
+        if (deletable.isNotEmpty()) {
+            val bar = LinearLayout(act).apply {
+                orientation = HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 0, 0, dp(8))
+            }
+            val selectAll = CheckBox(act).apply {
+                text = "Sab select karo"
+                textSize = 13f
+                setOnCheckedChangeListener { _, on ->
+                    selected.clear()
+                    if (on) deletable.forEach { selected.add(runIdOf(it)) }
+                    // Saare row checkboxes sync karo.
+                    for (i in 0 until list.childCount) {
+                        val row = list.getChildAt(i) as? LinearLayout ?: continue
+                        val cb = row.getChildAt(0) as? CheckBox ?: continue
+                        if (cb.isChecked != on) cb.isChecked = on
+                    }
+                    refreshDeleteBtn()
+                }
+            }
+            bar.addView(selectAll, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            deleteBtn = Button(act).apply {
+                text = "🗑️ Select karke delete karo"
+                textSize = 13f
+                minimumWidth = 0
+                isEnabled = false
+                alpha = 0.5f
+                setOnClickListener {
+                    val n = selected.size
+                    if (n == 0) return@setOnClickListener
+                    AlertDialog.Builder(act)
+                        .setTitle("🗑️ $n kaam delete karein?")
+                        .setMessage("$n purane kaam ek saath delete ho jayenge. Ye wapas nahi aayenge.")
+                        .setPositiveButton("Delete karo") { _, _ ->
+                            Thread({
+                                var done = 0
+                                for (t in deletable) {
+                                    val rid = runIdOf(t)
+                                    if (rid !in selected) continue
+                                    try {
+                                        // Server par cancelled mark (wahi single-delete wala raasta).
+                                        if (rid.isNotEmpty()) {
+                                            AgentApi.updateRun(
+                                                context, rid, "cancelled", 0,
+                                                "User ne bulk delete kiya", ""
+                                            )
+                                        }
+                                        // Local pending bhi saaf — sirf agar yahi run pending tha.
+                                        try {
+                                            val pending = com.formmitra.app.engine.AgentResume.checkPending(context)
+                                            if (pending != null && pending.runId == rid) {
+                                                com.formmitra.app.engine.AgentResume.clear(context)
+                                            }
+                                        } catch (_: Exception) { }
+                                        done++
+                                    } catch (_: Exception) { }
+                                }
+                                post {
+                                    toast("🗑️ $done kaam delete ho gaye")
+                                    dlg.dismiss()
+                                    showPastWork()
+                                }
+                            }, "fm-bulk-delete").start()
+                        }
+                        .setNegativeButton("Rehne do", null)
+                        .show()
+                }
+            }
+            bar.addView(deleteBtn)
+            list.addView(bar)
+            refreshDeleteBtn()
+        }
         for (t in tasks) {
             val title = t.optString("name", "Kaam").ifEmpty { "Kaam" }
             val status = t.optString("status", "").ifEmpty { "—" }
+            // v42: status badge — chal raha sabse upar dikhega (sorted).
+            val badge = when (status.lowercase()) {
+                "running", "in_progress", "started" -> "🟢 Chal raha"
+                "done", "completed", "success" -> "✅ Poora hua"
+                "cancelled", "canceled", "stopped" -> "⏹ Band"
+                "failed", "error" -> "❌ Fail"
+                else -> "Status: $status"
+            }
             // v41: lamba dabao = delete (server par cancelled + local pending
             // saaf — deleted kaam dobara kabhi start nahi hoga).
             val row = dialogRow(
                 act, "📝", title,
-                "Status: $status — tap: continue • lamba dabao: delete"
+                "$badge — tap: continue • lamba dabao: delete"
             ) {
                 dlg.dismiss()
                 resumeTask(t)
+            }
+            // v42: bulk-delete checkbox — sirf deletable (non-running) par.
+            if (!isRunning(t)) {
+                val cb = CheckBox(act).apply {
+                    isChecked = runIdOf(t) in selected
+                    setOnCheckedChangeListener { _, on ->
+                        val id = runIdOf(t)
+                        if (on) selected.add(id) else selected.remove(id)
+                        refreshDeleteBtn()
+                    }
+                    // Checkbox tap row-tap ko na khaye.
+                    isFocusable = false
+                }
+                (row as? LinearLayout)?.addView(cb, 0)
             }
             row.setOnLongClickListener {
                 confirmDeleteTask(act, t) {

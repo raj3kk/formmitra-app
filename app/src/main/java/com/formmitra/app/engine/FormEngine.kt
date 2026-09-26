@@ -126,6 +126,11 @@ class FormEngine(private val appContext: Context) {
             domStorageEnabled = true
             databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
+            // v42: ServicePlus jaise sarkari portals window.open() se popup
+            // kholte hain — user ke mobile browser me khulta hai, par hamare
+            // WebView me onCreateWindow na hone se popup ATKA rehta tha.
+            setSupportMultipleWindows(true)
+            javaScriptCanOpenWindowsAutomatically = true
         }
         // session cookies MainActivity ke WebView se shared hain
         // (CookieManager process-global hai)
@@ -140,6 +145,99 @@ class FormEngine(private val appContext: Context) {
                 fileChooserParams: FileChooserParams?
             ): Boolean {
                 return handleFileChooser(filePathCallback)
+            }
+
+            // v42: window.open() popup — naye WebView ki jagah URL seedha
+            // isi main WebView me kholo (automation ek page par kaam karta
+            // hai; alag window me khula page AI ko dikhta hi nahi).
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: android.os.Message?
+            ): Boolean {
+                try {
+                    val href = view?.url.orEmpty()
+                    android.util.Log.i("FmEngine", "onCreateWindow: popup → main WebView me khol raha hun")
+                    // Transport ko turant complete karo taaki page block na ho;
+                    // URL milte hi main WebView me load karo.
+                    val transport = resultMsg?.obj as? WebView.WebViewTransport
+                    // Ek dummy WebView do taaki popup ka WebViewClient chal sake,
+                    // par shouldOverrideUrlLoading me URL pakadkar main me load karo.
+                    val ctx = view?.context ?: return true
+                    val dummy = WebView(ctx)
+                    dummy.webViewClient = object : android.webkit.WebViewClient() {
+                        override fun shouldOverrideUrlLoading(
+                            v: WebView?,
+                            request: android.webkit.WebResourceRequest?
+                        ): Boolean {
+                            val u = request?.url?.toString().orEmpty()
+                            if (u.isNotEmpty() && u != "about:blank") {
+                                // v42: navigate() BLOCKING hai (latch) — UI thread
+                                // se seedha call = deadlock. Handler par post karo.
+                                try {
+                                    handler?.post { try { navigate(u) } catch (_: Exception) { } }
+                                } catch (_: Exception) { }
+                                return true
+                            }
+                            return false
+                        }
+                    }
+                    transport?.webView = dummy
+                    resultMsg?.sendToTarget()
+                    return true
+                } catch (t: Throwable) {
+                    android.util.Log.e("FmEngine", "onCreateWindow failed", t)
+                    return false
+                }
+            }
+
+            // v42: JS dialogs (alert/confirm/prompt) automation ko BLOCK kar
+            // dete hain — user ke mobile browser me ye dikhte hain, par
+            // automation me inka jawab AI ko pata hona chahiye. Default:
+            // alert dismiss, confirm = OK, prompt = khaali.
+            // (AI ko page_text me dialog ka text dikhega agar zaroori hua.)
+            override fun onJsAlert(
+                view: WebView?,
+                url: String?,
+                message: String?,
+                result: android.webkit.JsResult?
+            ): Boolean {
+                android.util.Log.i("FmEngine", "onJsAlert auto-dismiss: ${message?.take(80)}")
+                try { result?.confirm() } catch (_: Exception) { }
+                return true
+            }
+
+            override fun onJsConfirm(
+                view: WebView?,
+                url: String?,
+                message: String?,
+                result: android.webkit.JsResult?
+            ): Boolean {
+                android.util.Log.i("FmEngine", "onJsConfirm auto-OK: ${message?.take(80)}")
+                try { result?.confirm() } catch (_: Exception) { }
+                return true
+            }
+
+            override fun onJsPrompt(
+                view: WebView?,
+                url: String?,
+                message: String?,
+                defaultValue: String?,
+                result: android.webkit.JsPromptResult?
+            ): Boolean {
+                android.util.Log.i("FmEngine", "onJsPrompt auto-empty: ${message?.take(80)}")
+                try { result?.confirm("") } catch (_: Exception) { }
+                return true
+            }
+
+            // v42: ServicePlus kabhi-kabhi permission/location maangta hai —
+            // automation me silently deny (block nahi hona chahiye).
+            override fun onGeolocationPermissionsShowPrompt(
+                origin: String?,
+                callback: android.webkit.GeolocationPermissions.Callback?
+            ) {
+                try { callback?.invoke(origin, false, false) } catch (_: Exception) { }
             }
         }
         wv.measure(
@@ -333,8 +431,17 @@ class FormEngine(private val appContext: Context) {
     }
 
     /** AI agent loop ke liye DOM snapshot: fields + buttons + page text + url/title. */
+    /** v42: aakhri snapshot ke indexed elements (index-mode tap ke liye cache). */
+    @Volatile private var lastElements: JSONArray = JSONArray()
+
     fun domSnapshot(): JSONObject {
-        return unwrapJsObject(evalJsSync(SNAPSHOT_JS))
+        val snap = unwrapJsObject(evalJsSync(SNAPSHOT_JS))
+        // v42: elements cache karo — index-mode click isi se rect nikalega.
+        try {
+            val els = snap.optJSONArray("elements")
+            if (els != null) lastElements = els
+        } catch (_: Exception) { }
+        return snap
     }
 
     /** AI agent loop ke liye CAPTCHA detect (public wrapper). */
@@ -412,7 +519,20 @@ class FormEngine(private val appContext: Context) {
       try{ bodyText=(document.body?document.body.innerText:'').replace(/\s+/g,' ').slice(0,1500); }catch(e){}
       var href='', ttl='';
       try{ href=location.href||''; ttl=document.title||''; }catch(e){}
-      return JSON.stringify({url:href,title:ttl,fields:fields,buttons:buttons,page_text:bodyText});
+      // v42: unified indexed elements — AI index se tap karega (Hindi text
+      // match karne ki zaroorat nahi — transliteration/spelling issues khatm).
+      // fields pehle (0..F-1), phir buttons (F..F+B-1).
+      var elements=[];
+      try{
+        fields.forEach(function(f,i){
+          var lb=(f.label||f.placeholder||f.aria||f.name||f.id||f.tag||'field');
+          elements.push({idx:i,kind:'field',label:String(lb).slice(0,60),rect:f.rect});
+        });
+        buttons.forEach(function(b,j){
+          elements.push({idx:fields.length+j,kind:'button',label:String(b.text||'').slice(0,60),rect:b.rect});
+        });
+      }catch(e){}
+      return JSON.stringify({url:href,title:ttl,elements:elements,fields:fields,buttons:buttons,page_text:bodyText});
     })()"""
 
     /**
@@ -1006,6 +1126,27 @@ class FormEngine(private val appContext: Context) {
     }
 
     private fun clickEl(s: StepSpec): JSONObject {
+        // v42: index-mode — AI ne elements[] me se idx chuna; Hindi text
+        // match ki zaroorat nahi. Cached rect ke center par tapAt.
+        if (s.selectorMode == "index") {
+            val idx = s.selectorValue.trim().toIntOrNull()
+            val el = if (idx != null) lastElements.optJSONObject(idx) else null
+            val rect = el?.optJSONObject("rect")
+            if (el == null || rect == null) {
+                throw Exception("click: index $idx nahi mila (elements=${lastElements.length()})")
+            }
+            val cx = rect.optDouble("x", -1.0) + rect.optDouble("w", 0.0) / 2.0
+            val cy = rect.optDouble("y", -1.0) + rect.optDouble("h", 0.0) / 2.0
+            if (cx < 0 || cy < 0) {
+                throw Exception("click: index $idx ka rect invalid hai")
+            }
+            // rect CSS px me hai (getBoundingClientRect) — tapAt wahi leta hai.
+            if (!tapAt(cx.toFloat(), cy.toFloat())) {
+                throw Exception("click: index $idx par tap fail hua")
+            }
+            Thread.sleep(1500)
+            return JSONObject().put("clicked", true).put("via", "index")
+        }
         val js = """(function(){
           var el=${finderJs(s.selectorMode, s.selectorValue)};
           if(!el) return 'NOT_FOUND';

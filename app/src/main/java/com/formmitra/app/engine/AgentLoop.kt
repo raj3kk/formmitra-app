@@ -3810,7 +3810,9 @@ object AgentLoop {
         val labels = ArrayList<String>()
         for (i in 0 until buttons.length().coerceAtMost(8)) {
             val b = buttons.optJSONObject(i) ?: continue
-            val lbl = b.optString("label", "").trim().take(30)
+            // v42 fix: snapshot me button text "text" key me hai ("label" nahi) —
+            // pehle ye list hamesha khaali jaati thi, AI ko buttons dikhte hi nahi the.
+            val lbl = b.optString("text", "").trim().take(30)
             if (lbl.isNotEmpty()) labels.add(lbl)
         }
         if (labels.isNotEmpty()) sb.append("\nButtons: ").append(labels.joinToString(" | "))
