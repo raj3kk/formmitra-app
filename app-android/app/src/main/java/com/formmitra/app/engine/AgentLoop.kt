@@ -3,6 +3,7 @@ package com.formmitra.app.engine
 import android.content.Context
 import com.formmitra.app.agent.AgentApi
 import com.formmitra.app.agent.CardJson
+import com.formmitra.app.agent.CardStore
 import com.formmitra.app.agent.ChoiceMemory
 import com.formmitra.app.agent.DetailStore
 import com.formmitra.app.agent.DocumentAutoPick
@@ -1006,6 +1007,9 @@ object AgentLoop {
             }
 
             var currentUrl = startUrl
+            // v53: wrong-page recovery tracking
+            var lastGoodUrl = startUrl
+            var lastActionWasNav = false
             val captchaAttempts = intArrayOf(0)
             // G2 resume: startStep steps pehle ho chuke — (startStep + 1) se continue.
             for (i in (stepsTaken + 1)..maxSteps) {
@@ -1039,6 +1043,29 @@ object AgentLoop {
                 }
                 val url = snap.optString("url", "").ifEmpty { currentUrl }
                 val title = snap.optString("title", "")
+                // v53: WRONG-PAGE RECOVERY (user order: "galti se kahin aur
+                // visit kar gaya to back karke aage badh sake").
+                // Agar current URL last-good URL se bilkul alag hai AUR
+                // page par interactable elements nahi hain AUR pichla action
+                // navigation nahi tha → back jao.
+                val interactiveCount = try {
+                    snap.optJSONArray("interactives")?.length() ?: 0
+                } catch (_: Exception) { 0 }
+                if (lastGoodUrl.isNotEmpty() &&
+                    url.isNotEmpty() &&
+                    !urlsRelated(url, lastGoodUrl) &&
+                    interactiveCount < 3 &&
+                    lastActionWasNav == false
+                ) {
+                    logStep(i, "wrong_page_recovery", false,
+                        "Galat page par aa gaye the ($url) — back ja rahe")
+                    try {
+                        engine.goBack()
+                        Thread.sleep(2000)
+                        currentUrl = lastGoodUrl
+                        continue
+                    } catch (_: Exception) { }
+                }
                 currentUrl = url
 
                 // (b) CAPTCHA safety net (v14 full protocol: max 3 attempts)
@@ -1245,6 +1272,9 @@ object AgentLoop {
                         LiveActivity.emitStep(agentRunId ?: effectiveRunId, action)
                     }
                 } catch (_: Exception) { }
+                // v52: ASK-BEFORE-VISIT HATAYA GAYA (user order 2026-09-27):
+                // "link kholne se pehle nahi puchega — automated rahe".
+                // Agent khud decide karega, user ko beech me nahi rokega.
                 // CONTRACT SYNC (2026-09-26): act response ka top-level
                 // work_summary (running summary) — done step me fallback.
 
@@ -1346,11 +1376,22 @@ object AgentLoop {
                                 ?: "Aapki zaroorat hai — app khol ke dekh lein")
                         )
                     }
-                    "vetoed" -> return finish(
-                        "vetoed",
-                        ((stepMap["blocked_reason"] as? String)?.ifEmpty { null }
-                            ?: "Rok diya gaya — payment/safety")
-                    )
+                    "vetoed" -> {
+                        // v47: veto par bhi screenshot + saaf reason — user ko
+                        // pata chale KYUN ruka aur page par kya tha.
+                        var vmsg = ((stepMap["blocked_reason"] as? String)?.ifEmpty { null }
+                            ?: "Rok diya gaya \u2014 payment/safety")
+                        try {
+                            val vsnap = try { engine.capturePngBase64() } catch (_: Exception) { "" }
+                            if (vsnap.isNotEmpty()) {
+                                val u = try {
+                                    RunReporter.uploadProof(ctx, effectiveRunId, vsnap)
+                                } catch (_: Exception) { null }
+                                if (!u.isNullOrEmpty()) vmsg += " Screenshot: $u"
+                            }
+                        } catch (_: Exception) { }
+                        return finish("vetoed", vmsg)
+                    }
                     // CONTRACT SYNC (2026-09-26): correct_field — server ka
                     // mid-run correction step (web/another device se aaya
                     // correction). CorrectionStore me dalo; agle act() me
@@ -1484,7 +1525,83 @@ object AgentLoop {
                         if (lastDiagnosis.isNotEmpty()) {
                             msg += " (AI ki raay: ${lastDiagnosis.first().take(150)})"
                         }
-                        return finish("needs_user", msg)
+                        // v46 (stuck-report root fix): atakne par 2-3 screenshots
+                        // lo + proof upload karo taaki user ko reason ke saath
+                        // tasveer bhi dikhe (pehle sirf text jata tha).
+                        // v48: proofUrls try ke bahar (Muse help me bhi chahiye).
+                        val proofUrls = ArrayList<String>()
+                        try {
+                            fun snap(): String = try { engine.capturePngBase64() }
+                                catch (_: Exception) { "" }
+                            fun scrollQuiet(dir: String) {
+                                try {
+                                    engine.runAgentStep(
+                                        JSONObject()
+                                            .put("type", "scroll")
+                                            .put("direction", dir)
+                                            .put("amount", 60.0)
+                                    )
+                                } catch (_: Exception) { }
+                            }
+                            // 1. jahan atka — current view
+                            val s1 = snap()
+                            // 2. thoda upar — upar kya tha
+                            scrollQuiet("up")
+                            try { Thread.sleep(500) } catch (_: Exception) { }
+                            val s2 = snap()
+                            // 3. wapas neeche (original jagah) + thoda aur neeche
+                            scrollQuiet("down")
+                            try { Thread.sleep(300) } catch (_: Exception) { }
+                            scrollQuiet("down")
+                            try { Thread.sleep(500) } catch (_: Exception) { }
+                            val s3 = snap()
+                            // wapas original jagah
+                            scrollQuiet("up")
+                            for (s in listOf(s1, s2, s3)) {
+                                if (s.isNotEmpty()) {
+                                    val u = try {
+                                        RunReporter.uploadProof(ctx, effectiveRunId, s)
+                                    } catch (_: Exception) { null }
+                                    if (!u.isNullOrEmpty()) proofUrls.add(u)
+                                }
+                            }
+                            if (proofUrls.isNotEmpty()) {
+                                msg += " Screenshots: " + proofUrls.joinToString(" ")
+                            }
+                            logStep(i, "stuck_proof", proofUrls.isNotEmpty(),
+                                "atke hue page ke ${proofUrls.size} screenshots user ke liye")
+                        } catch (_: Exception) { }
+                        // v48: MUSE HELP CHANNEL — AI se na suljhe to Muse se
+                        // help maango. Request banao → jawab ka wait karo
+                        // (5 min tak) → jawab aaye to guidance lekar retry.
+                        val museGuidance = try {
+                            askMuseForHelp(
+                                ctx, effectiveRunId, engine, goal, msg,
+                                lastDiagnosis.firstOrNull().orEmpty(),
+                                proofUrls
+                            )
+                        } catch (_: Exception) { null }
+                        if (!museGuidance.isNullOrEmpty()) {
+                            history.add(
+                                JSONObject().put("action", "muse_help")
+                                    .put("result", "guided")
+                                    .put("detail", "Muse ki guidance mili — dobara try: " +
+                                        museGuidance.take(200))
+                            )
+                            history.add(
+                                JSONObject().put("action", "muse_guidance")
+                                    .put("result", "ok")
+                                    .put("detail", museGuidance.take(2000))
+                            )
+                            stuckCount = 0
+                            recentSigs.clear()
+                            logStep(i, "muse_help", true,
+                                "Muse se help mili — naye guidance se retry")
+                            // Loop continue — naye guidance ke saath aage badho.
+                            continue
+                        } else {
+                            return finish("needs_user", msg)
+                        }
                     }
                     // v24-refine (AI-training): ataki situation → AI
                     // escalation — /api/agent/verify se diagnosis (EK call
@@ -1653,6 +1770,14 @@ object AgentLoop {
                     }
                     consecErrors = 0
                     stepsTaken++
+                    // v53: last-good tracking (wrong-page recovery ke liye).
+                    // Action safal hua → ye page theek hai.
+                    val stypeNow = (stepMap["action"] as? String).orEmpty()
+                    lastActionWasNav = (stypeNow == "goto" || stypeNow == "navigate")
+                    try {
+                        val u = engine.pageUrl()
+                        if (u.isNotEmpty()) lastGoodUrl = u
+                    } catch (_: Exception) { }
                     // v36: verified step → work-pattern ke liye collect.
                     // Sirf source KEY (card/user/detail ka naam) — personal
                     // VALUE kabhi nahi. goto ka URL selector me (mode=url).
@@ -1807,11 +1932,33 @@ object AgentLoop {
                     val stepFails = (stepFailCounts[stepSig] ?: 0) + 1
                     stepFailCounts[stepSig] = stepFails
                     when (com.formmitra.app.agent.LearnLogic.stepEscalation(stepFails)) {
-                        com.formmitra.app.agent.LearnLogic.STEP_USER_GATE -> {
-                            return finishUserGate(
-                                i, action,
-                                "Ye step 3 baar fail ho gaya — aage badhne ke liye aapki madad chahiye"
+                        com.formmitra.app.agent.LearnLogic.STEP_SMART_RETRY -> {
+                            // v52: Give-up NAHI — smart retry. Link thik tha,
+                            // process gadbad thi → naya tareeka try karo.
+                            // Operator: page dobara padho, alternative selector
+                            // dhoondo, AI Mode se samjho — phir retry.
+                            logStep(
+                                i, "smart_retry", true,
+                                "Step $stepFails baar fail — naya tareeka try kar rahe (give-up nahi)"
                             )
+                            // AI Mode se samjho (agar pehle nahi samjha)
+                            val problemDesc = "step '$action' $stepFails baar fail — naya tareeka chahiye"
+                            val smartSolved = tryAiModeStrategy(
+                                ctx, engine, goal, problemDesc,
+                                currentUrl, history
+                            )
+                            if (visionHistory.isNotEmpty()) {
+                                history.addAll(visionHistory)
+                                visionHistory.clear()
+                            }
+                            if (smartSolved) {
+                                stepFailCounts[stepSig] = 0
+                            }
+                            // Fail count ko cap karo taaki infinite na ho —
+                            // maxSteps backstop sambhal lega.
+                            if (stepFails > 10) {
+                                stepFailCounts[stepSig] = 3
+                            }
                         }
                         com.formmitra.app.agent.LearnLogic.STEP_AI_HELP -> {
                             logStep(
@@ -1822,6 +1969,55 @@ object AgentLoop {
                             )
                             ladderLevel = EscalationLadder.L_AI_STEP
                             actReason = AiUsage.R_STUCK_RETRY
+                            // v51: VISION AI — OPERATOR khud use karega, user nahi.
+                            // Atke to operator screenshot le ke AI se puchega
+                            // "iske aage kya karu", AI ke steps follow karega.
+                            val visionSolved = tryOperatorVisionHelp(
+                                ctx, engine, goal, currentUrl, history
+                            )
+                            // v53: AI HELP SYSTEM — permanent companion.
+                            // Help browser (alag WebView) me AI Mode kholo,
+                            // problem puchho, jawab samjho, trained ho.
+                            // (Vision AI se na ho to ye try karo)
+                            var aiHelpSolved = false
+                            if (!visionSolved) {
+                                val problemDesc = "step '$action' fail ho raha hai"
+                                // Work page ka screenshot (AI ko dikhane ke liye)
+                                val workShot = try {
+                                    engine.capturePngBase64()
+                                } catch (_: Exception) { "" }
+                                val helpResult = AiHelpSystem.helpCycle(
+                                    ctx, engine, problemDesc, goal,
+                                    workScreenshotB64 = workShot.ifEmpty { null }
+                                )
+                                if (helpResult.success) {
+                                    visionHistory.add(org.json.JSONObject()
+                                        .put("type", "ai_help")
+                                        .put("source", helpResult.source)
+                                        .put("understanding",
+                                            helpResult.understanding.take(500)))
+                                    aiHelpSolved = true
+                                }
+                            }
+                            // v52: AI MODE STRATEGY (fallback — purana tareeka)
+                            var aiModeSolved = false
+                            if (!visionSolved && !aiHelpSolved) {
+                                val problemDesc = "step '$action' fail ho raha hai"
+                                aiModeSolved = tryAiModeStrategy(
+                                    ctx, engine, goal, problemDesc,
+                                    currentUrl, history
+                                )
+                            }
+                            // Vision/AI-Help results ko main history me milao
+                            // (brain dekhega)
+                            if (visionHistory.isNotEmpty()) {
+                                history.addAll(visionHistory)
+                                visionHistory.clear()
+                            }
+                            if (visionSolved || aiHelpSolved || aiModeSolved) {
+                                // Step fail count reset (nayi koshish)
+                                stepFailCounts[stepSig] = 0
+                            }
                         }
                     }
                     // Upload me file missing → user se document maango (ek baar),
@@ -2051,7 +2247,7 @@ object AgentLoop {
             ?: "input"
         // v34: OTP popup me site ka naam — engine se host nikalo.
         val otpSite = if (kind == "otp") siteHost(engine) else ""
-        val req = buildPromptRequest(runId, kind, prompt, otpSite)
+        val req = buildPromptRequest(ctx, runId, kind, prompt, otpSite)
         // NOTE: duplicate notification nahi — UserPrompt.ask par FmApp ka
         // raised-listener NotifCenter se notify + PendingPrompt persist
         // karta hai (K1/K4). Yahan sirf automation logic.
@@ -2184,6 +2380,13 @@ object AgentLoop {
                         ((it["key"] as? String) ?: "value") to
                             ((it["type"] as? String) ?: "text")
                     }
+                // v48: field key -> label (card save ke liye).
+                val fieldLabels = ((prompt["fields"] as? List<*>) ?: emptyList<Any>())
+                    .mapNotNull { it as? Map<String, Any?> }
+                    .associate {
+                        ((it["key"] as? String) ?: "value") to
+                            (((it["label"] as? String) ?: it["key"] as? String) ?: "value")
+                    }
                 val ansKeys = ans.keys().asSequence()
                     .filter { it != "approved" }.toList()
                 var filledAny = false
@@ -2219,6 +2422,13 @@ object AgentLoop {
                         if (kind == "input") {
                             try {
                                 DetailStore.saveAll(ctx, mapOf(k to v))
+                            } catch (_: Exception) { }
+                            // v48: info-form jawab FormMitra card me bhi save —
+                            // baad me kaam aayega (pending details → card).
+                            // OTP/password kabhi save nahi hote.
+                            try {
+                                val label = fieldLabels[k] ?: k
+                                CardStore.pendingAdd(ctx, label, v, "agent")
                             } catch (_: Exception) { }
                         }
                     }
@@ -3000,7 +3210,7 @@ object AgentLoop {
      * result classify karo; FAILURE par 1 retry (total 2 attempts).
      * true = success confirm; false = failure/unknown.
      */
-    private fun submitOtpAndVerify(engine: FormEngine): Boolean {
+    private fun submitOtpAndVerify(engine: FormEngine, history: ArrayList<JSONObject>): Boolean {
         repeat(2) { attempt ->
             val before = try { engine.domSnapshot() } catch (_: Exception) { return false }
             val beforeUrl = before.optString("url", "")
@@ -3035,9 +3245,120 @@ object AgentLoop {
                 try { Thread.sleep(1500) } catch (_: Exception) { }
                 return@repeat
             }
+            if (result == OtpFieldDetect.Result.FAILURE) return false
+            // v48 (OTP loop ROOT FIX): UNKNOWN matlab "pata nahi", "fail" nahi.
+            // Pehle OTP sahi bharne par bhi UNKNOWN aata tha → galat reask →
+            // popup loop. Ab: thoda aur wait + OTP field ab bhi hai ya nahi check.
+            // OTP field gayab = page OTP se aage badh gaya = SUCCESS.
+            try { Thread.sleep(5000) } catch (_: Exception) { }
+            val after2 = try { engine.domSnapshot() } catch (_: Exception) { null }
+            val result2 = OtpFieldDetect.classifyResult(
+                beforeUrl, after2?.optString("url", "") ?: "",
+                beforeText, after2?.optString("page_text", "") ?: ""
+            )
+            if (result2 == OtpFieldDetect.Result.SUCCESS) return true
+            if (result2 == OtpFieldDetect.Result.FAILURE) {
+                if (attempt == 0) { try { Thread.sleep(1500) } catch (_: Exception) { }; return@repeat }
+                return false
+            }
+            // Ab bhi UNKNOWN → OTP field check: gayab hai to success.
+            if (!otpFieldStillPresent(engine)) {
+                history.add(
+                    JSONObject().put("action", "otp_verify").put("result", "success")
+                        .put("detail", "OTP field page se gayab — aage badh gaya")
+                )
+                return true
+            }
             return false
         }
         return false
+    }
+
+    /**
+     * v48: MUSE HELP CHANNEL — agent atak jaye aur AI se na suljhe to
+     * Muse se help maango.
+     * 1. /api/agent/muse-help par request banao (stuck reason + screenshots).
+     * 2. 5 min tak poll karo (har 30s) — Muse jawab de to guidance wapas.
+     * 3. Timeout → null (caller needs_user finish karega).
+     */
+    private fun askMuseForHelp(
+        ctx: Context,
+        runId: String,
+        engine: FormEngine,
+        goal: String,
+        stuckReason: String,
+        aiDiagnosis: String,
+        proofUrls: List<String>
+    ): String? {
+        return try {
+            val snap = try { engine.domSnapshot() } catch (_: Exception) { null }
+            val url = snap?.optString("url", "").orEmpty()
+            val host = try {
+                java.net.URI(url).host.orEmpty()
+            } catch (_: Exception) { "" }
+            val pageText = snap?.optString("page_text", "").orEmpty().take(3000)
+            // 1. Help request banao.
+            val createBody = JSONObject()
+                .put("run_id", runId)
+                .put("host", host)
+                .put("url", url.take(500))
+                .put("goal", goal)
+                .put("stuck_reason", stuckReason.take(1000))
+                .put("ai_diagnosis", aiDiagnosis.take(1000))
+                .put("page_text", pageText)
+                .put("proof_urls", org.json.JSONArray(proofUrls.take(5)))
+            val created = AgentApi.postAuthed(ctx, "/api/agent/muse-help", createBody)
+            val helpId = created?.optString("help_id", "").orEmpty()
+            if (helpId.isEmpty()) return null
+            // User ko batao — Muse se help maangi hai.
+            try {
+                NotifCenter.notify(
+                    ctx,
+                    NotifCenter.Cat.STATUS,
+                    "Muse se help maangi 🤝",
+                    "Agent atak gaya tha — Muse se guidance ka intezaar hai (5 min)."
+                )
+            } catch (_: Exception) { }
+            // 2. Poll karo — 10 baar × 30s = 5 min.
+            repeat(10) {
+                try { Thread.sleep(30_000) } catch (_: Exception) { }
+                val poll = AgentApi.getAuthed(
+                    ctx, "/api/agent/muse-help?help_id=" + helpId
+                )
+                val status = poll?.optString("status", "").orEmpty()
+                if (status == "answered" || status == "closed") {
+                    val resp = poll?.optString("muse_response", "").orEmpty()
+                    if (resp.isNotEmpty()) return resp
+                    if (status == "closed") return null
+                }
+            }
+            null
+        } catch (_: Exception) { null }
+    }
+
+    /**
+     * v48: page par OTP input field ab bhi maujood hai ya nahi.
+     * Submit ke baad field gayab = OTP accept ho gaya (page aage badha).
+     */
+    private fun otpFieldStillPresent(engine: FormEngine): Boolean {
+        return try {
+            val snap = engine.domSnapshot()
+            val fields = snap.optJSONArray("fields") ?: return true
+            val fs = (0 until fields.length()).mapNotNull { i ->
+                val f = fields.optJSONObject(i) ?: return@mapNotNull null
+                OtpFieldDetect.Field(
+                    tag = f.optString("tag", ""),
+                    type = f.optString("type", ""),
+                    label = f.optString("label", ""),
+                    placeholder = f.optString("placeholder", ""),
+                    aria = f.optString("aria", ""),
+                    name = f.optString("name", ""),
+                    id = f.optString("id", ""),
+                    maxLen = f.optInt("maxlength", -1)
+                )
+            }
+            OtpFieldDetect.boxGroup(fs) != null || OtpFieldDetect.bestField(fs) != null
+        } catch (_: Exception) { true }
     }
 
     /**
@@ -3114,7 +3435,7 @@ object AgentLoop {
             JSONObject().put("action", "otp_fill").put("result", "ok")
                 .put("detail", "OTP bhara ($site) — verify dabakar result check ho raha hai")
         )
-        if (submitOtpAndVerify(engine)) {
+        if (submitOtpAndVerify(engine, history)) {
             history.add(
                 JSONObject().put("action", "otp_verify").put("result", "success")
                     .put("detail", "OTP verify ho gaya ($site)")
@@ -3344,6 +3665,7 @@ object AgentLoop {
 
     /** Prompt map → UserPrompt.Request. */
     private fun buildPromptRequest(
+        ctx: Context,
         runId: String,
         kind: String,
         prompt: Map<String, Any?>,
@@ -3373,6 +3695,27 @@ object AgentLoop {
                 UserPrompt.Field("otp", "OTP", "otp")
             )
         }
+        // v50 CARD AUTO-FILL: har field ke liye card me dhoondo.
+        // Mila to prefill — dialog me bhara hua dikhega, user ko dobara
+        // likhna nahi padega. (OTP/password kabhi prefill nahi.)
+        if (kind == "input" || kind == "login") {
+            try {
+                val needed = fields.map {
+                    SiteFieldDetector.NeededField(
+                        it.key, it.label, "", it.type,
+                        SiteFieldDetector.isSensitiveKey(it.key, it.type),
+                        0
+                    )
+                }
+                val fromCard = SiteFieldDetector.lookupFromCard(ctx, needed)
+                if (fromCard.isNotEmpty()) {
+                    fields = fields.map { f ->
+                        val v = fromCard[f.key] ?: ""
+                        if (v.isNotEmpty()) f.copy(prefill = v) else f
+                    }
+                }
+            } catch (_: Exception) { }
+        }
         val options = ((prompt["options"] as? List<*>) ?: emptyList<Any>())
             .mapNotNull { (it as? String)?.ifEmpty { null } }
         @Suppress("UNCHECKED_CAST")
@@ -3390,6 +3733,10 @@ object AgentLoop {
         val fullMsg = if (kind == "otp" && site.isNotEmpty() &&
             !baseMsg.contains(site)
         ) "$baseMsg\nSite: $site" else baseMsg
+        // v51: user-gates par timeout NAHI — user jawab de ya cancel kare
+        // tabhi aage. (otp/input/login/choice/document)
+        val isUserGate = kind == "otp" || kind == "input" || kind == "login" ||
+            kind == "choice" || kind == "document"
         return UserPrompt.Request(
             runId = runId,
             kind = kind,
@@ -3399,7 +3746,8 @@ object AgentLoop {
             options = options,
             payment = payment,
             docType = (prompt["doc_type"] as? String)?.ifEmpty { null } ?: "",
-            timeoutSec = (prompt["timeout_s"] as? Number)?.toLong() ?: 600L
+            timeoutSec = (prompt["timeout_s"] as? Number)?.toLong() ?: 600L,
+            waitForever = isUserGate
         )
     }
     /**
@@ -3605,7 +3953,7 @@ object AgentLoop {
         var didAny = false
         if (seq.length() == 0) {
             // sequence nahi aayi → type-based legacy fallback
-            return executeCaptchaLegacy(ctx, engine, cap, snap, widget)
+            return executeCaptchaLegacy(engine, cap, snap, widget)
         }
         for (i in 0 until seq.length()) {
             val st = seq.optJSONObject(i) ?: continue
@@ -3673,7 +4021,6 @@ object AgentLoop {
      * action_sequence khaali ho to type-based fallback (legacy action field).
      */
     private fun executeCaptchaLegacy(
-        ctx: Context,
         engine: FormEngine,
         cap: JSONObject,
         snap: JSONObject,
@@ -3724,14 +4071,22 @@ object AgentLoop {
             false
         }
     }
-
     /** Widget rect ka center (CSS px) — checkbox fallback ke liye. */
+    /**
+     * v46 (A4 root fix): widget ka normalized (0-1000) center do.
+     * Pehle rect (CSS pixels) seedha tapNormalized(0..1000) me jata tha —
+     * e.g. x=120px screen ke 12% par tap ho jata tha (galat jagah).
+     * Ab JS cx1000/cy1000 bhejta hai; wahi prefer karo.
+     */
     private fun widgetCenter(widget: JSONObject?): Pair<Double, Double>? {
-        val rect = widget?.optJSONObject("rect") ?: return null
-        val x = rect.optDouble("x", Double.NaN)
-        val y = rect.optDouble("y", Double.NaN)
-        if (x.isNaN() || y.isNaN()) return null
-        return (x + rect.optDouble("w", 0.0) / 2) to (y + rect.optDouble("h", 0.0) / 2)
+        if (widget != null && widget.has("cx1000")) {
+            val cx = widget.optDouble("cx1000", Double.NaN)
+            val cy = widget.optDouble("cy1000", Double.NaN)
+            if (!cx.isNaN() && !cy.isNaN()) return cx to cy
+        }
+        // Fallback nahi: bina viewport ke CSS px → normalized convert nahi ho
+        // sakta; galat tap karne se achha hai tap na karna (handoff hoga).
+        return null
     }
 
     /**
@@ -4047,4 +4402,222 @@ object AgentLoop {
         }
         return o
     }
+
+    // v52: ask-before-visit helpers REMOVED (user order 2026-09-27) —
+    // agent automated rahega, link kholne se pehle nahi puchega.
+
+    /**
+     * v51: needs_user exit signal.
+     */
+    /**
+     * v52: AI MODE AUTO-STRATEGY — operator khud AI Mode me jaake AI se
+     * baat karega (user order 2026-09-27).
+     *
+     * "AI overview ya AI mode me jaake AI se baat kare — video me bataya
+     * tha. AI mode me jaake kya kaise karna hai, trained karo full operate
+     * karne ke liye agent ko. Understanding kaise karega, read karke —
+     * ye bhi saath me. Jo bhi seekhega memory me rahega, trained hoga,
+     * aage usse karega."
+     *
+     * Flow (OPERATOR-driven, user ko kuch nahi karna):
+     * 1. Current URL save karo
+     * 2. AI Mode search kholo (goal/problem ke saath)
+     * 3. AI Overview READ karo (understanding = read karke)
+     * 4. Doubt ho to "Ask anything" me follow-up puchho + send
+     * 5. Jawab READ karo
+     * 6. Wapas original page par jao
+     * 7. Seekha hua MEMORY me rakho (agli baar bina AI Mode ke)
+     *
+     * @return true = AI Mode se actionable samajh mila
+     */
+    /**
+     * v53: Do URLs related hain? (wrong-page recovery ke liye)
+     * Same host ya ek dusre ka prefix → related.
+     */
+    private fun urlsRelated(a: String, b: String): Boolean {
+        return try {
+            if (a.isEmpty() || b.isEmpty()) return true
+            val ua = java.net.URL(a)
+            val ub = java.net.URL(b)
+            if (ua.host.equals(ub.host, ignoreCase = true)) return true
+            if (a.startsWith(b) || b.startsWith(a)) return true
+            false
+        } catch (_: Exception) { true }
+    }
+
+    private fun tryAiModeStrategy(
+        ctx: Context,
+        engine: FormEngine,
+        goal: String,
+        problem: String,
+        currentUrl: String,
+        history: List<org.json.JSONObject>
+    ): Boolean {
+        return try {
+            android.util.Log.i("AgentLoop",
+                "AI Mode strategy: operator khud AI se baat kar raha hai...")
+            // 0. Pehle seekha hua hai? (memory — dobara AI Mode nahi)
+            val learned = AiModeMemory.getLearned(ctx, problem)
+            if (learned != null) {
+                android.util.Log.i("AgentLoop", "AI Mode: memory se mila")
+                visionHistory.add(org.json.JSONObject()
+                    .put("type", "ai_mode")
+                    .put("source", "memory")
+                    .put("understanding", learned.take(500)))
+                return true
+            }
+            // 1. Current page save karo
+            val returnUrl = currentUrl.ifEmpty { "" }
+            // 2. AI Mode search kholo
+            val query = "$goal — $problem kaise solve kare"
+            val aiUrl = AiModeOperator.AI_MODE_SEARCH +
+                java.net.URLEncoder.encode(query, "UTF-8")
+            try {
+                engine.runAgentStep(org.json.JSONObject()
+                    .put("type", "goto")
+                    .put("url", aiUrl))
+            } catch (_: Exception) { }
+            Thread.sleep(4000)  // AI Overview load hone do
+            // 3. AI Overview READ karo (understanding = read karke)
+            var answer = ""
+            try {
+                val raw = engine.evalJs(AiModeOperator.readAiAnswerJs(), 15000)
+                answer = raw.trim().trim('"').take(2000)
+            } catch (_: Exception) { }
+            // 4. Doubt ho to follow-up puchho
+            if (answer.length < 200 || answer.contains("NOT_FOUND")) {
+                try {
+                    engine.evalJs(
+                        AiModeOperator.askAnythingJs(
+                            "Iske baare me step by step batao: $problem"
+                        ), 10000
+                    )
+                    Thread.sleep(5000)
+                    val raw2 = engine.evalJs(
+                        AiModeOperator.readAiAnswerJs(), 15000)
+                    val a2 = raw2.trim().trim('"').take(2000)
+                    if (a2.length > answer.length) answer = a2
+                } catch (_: Exception) { }
+            }
+            // 5. Wapas original page par jao
+            if (returnUrl.isNotEmpty()) {
+                try {
+                    engine.runAgentStep(org.json.JSONObject()
+                        .put("type", "goto")
+                        .put("url", returnUrl))
+                    Thread.sleep(2000)
+                } catch (_: Exception) { }
+            }
+            // 6. Samajh memory me rakho (trained)
+            if (answer.length >= 100) {
+                AiModeMemory.learn(ctx, problem, answer)
+                visionHistory.add(org.json.JSONObject()
+                    .put("type", "ai_mode")
+                    .put("source", "ai_overview")
+                    .put("understanding", answer.take(500)))
+                android.util.Log.i("AgentLoop",
+                    "AI Mode: samajh mila + memory me save")
+                return true
+            }
+            android.util.Log.i("AgentLoop", "AI Mode: kaam ka jawab nahi mila")
+            false
+        } catch (e: Exception) {
+            android.util.Log.e("AgentLoop",
+                "AI Mode error: ${(e.message ?: "").take(100)}")
+            false
+        }
+    }
+
+    /**
+     * v52: VISION AI — OPERATOR khud use karega, USER nahi.
+     * (doc restored)
+     *
+     * Jab operator atakta hai:
+     * 1. Operator screenshot leta hai (user ko kuch nahi karna)
+     * 2. AI ko bhejta hai: "iske aage kya karu?"
+     * 3. AI ke steps aate hain → history me daalo (agla brain
+     *    decision isi se seekhega)
+     * 4. Solution yaad rakhta hai (agli baar AI call bina)
+     *
+     * NOTE: logStep/pushHistory local hain — yahan android Log +
+     * visionHistory (class field) use karo. Loop inhe padhega.
+     *
+     * @return true = AI se actionable solution mila
+     */
+    // Operator vision results (loop padhega) — JSONObject list
+    private val visionHistory = mutableListOf<org.json.JSONObject>()
+
+    private fun tryOperatorVisionHelp(
+        ctx: Context,
+        engine: FormEngine,
+        goal: String,
+        pageUrl: String,
+        history: List<org.json.JSONObject>
+    ): Boolean {
+        return try {
+            android.util.Log.i("AgentLoop",
+                "Vision AI: operator khud screenshot le raha hai...")
+            // 1. Screenshot lo (operator khud — FormEngine se)
+            val pngB64 = try { engine.capturePngBase64() } catch (_: Exception) { "" }
+            if (pngB64.isEmpty()) {
+                android.util.Log.e("AgentLoop", "Vision AI: screenshot fail")
+                return false
+            }
+            // PNG se JPEG banao (AI ko JPEG chahiye) — ya direct PNG bhejo
+            val b64 = pngB64
+            if (b64 == null) {
+                android.util.Log.e("AgentLoop", "Vision AI: screenshot fail")
+                return false
+            }
+            // 2. Pehle seekha hua solution hai?
+            val learned = AiHelper.getLearnedSolution(ctx, pageUrl, "stuck")
+            if (learned != null) {
+                android.util.Log.i("AgentLoop",
+                    "Vision AI: seekha hua solution mila")
+                visionHistory.add(org.json.JSONObject()
+                    .put("type", "vision_ai")
+                    .put("solution", "learned")
+                    .put("detail", learned.take(200)))
+                return true
+            }
+            // 3. AI se puchho
+            val historyStrings = history.mapNotNull {
+                try { it.toString() } catch (_: Exception) { null }
+            }
+            val analysis = AiHelper.askAiWhatNext(
+                ctx, b64, pageUrl, goal, historyStrings
+            ) ?: run {
+                android.util.Log.e("AgentLoop", "Vision AI: AI jawab nahi de paya")
+                return false
+            }
+            // 4. AI ne kya dekha/bataya — visionHistory me (loop padhega)
+            val entry = org.json.JSONObject()
+                .put("type", "vision_ai")
+                .put("seen", analysis.seen.take(150))
+                .put("problem", analysis.problem.take(150))
+                .put("steps", analysis.steps.joinToString(" | ").take(300))
+            visionHistory.add(entry)
+            android.util.Log.i("AgentLoop", "Vision AI: ${entry.toString().take(200)}")
+            // 5. Solution yaad rakho (training)
+            if (analysis.steps.isNotEmpty()) {
+                AiHelper.learnSolution(
+                    ctx, pageUrl, "stuck",
+                    analysis.steps.joinToString("\n")
+                )
+            }
+            // 6. Agar AI ko user chahiye to false (user gate par jayega)
+            if (analysis.needsUser) {
+                android.util.Log.i("AgentLoop",
+                    "Vision AI ko user chahiye: ${analysis.userAsk.take(100)}")
+                return false
+            }
+            analysis.steps.isNotEmpty() && analysis.confidence >= 0.4
+        } catch (e: Exception) {
+            android.util.Log.e("AgentLoop",
+                "Vision AI error: ${(e.message ?: "").take(100)}")
+            false
+        }
+    }
+
+
 }

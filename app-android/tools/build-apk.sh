@@ -18,11 +18,11 @@ rm -rf $OUT && mkdir -p $OUT/{aar,classes,dex,res}
 export JAVA_HOME=$PTOOLS/jdk-17
 export PATH=$JAVA_HOME/bin:$PATH
 APPID="com.formmitra.app"
-VERSION_CODE=10
-VERSION_NAME="1.0.10-v10"
+VERSION_CODE=53
+VERSION_NAME="1.0.53-v53"
 SITE_URL="https://formmitra-git-main-webbuilder1.vercel.app/"
 # Output APK name parameterized — v1 APK (formmitra-v1.apk) untouched rehta hai.
-APK_NAME="formmitra-v10.apk"
+APK_NAME="formmitra-v${VERSION_CODE}.apk"
 
 # BuildConfig.java sync (manual build me Gradle nahi hai)
 sed -i -e "s/VERSION_NAME = \"[^\"]*\"/VERSION_NAME = \"$VERSION_NAME\"/" \
@@ -62,6 +62,70 @@ for d in $OUT/aar/*/; do
   fi
 done
 echo "aar res zips: $((${#AAR_RES_ARGS[@]} / 2))"
+
+# == J1: FCM config (google-services.json → fcm_values.xml) ==
+# Firebase project clip-flow-685a5 reuse. User Firebase console me
+# com.formmitra.app add karke updated google-services.json dega.
+# - json me FormMitra client mile to res values generate (build-time only,
+#   $OUT me — repo me COMMIT NAHI hota, koi secret file nahi banti).
+# - na mile to skip: FirebaseApp.initializeApp null dega → FcmPush graceful
+#   degrade, polling fallback (FormTaskWorker 30-min + NetWake + WakeWorker).
+# Firebase options code me hardcode NAHI — sab json se aata hai.
+FCM_RES_ARGS=()
+GSJSON=""
+for cand in "$FA/app/google-services.json" "$HOME/workspace/user/files/google-services.json"; do
+  if [ -f "$cand" ]; then GSJSON="$cand"; break; fi
+done
+if [ -n "$GSJSON" ]; then
+  echo "google-services.json: $GSJSON"
+  mkdir -p $OUT/fcm-res/values
+  if python3 - "$GSJSON" "$OUT/fcm-res/values/fcm_values.xml" <<'PYEOF'
+import json, sys, xml.sax.saxutils as sx
+src, dst = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(src))
+except Exception as e:
+    print('FCM: json parse fail: %s' % e); sys.exit(1)
+proj = d.get('project_info', {}) or {}
+found = None
+for c in d.get('client', []) or []:
+    ci = c.get('client_info') or {}
+    aci = ci.get('android_client_info') or {}
+    if aci.get('package_name') == 'com.formmitra.app':
+        found = c; break
+if not found:
+    print('FCM: com.formmitra.app client json me nahi — polling fallback')
+    sys.exit(1)
+api_key = ''
+for k in found.get('api_key') or []:
+    if k.get('current_key'):
+        api_key = k['current_key']; break
+vals = {
+    'google_app_id': (found.get('client_info') or {}).get('mobilesdk_app_id', ''),
+    'gcm_defaultSenderId': str(proj.get('project_number', '')),
+    'google_api_key': api_key,
+    'google_project_id': proj.get('project_id', ''),
+    'google_storage_bucket': proj.get('storage_bucket', ''),
+}
+for req in ('google_app_id', 'gcm_defaultSenderId', 'google_api_key', 'google_project_id'):
+    if not vals[req]:
+        print('FCM: missing ' + req); sys.exit(1)
+xml = '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+for k, v in vals.items():
+    if v:
+        xml += '    <string name="%s" translatable="false">%s</string>\n' % (k, sx.escape(v))
+xml += '</resources>\n'
+open(dst, 'w').write(xml)
+print('FCM: fcm_values.xml OK (project=%s)' % vals['google_project_id'])
+PYEOF
+  then
+    $BT/aapt2 compile --dir $OUT/fcm-res -o $OUT/fcm-res.zip
+    FCM_RES_ARGS=(-R $OUT/fcm-res.zip)
+  fi
+else
+  echo "FCM: google-services.json nahi mila — polling fallback (build nahi tootega)"
+fi
+
 $BT/aapt2 link -o $OUT/base.apk \
   -I $SDK/platforms/android-34/android.jar \
   --manifest $OUT/AndroidManifest.xml \
@@ -71,6 +135,7 @@ $BT/aapt2 link -o $OUT/base.apk \
   --auto-add-overlay \
   --java $OUT/gen \
   "${AAR_RES_ARGS[@]}" \
+  "${FCM_RES_ARGS[@]}" \
   $OUT/res.zip
 # R.java bani ya nahi — nahi bani to aage badhne ka matlab nahi
 test -f $OUT/gen/com/formmitra/app/R.java
@@ -78,7 +143,7 @@ test -f $OUT/gen/com/formmitra/app/R.java
 echo "== 3. kotlinc =="
 find $APP/java -name "*.kt" -o -name "*.java" > $OUT/sources.txt
 wc -l $OUT/sources.txt
-$PTOOLS/kotlinc/bin/kotlinc -jvm-target 17 -no-reflect \
+$PTOOLS/kotlinc/bin/kotlinc -J-Xmx2g -jvm-target 17 -no-reflect \
   -cp "$CP" -d $OUT/classes @$OUT/sources.txt 2>&1 | grep -v "^warning:"; test ${PIPESTATUS[0]} -eq 0
 
 echo "== 3b. library R classes =="
@@ -116,6 +181,32 @@ D8_JARS+=("$PTOOLS/kotlinc/lib/kotlin-stdlib.jar")
 echo "d8 jars: ${#D8_JARS[@]} (kotlin-stdlib = compiler bundled)"
 $BT/d8 --min-api 26 --lib $SDK/platforms/android-34/android.jar \
   --output $OUT/dex $(find $OUT/classes -name "*.class") "${D8_JARS[@]}" 2>&1 | tail -5
+
+echo "== 4b. dex-content gate (transitive-dep pin) =="
+# v36 REAL-PHONE crash: "Kaam shuru karte waqt"
+#   NoClassDefFoundError: Landroidx/arch/core/executor/ArchTaskExecutor
+#   (Scheduler.kickNow -> WorkManager.enqueue -> LiveData.postValue -> ArchTaskExecutor)
+# Root cause: core-runtime AAR d8 inputs me nahi tha — d8 dangling references par
+# fail NAHI karta, isliye selftest/JVM par dikha nahi, phone par crash hua.
+# Ye gate har build par verify karta hai ki zaroori transitive classes dex me
+# DEFINITION ke roop me maujood hain (sirf reference nahi). NOTE: dexdump me
+# "Class descriptor" ke baad DO space hain — single-space grep false alarm dega.
+DEX_GATE_FAIL=0
+for _dexclass in \
+  "Landroidx/arch/core/executor/ArchTaskExecutor;" \
+  "Landroidx/arch/core/executor/DefaultTaskExecutor;" \
+  "Lkotlin/enums/EnumEntriesKt;" ; do
+  if $BT/dexdump -d $OUT/dex/classes*.dex 2>/dev/null | grep -q "Class descriptor  : '$_dexclass'"; then
+    echo "dex-gate OK: $_dexclass"
+  else
+    echo "DEX-GATE-FAIL: $_dexclass dex me DEFINITION ke roop me nahi mila"
+    DEX_GATE_FAIL=1
+  fi
+done
+if [ "$DEX_GATE_FAIL" -ne 0 ]; then
+  echo "DEX-GATE: transitive dependency dex se missing — build ROKA gaya (v36 crash dobara nahi)"
+  exit 1
+fi
 
 echo "== 5. package + sign =="
 cd $OUT
