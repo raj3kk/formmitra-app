@@ -965,6 +965,77 @@ class FormEngine(private val appContext: Context) {
         } catch (_: Exception) { "" }
     }
 
+    /**
+     * v53: WORK SCREENSHOT → AI MODE UPLOAD.
+     * User order: "kaam me dikkat aayi to screenshot leke AI Mode me
+     * upload karke puchega."
+     *
+     * 1. base64 screenshot ko temp PNG file me save karo
+     * 2. pendingUploadFile arm karo
+     * 3. AI Mode ke image/Lens upload button ko JS se click karo
+     * 4. onShowFileChooser fire → screenshot file mil jayegi
+     *
+     * @return true = upload button mila aur click hua
+     */
+    fun uploadWorkScreenshotToAiMode(screenshotB64: String): Boolean {
+        return try {
+            if (screenshotB64.isEmpty()) return false
+            // 1. Temp file me save karo
+            val bytes = android.util.Base64.decode(
+                screenshotB64, android.util.Base64.DEFAULT
+            )
+            val file = java.io.File(
+                appContext.cacheDir,
+                "ai_help_shot_${System.currentTimeMillis()}.png"
+            )
+            java.io.FileOutputStream(file).use { it.write(bytes) }
+            // 2. File chooser arm karo
+            pendingUploadFile = file
+            val latch = java.util.concurrent.CountDownLatch(1)
+            pendingUploadLatch = latch
+            try {
+                // 3. AI Mode ka image upload button click karo (help WebView)
+                val clicked = evalHelpJs(
+                    """(function(){
+                        // Google AI Mode / Search ke image upload buttons
+                        var btn = document.querySelector('div[aria-label*="image" i][role="button"]') ||
+                            document.querySelector('button[aria-label*="Lens" i]') ||
+                            document.querySelector('div[aria-label*="Lens" i]') ||
+                            document.querySelector('input[type="file"][accept*="image"]') ||
+                            Array.from(document.querySelectorAll('div[role="button"],button')).find(b => {
+                                var t = (b.getAttribute('aria-label')||'').toLowerCase();
+                                return t.indexOf('upload image')>=0 || t.indexOf('lens')>=0 ||
+                                       t.indexOf('image search')>=0;
+                            });
+                        if (!btn) return 'UPLOAD_BTN_NOT_FOUND';
+                        btn.click();
+                        return 'UPLOAD_CLICKED';
+                    })()""", 15000
+                )
+                android.util.Log.i(
+                    "FmEngine",
+                    "AI Mode upload button: ${clicked.take(40)}"
+                )
+                // 4. File chooser ka intezar (15s)
+                latch.await(15, java.util.concurrent.TimeUnit.SECONDS)
+            } finally {
+                pendingUploadFile = null
+                pendingUploadLatch = null
+                // Temp file saaf karo (privacy)
+                try { file.delete() } catch (_: Exception) { }
+            }
+            true
+        } catch (e: Exception) {
+            android.util.Log.e(
+                "FmEngine",
+                "uploadWorkScreenshotToAiMode fail: ${(e.message ?: "").take(80)}"
+            )
+            try { pendingUploadFile = null } catch (_: Exception) { }
+            try { pendingUploadLatch = null } catch (_: Exception) { }
+            false
+        }
+    }
+
     private fun evalJsSync(js: String, timeoutMs: Long = 30_000): String {        val latch = CountDownLatch(1)
         var out = "null"
         handler!!.post {

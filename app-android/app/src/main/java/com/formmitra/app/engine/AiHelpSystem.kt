@@ -123,7 +123,9 @@ object AiHelpSystem {
 
     /**
      * Screenshot ke saath puchho.
-     * (Screenshot AI Mode me upload + question)
+     * (Screenshot AI Mode me UPLOAD + question)
+     * v53: asli file upload — pendingUploadFile arm karke AI Mode ke
+     * Lens/image button ko click karta hai.
      * @return AI ka jawab (null = nahi mila)
      */
     fun askWithScreenshot(
@@ -133,9 +135,18 @@ object AiHelpSystem {
     ): String? {
         return try {
             if (!ensureAiMode(engine, question)) return null
-            // Screenshot upload karne ki koshish (Lens/upload button)
-            // Pehle sawal puchho, phir screenshot ka zikr karo
-            val q = "$question\n\n(Mere paas is page ka screenshot hai — " +
+            // 1. Screenshot AI Mode me UPLOAD karo (asli file upload)
+            val uploaded = try {
+                engine.uploadWorkScreenshotToAiMode(screenshotB64)
+            } catch (_: Exception) { false }
+            Log.i(TAG, "Screenshot upload: $uploaded")
+            Thread.sleep(3000)
+            // 2. Sawal puchho (screenshot ke context ke saath)
+            val q = if (uploaded)
+                "$question\n\n(Upar jo screenshot upload kiya hai usme jo " +
+                "dikh raha hai, uske hisaab se step-by-step batao kya karu)"
+            else
+                "$question\n\n(Mere paas is page ka screenshot hai — " +
                 "page par ye dikh raha hai, iske hisaab se batao)"
             askAi(engine, q)
         } catch (e: Exception) {
