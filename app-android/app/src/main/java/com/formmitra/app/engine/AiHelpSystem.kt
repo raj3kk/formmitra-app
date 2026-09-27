@@ -156,11 +156,72 @@ object AiHelpSystem {
     }
 
     /**
+     * SMART HELP SITUATION — agent khud decide karega kya puchna hai.
+     * User order: "agent ko pta ho kha se screenshot kr k kya upload kr k
+     * puchna h and kya puchna kya situation h kya age krna"
+     *
+     * Har field AI ko full context deta hai:
+     * - goal: user ka asli kaam kya hai
+     * - problem: kya dikkat aayi
+     * - currentUrl: KAUNSE link par atka (link ke saath)
+     * - pageTitle: page ka naam
+     * - attemptedAction: kya karne ki koshish thi (tap/fill/etc)
+     * - failCount: kitni baar fail hua
+     * - recentAttempts: pehle kya-kya try kiya (dobara wahi na puche)
+     */
+    data class HelpSituation(
+        val goal: String,
+        val problem: String,
+        val currentUrl: String = "",
+        val pageTitle: String = "",
+        val attemptedAction: String = "",
+        val failCount: Int = 0,
+        val recentAttempts: List<String> = emptyList()
+    )
+
+    /**
+     * SMART QUESTION BUILDER — situation se full-detail sawal banata hai.
+     * Agent ko khud pata: kya puchna hai, kya situation hai, kya aage karna hai.
+     */
+    fun buildSmartQuestion(s: HelpSituation, withScreenshot: Boolean): String {
+        val sb = StringBuilder()
+        sb.append("Mera goal hai: ${s.goal}\n")
+        if (s.currentUrl.isNotEmpty()) {
+            sb.append("Main is website/link par hun: ${s.currentUrl}\n")
+        }
+        if (s.pageTitle.isNotEmpty()) {
+            sb.append("Page ka title: ${s.pageTitle}\n")
+        }
+        if (s.attemptedAction.isNotEmpty()) {
+            sb.append("Main ye karne ki koshish kar raha tha: ${s.attemptedAction}\n")
+        }
+        sb.append("Problem: ${s.problem}\n")
+        if (s.failCount > 0) {
+            sb.append("Ye ${s.failCount} baar fail ho chuka hai.\n")
+        }
+        if (s.recentAttempts.isNotEmpty()) {
+            sb.append("Pehle ye try kar chuka hun (dobara mat batao):\n")
+            s.recentAttempts.take(5).forEach { sb.append("- $it\n") }
+        }
+        if (withScreenshot) {
+            sb.append("\nUpar jo screenshot upload kiya hai, wo KAAM WALE " +
+                "browser ka hai — wahi page jahan main atka hun.\n")
+        }
+        sb.append("\nScreenshot/page dekh ke batao:\n")
+        sb.append("1. Page par abhi kya dikh raha hai? (kahan atka hun)\n")
+        sb.append("2. Mera goal poora karne ke liye AGLA STEP kya hona chahiye?\n")
+        sb.append("3. Kaunsa button/link/field use karun — exact text batao\n")
+        sb.append("4. Agar ye page galat hai to sahi page ka URL kya hai?\n")
+        sb.append("Step by step, short me batao.")
+        return sb.toString()
+    }
+
+    /**
      * FULL HELP CYCLE — stuck point par operator ye bulayega.
      *
      * 1. Pehle memory dekho (seekha hua?)
-     * 2. AI Mode me puchho
-     * 3. Na mile to screenshot ke saath puchho
+     * 2. AI Mode me puchho (SMART question — full detail)
+     * 3. Na mile to screenshot ke saath puchho (ASLI upload)
      * 4. Seekha hua memory me save karo
      *
      * BOUNDED: max 3 cycles (loop-guard).
@@ -174,34 +235,85 @@ object AiHelpSystem {
         goal: String,
         workScreenshotB64: String? = null
     ): HelpResult {
+        // Purana signature — HelpSituation me convert karo
+        return helpCycle(
+            ctx, engine,
+            HelpSituation(goal = goal, problem = problem),
+            workScreenshotB64
+        )
+    }
+
+    /**
+     * SMART HELP CYCLE — HelpSituation ke saath.
+     * Agent khud full detail bhejta hai: link + screenshot + situation.
+     *
+     * v55 order (user: "groq uska v help le jb jaruri ho"):
+     *   1. Memory (seekha hua — free, instant)
+     *   2. Groq (key hai to — fast direct API)
+     *   3. AI Mode browser (screenshot upload ke saath)
+     */
+    fun helpCycle(
+        ctx: Context,
+        engine: FormEngine,
+        situation: HelpSituation,
+        workScreenshotB64: String? = null
+    ): HelpResult {
         // 0. Memory me seekha hua hai?
-        val learned = AiModeMemory.getLearned(ctx, problem)
+        val memKey = "${situation.goal} — ${situation.problem}".take(200)
+        val learned = AiModeMemory.getLearned(ctx, memKey)
         if (learned != null) {
-            Log.i(TAG, "Memory se mila — AI Mode nahi khola")
+            Log.i(TAG, "Memory se mila — AI nahi puchha")
             return HelpResult(
                 understanding = learned,
                 source = "memory",
                 success = true
             )
         }
-        // 1-3. Bounded help cycles
+        // 1. GROQ — key hai to seedha puchho (fast, browser ka wait nahi)
+        // (User order: "groq uska v help le jb jaruri ho jha p lena chaiye")
+        // Jab agent atka ho aur samajh chahiye = jaruri jagah.
+        try {
+            // Page ka text context ke liye (screenshot Groq ko nahi jata —
+            // text API hai; situation + page text kaafi hai)
+            val pageText = try {
+                engine.evalJs(
+                    "document.body ? document.body.innerText.slice(0,1500) : ''",
+                    8000
+                )
+            } catch (_: Exception) { "" }
+            val groqAnswer = GroqHelp.askForHelp(ctx, situation, pageText)
+            if (groqAnswer != null && groqAnswer.length >= 50) {
+                Log.i(TAG, "Groq se samajh mila — memory me save kar raha")
+                AiModeMemory.learn(ctx, memKey, groqAnswer)
+                return HelpResult(
+                    understanding = groqAnswer,
+                    source = "groq",
+                    success = true
+                )
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Groq help fail: ${(e.message ?: "").take(80)}")
+        }
+        // 2-4. AI Mode browser — bounded help cycles (screenshot ke saath)
         for (cycle in 1..MAX_CYCLES) {
-            Log.i(TAG, "Help cycle $cycle/$MAX_CYCLES: $problem".take(80))
+            Log.i(TAG, "Help cycle $cycle/$MAX_CYCLES: ${situation.problem}".take(80))
             try {
-                // Pehle bina screenshot puchho
-                var answer = askAi(engine, "$goal — $problem. Step by step batao kya karu.")
-                // Na mile to screenshot ke saath
+                // SMART question — full detail (link + situation)
+                val smartQ = buildSmartQuestion(situation, withScreenshot = false)
+                var answer = askAi(engine, smartQ)
+                // Na mile to screenshot ke saath (ASLI upload)
                 if (answer == null && workScreenshotB64 != null) {
                     Log.i(TAG, "Screenshot ke saath puchh raha")
+                    val smartQShot = buildSmartQuestion(situation, withScreenshot = true)
                     answer = askWithScreenshot(
                         engine,
-                        "$goal — $problem. Screenshot me jo dikh raha hai uske hisaab se batao.",
+                        smartQShot,
                         workScreenshotB64
                     )
                 }
                 if (answer != null && answer.length >= 100) {
                     // Seekha hua save karo (trained)
-                    AiModeMemory.learn(ctx, problem, answer)
+                    AiModeMemory.learn(ctx, memKey, answer)
                     return HelpResult(
                         understanding = answer,
                         source = "ai_mode",

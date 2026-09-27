@@ -436,6 +436,12 @@ run_test selftest_v53 SelfTestV53 \
   "$SRC/agent/LearnLogic.kt" \
   "$APP/tools/selftest/SelfTestV53.kt"
 
+# v55: GroqHelp + smart question + auto-refresh
+# (GroqHelp/AiHelpSystem FormEngine par depend karte hain — source-check
+# pattern. Koi compile dependency nahi.)
+run_test selftest_v55 SelfTestV55 \
+  "$APP/tools/selftest/SelfTestV55.kt"
+
 echo "==============================="
 echo "TOTAL PASS: $TOTAL_PASS"
 echo "TOTAL FAILURES: $TOTAL_FAIL"

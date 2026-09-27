@@ -1941,6 +1941,20 @@ object AgentLoop {
                                 i, "smart_retry", true,
                                 "Step $stepFails baar fail — naya tareeka try kar rahe (give-up nahi)"
                             )
+                            // v54: SMART MOVE — 2 baar fail par pehle REFRESH.
+                            // (User: "refresh agent khud karega automated")
+                            // Stale/atka page aksar refresh se thik hota hai.
+                            // Sirf ek baar per step (dobara nahi).
+                            if (stepFails == 2) {
+                                try {
+                                    logStep(
+                                        i, "smart_refresh", true,
+                                        "2 baar fail — page refresh karke dobara try"
+                                    )
+                                    engine.opReload()
+                                    Thread.sleep(2000)
+                                } catch (_: Exception) { }
+                            }
                             // AI Mode se samjho (agar pehle nahi samjha)
                             val problemDesc = "step '$action' $stepFails baar fail — naya tareeka chahiye"
                             val smartSolved = tryAiModeStrategy(
@@ -1981,13 +1995,40 @@ object AgentLoop {
                             // (Vision AI se na ho to ye try karo)
                             var aiHelpSolved = false
                             if (!visionSolved) {
-                                val problemDesc = "step '$action' fail ho raha hai"
-                                // Work page ka screenshot (AI ko dikhane ke liye)
+                                // v54: SMART SITUATION — agent khud full detail
+                                // bhejta hai: link + page + kya kar raha tha +
+                                // kitni baar fail + pehle kya try kiya.
+                                // (User: "kya puchna kya situation h kya age krna")
+                                val pageTitle = try {
+                                    engine.evalJs("document.title", 8000)
+                                        .take(120)
+                                } catch (_: Exception) { "" }
+                                // Recent attempts — history se (dobara wahi na ho)
+                                val recentTries = try {
+                                    history.takeLast(6).mapNotNull { h ->
+                                        try {
+                                            val a = h.optString("action", "")
+                                            val ok = h.optBoolean("ok", true)
+                                            if (a.isNotEmpty() && !ok) "$a (fail)"
+                                            else null
+                                        } catch (_: Exception) { null }
+                                    }.distinct().take(5)
+                                } catch (_: Exception) { emptyList<String>() }
+                                val situation = AiHelpSystem.HelpSituation(
+                                    goal = goal,
+                                    problem = "step '$action' fail ho raha hai",
+                                    currentUrl = currentUrl,
+                                    pageTitle = pageTitle,
+                                    attemptedAction = action,
+                                    failCount = stepFails,
+                                    recentAttempts = recentTries
+                                )
+                                // Work page ka screenshot (KAAM WALE browser ka)
                                 val workShot = try {
                                     engine.capturePngBase64()
                                 } catch (_: Exception) { "" }
                                 val helpResult = AiHelpSystem.helpCycle(
-                                    ctx, engine, problemDesc, goal,
+                                    ctx, engine, situation,
                                     workScreenshotB64 = workShot.ifEmpty { null }
                                 )
                                 if (helpResult.success) {
