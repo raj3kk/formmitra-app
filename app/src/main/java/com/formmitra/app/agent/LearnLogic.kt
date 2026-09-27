@@ -148,19 +148,26 @@ object LearnLogic {
     }
 
     // ---- v36 refine point 2: per-step stuck escalation ----
-    /** Ek step fail ho to aage kya: 0=continue, 1=AI single-step help, 2=user gate. */
+    // v52: "7 baar fail ab nahi hoga" restriction REMOVED (user order
+    // 2026-09-27). Link thik tha, process gadbad thi — to process thik
+    // karo, give-up mat karo. Operator ab smart strategies try karega:
+    // vision AI → AI Mode → alternative approach. User gate SIRF tab jab
+    // sach me user ki zaroorat ho (OTP/login/payment), fail-count par nahi.
+    /** Ek step fail ho to aage kya: 0=continue, 1=AI single-step help, 2=smart retry (naya tareeka). */
     const val STEP_OK = 0
     const val STEP_AI_HELP = 1
-    const val STEP_USER_GATE = 2
+    const val STEP_SMART_RETRY = 2
+    // STEP_USER_GATE ab fail-count par nahi — sirf hard gates par.
 
     /**
      * Same step N baar fail → escalation level.
-     * 2 fails → AI se single-step help; 3 fails → user ko saaf batao.
-     * Infinite retry loop KABHI nahi (loop ka maxSteps + STUCK_MAX backstop
-     * alag se hain).
+     * 2 fails → AI se single-step help (vision AI + AI Mode);
+     * 3+ fails → SMART RETRY (naya tareeka, give-up nahi).
+     * Infinite retry loop se bachne ke liye loop ka maxSteps backstop
+     * hai — wahan pohoche to hi user ko batayenge (learnings ke saath).
      */
     fun stepEscalation(failCount: Int): Int = when {
-        failCount >= 3 -> STEP_USER_GATE
+        failCount >= 3 -> STEP_SMART_RETRY
         failCount >= 2 -> STEP_AI_HELP
         else -> STEP_OK
     }

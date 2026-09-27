@@ -322,19 +322,36 @@ class WorkTabView(context: Context) : LinearLayout(context) {
         if (act.isFinishing || act.isDestroyed) return
         val name = t.optString("name", "Kaam").ifEmpty { "Kaam" }
         val status = t.optString("status", "")
-        // Chal raha kaam — pehle band karo.
-        if (status.lowercase() in setOf("running", "in_progress", "started")) {
-            toast("Pehle kaam band karo, phir delete karo ⏹")
-            return
+        val isRunning = status.lowercase() in setOf("running", "in_progress", "started")
+        // v52: Live automation bhi delete ho sakta hai — pehle use band
+        // karo (AutomationStopper), phir delete. User order 2026-09-27.
+        val msg = if (isRunning) {
+            "\"$name\"\n\n🔴 Ye kaam ABHI CHAL RAHA hai.\n\n" +
+            "Delete karne par:\n" +
+            "• Pehle automation band hoga\n" +
+            "• Phir ye kaam hamesha ke liye delete hoga\n\n" +
+            "⚠️ AI ki seekhi hui memory (trained) kabhi delete nahi hogi.\n" +
+            "⚠️ FormMitra Card ka data safe rahega."
+        } else {
+            "\"$name\"\n\nYe hamesha ke liye delete ho jayega.\n\n" +
+            "⚠️ AI ki seekhi hui memory (trained) kabhi delete nahi hogi.\n" +
+            "⚠️ FormMitra Card ka data safe rahega."
         }
         AlertDialog.Builder(act)
             .setTitle("🗑️ Kaam delete karo?")
-            .setMessage("\"$name\"\n\nYe hamesha ke liye delete ho jayega.")
+            .setMessage(msg)
             .setPositiveButton("Delete karo") { _, _ ->
                 // Turant UI se hatao (server ka wait nahi).
                 tasks = tasks.filter { it.optString("id") != t.optString("id") }
                 render()
                 Thread({
+                    // v52: Chal raha ho to PEHLE band karo.
+                    if (isRunning) {
+                        try {
+                            com.formmitra.app.engine.AutomationStopper.stopAll(context)
+                            Thread.sleep(800)
+                        } catch (_: Exception) { }
+                    }
                     val ok = try {
                         AgentApi.deleteTask(context, t.optString("id", ""))
                     } catch (_: Exception) { false }

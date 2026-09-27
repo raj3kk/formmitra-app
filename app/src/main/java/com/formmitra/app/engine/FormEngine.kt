@@ -157,7 +157,6 @@ class FormEngine(private val appContext: Context) {
                 resultMsg: android.os.Message?
             ): Boolean {
                 try {
-                    val href = view?.url.orEmpty()
                     android.util.Log.i("FmEngine", "onCreateWindow: popup → main WebView me khol raha hun")
                     // Transport ko turant complete karo taaki page block na ho;
                     // URL milte hi main WebView me load karo.
@@ -166,6 +165,18 @@ class FormEngine(private val appContext: Context) {
                     // par shouldOverrideUrlLoading me URL pakadkar main me load karo.
                     val ctx = view?.context ?: return true
                     val dummy = WebView(ctx)
+                    // v46 (root fix): dummy ka kaam khatm hote hi destroy —
+                    // pehle har popup ek WebView leak karta tha.
+                    var dummyDead = false
+                    fun killDummy() {
+                        if (dummyDead) return
+                        dummyDead = true
+                        try {
+                            dummy.stopLoading()
+                            dummy.removeAllViews()
+                            dummy.destroy()
+                        } catch (_: Exception) { }
+                    }
                     dummy.webViewClient = object : android.webkit.WebViewClient() {
                         override fun shouldOverrideUrlLoading(
                             v: WebView?,
@@ -176,7 +187,10 @@ class FormEngine(private val appContext: Context) {
                                 // v42: navigate() BLOCKING hai (latch) — UI thread
                                 // se seedha call = deadlock. Handler par post karo.
                                 try {
-                                    handler?.post { try { navigate(u) } catch (_: Exception) { } }
+                                    handler?.post {
+                                        try { navigate(u) } catch (_: Exception) { }
+                                        killDummy()
+                                    }
                                 } catch (_: Exception) { }
                                 return true
                             }
@@ -185,6 +199,11 @@ class FormEngine(private val appContext: Context) {
                     }
                     transport?.webView = dummy
                     resultMsg?.sendToTarget()
+                    // Safety: URL kabhi na aaya (about:blank JS popup) to 15s
+                    // me dummy destroy — hamesha leak-free.
+                    try {
+                        handler?.postDelayed({ killDummy() }, 15_000)
+                    } catch (_: Exception) { }
                     return true
                 } catch (t: Throwable) {
                     android.util.Log.e("FmEngine", "onCreateWindow failed", t)
@@ -197,13 +216,25 @@ class FormEngine(private val appContext: Context) {
             // automation me inka jawab AI ko pata hona chahiye. Default:
             // alert dismiss, confirm = OK, prompt = khaali.
             // (AI ko page_text me dialog ka text dikhega agar zaroori hua.)
+            // v46 (root fix): JS dialogs ka SAFE default + AI visibility.
+            // Pehle confirm hamesha OK hota tha ("delete?" par bhi OK!) aur
+            // prompt khaali submit hota tha. Ab:
+            //  - alert → dismiss (harmless), notice me darj.
+            //  - confirm → CANCEL (safe default: koi destructive/important
+            //    faisla AI ki marzi ke bina nahi), notice me darj — AI snapshot
+            //    me dekh kar zaroorat par on-page button khud dabayega ya
+            //    user se poochhega.
+            //  - prompt → CANCEL (khaali submit galat state bana sakta tha),
+            //    notice me darj.
             override fun onJsAlert(
                 view: WebView?,
                 url: String?,
                 message: String?,
                 result: android.webkit.JsResult?
             ): Boolean {
-                android.util.Log.i("FmEngine", "onJsAlert auto-dismiss: ${message?.take(80)}")
+                val msg = message.orEmpty()
+                android.util.Log.i("FmEngine", "onJsAlert dismiss: ${msg.take(80)}")
+                addNotice("js_alert", msg, url.orEmpty())
                 try { result?.confirm() } catch (_: Exception) { }
                 return true
             }
@@ -214,8 +245,10 @@ class FormEngine(private val appContext: Context) {
                 message: String?,
                 result: android.webkit.JsResult?
             ): Boolean {
-                android.util.Log.i("FmEngine", "onJsConfirm auto-OK: ${message?.take(80)}")
-                try { result?.confirm() } catch (_: Exception) { }
+                val msg = message.orEmpty()
+                android.util.Log.i("FmEngine", "onJsConfirm CANCEL (safe): ${msg.take(80)}")
+                addNotice("js_confirm_cancelled", msg, url.orEmpty())
+                try { result?.cancel() } catch (_: Exception) { }
                 return true
             }
 
@@ -226,17 +259,22 @@ class FormEngine(private val appContext: Context) {
                 defaultValue: String?,
                 result: android.webkit.JsPromptResult?
             ): Boolean {
-                android.util.Log.i("FmEngine", "onJsPrompt auto-empty: ${message?.take(80)}")
-                try { result?.confirm("") } catch (_: Exception) { }
+                val msg = message.orEmpty()
+                android.util.Log.i("FmEngine", "onJsPrompt CANCEL (safe): ${msg.take(80)}")
+                addNotice("js_prompt_cancelled", msg, url.orEmpty())
+                try { result?.cancel() } catch (_: Exception) { }
                 return true
             }
 
-            // v42: ServicePlus kabhi-kabhi permission/location maangta hai —
-            // automation me silently deny (block nahi hona chahiye).
+            // v46: geolocation — deny (safe default: background automation me
+            // location leak nahi), par notice AI ko dikhta hai. Agar task ko
+            // asal me location chahiye to AI needs_user karega.
             override fun onGeolocationPermissionsShowPrompt(
                 origin: String?,
                 callback: android.webkit.GeolocationPermissions.Callback?
             ) {
+                android.util.Log.i("FmEngine", "geolocation denied: $origin")
+                addNotice("geolocation_denied", "site ne location manga", origin.orEmpty())
                 try { callback?.invoke(origin, false, false) } catch (_: Exception) { }
             }
         }
@@ -434,12 +472,48 @@ class FormEngine(private val appContext: Context) {
     /** v42: aakhri snapshot ke indexed elements (index-mode tap ke liye cache). */
     @Volatile private var lastElements: JSONArray = JSONArray()
 
+    /**
+     * v46: page notices — JS dialogs (alert/confirm/prompt) aur geolocation
+     * prompts jo automation ne khud handle kiye. domSnapshot inhe AI ko
+     * dikhata hai (consume-on-read), taaki AI ko pata chale page ne kya manga
+     * tha aur automation ne kya jawab diya.
+     */
+    private val pageNotices = ArrayDeque<JSONObject>()
+    private val noticesLock = Any()
+    private fun addNotice(kind: String, text: String, url: String) {
+        synchronized(noticesLock) {
+            try {
+                pageNotices.addLast(
+                    JSONObject()
+                        .put("kind", kind)
+                        .put("text", text.take(200))
+                        .put("url", url.take(200))
+                        .put("at", System.currentTimeMillis())
+                )
+                while (pageNotices.size > 5) pageNotices.removeFirst()
+            } catch (_: Exception) { }
+        }
+    }
+    /** Snapshot ke saath notices bhi do aur buffer khaali karo. */
+    private fun drainNotices(): JSONArray {
+        val arr = JSONArray()
+        synchronized(noticesLock) {
+            for (n in pageNotices) arr.put(n)
+            pageNotices.clear()
+        }
+        return arr
+    }
+
     fun domSnapshot(): JSONObject {
         val snap = unwrapJsObject(evalJsSync(SNAPSHOT_JS))
         // v42: elements cache karo — index-mode click isi se rect nikalega.
         try {
             val els = snap.optJSONArray("elements")
             if (els != null) lastElements = els
+        } catch (_: Exception) { }
+        // v46: automation-handled dialogs/location prompts AI ko dikhao.
+        try {
+            snap.put("notices", drainNotices())
         } catch (_: Exception) { }
         return snap
     }
@@ -459,11 +533,15 @@ class FormEngine(private val appContext: Context) {
           return {x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)};
         }catch(e){ return null; }
       }
-      function labelText(el){
+      // v46: label lookup root-scoped — shadow DOM ke andar ke fields
+      // ke labels document.querySelector se nahi milte the.
+      function labelText(el, root){
         try{
           var id=el.getAttribute('id');
           if(id){
-            var lb=document.querySelector('label[for="'+id+'"]');
+            var scope=root||document;
+            var lb=null;
+            try{ lb=scope.querySelector('label[for="'+id+'"]'); }catch(e){}
             if(lb && lb.innerText) return lb.innerText.trim().slice(0,80);
           }
         }catch(e){}
@@ -482,10 +560,25 @@ class FormEngine(private val appContext: Context) {
         }catch(e){}
         docs.forEach(fn);
       }
+      // v46: OPEN shadow roots bhi traverse karo — nahi to shadow-DOM wale
+      // form fields/buttons AI snapshot me dikhte hi nahi the.
+      function eachRoot(fn){
+        function walk(root){
+          fn(root);
+          var all;
+          try{ all=root.querySelectorAll('*'); }catch(e){ return; }
+          for(var i=0;i<all.length;i++){
+            var sr=null;
+            try{ sr=all[i].shadowRoot; }catch(e){}
+            if(sr) walk(sr);
+          }
+        }
+        eachDoc(function(doc){ walk(doc); });
+      }
       var fields=[];
-      eachDoc(function(doc){
+      eachRoot(function(root){
         var els;
-        try{ els=doc.querySelectorAll('input,select,textarea'); }catch(e){ return; }
+        try{ els=root.querySelectorAll('input,select,textarea'); }catch(e){ return; }
         Array.from(els).forEach(function(el){
           if(fields.length>=60) return;
           var t='';
@@ -500,13 +593,13 @@ class FormEngine(private val appContext: Context) {
           var val='';
           try{ val = (t==='password') ? '' : ((el.value||'')+'').slice(0,120); }catch(e){}
           try{ ml=parseInt(el.getAttribute('maxlength')||'0',10)||0; }catch(e){ ml=0; }
-          fields.push({tag:tag,type:t,label:labelText(el),placeholder:ph,aria:ar,id:id,name:nm,maxlength:ml,rect:rect(el),value:val});
+          fields.push({tag:tag,type:t,label:labelText(el, root),placeholder:ph,aria:ar,id:id,name:nm,maxlength:ml,rect:rect(el),value:val});
         });
       });
       var buttons=[];
-      eachDoc(function(doc){
+      eachRoot(function(root){
         var els;
-        try{ els=doc.querySelectorAll('button,a,input[type=submit],input[type=button],[role=button]'); }catch(e){ return; }
+        try{ els=root.querySelectorAll('button,a,input[type=submit],input[type=button],[role=button]'); }catch(e){ return; }
         Array.from(els).forEach(function(el){
           if(buttons.length>=30) return;
           var txt='';
@@ -630,9 +723,65 @@ class FormEngine(private val appContext: Context) {
         val blob = obj.optString("href", "") + " " +
             obj.optString("title", "") + " " +
             obj.optString("text", "")
-        VetoCheck.find(blob)?.let {
-            throw VetoException("live page pe payment keyword '$it' — page rok diya")
-        }
+        val kw = VetoCheck.find(blob) ?: return
+        // v47 (payment false-positive ROOT FIX): sirf "payment"/"fee" shabd
+        // milna payment NAHI hai (scholarship portal par "fee payment" text
+        // hota hai). Veto SIRF tab jab ASLI payment UI bhi dikhe — QR, upi://
+        // link, payment gateway iframe, card/UPI field + pay button.
+        if (!hasRealPaymentUi()) return
+        throw VetoException("live page par asli payment UI ('$kw') — page rok diya")
+    }
+
+    /**
+     * v47: page par ASLI payment UI hai ya nahi — QR / upi: link /
+     * gateway iframe / card-UPI field + pay button. Sirf text me "payment"
+     * shabd hona kaafi NAHI (scholarship/fee-info pages par false positive tha).
+     */
+    private fun hasRealPaymentUi(): Boolean {
+        val raw = evalJsSync(
+            """(function(){
+              try{
+                var html = document.documentElement ? document.documentElement.outerHTML.slice(0,60000) : '';
+                var low = html.toLowerCase();
+                // 1. upi:// link
+                if (low.indexOf('upi://') >= 0) return 'upi_link';
+                // 2. payment gateway iframe
+                var ifs = document.getElementsByTagName('iframe');
+                for (var i = 0; i < ifs.length; i++) {
+                  var s = (ifs[i].src || '').toLowerCase();
+                  if (s.indexOf('razorpay')>=0||s.indexOf('payu')>=0||s.indexOf('billdesk')>=0||
+                      s.indexOf('cashfree')>=0||s.indexOf('juspay')>=0||s.indexOf('ccavenue')>=0)
+                    return 'gateway_iframe';
+                }
+                // 3. QR code image/canvas
+                var imgs = document.getElementsByTagName('img');
+                for (var j = 0; j < imgs.length; j++) {
+                  var a = ((imgs[j].src||'')+' '+(imgs[j].alt||'')).toLowerCase();
+                  if (a.indexOf('qr')>=0 && (a.indexOf('upi')>=0||a.indexOf('scan')>=0||a.indexOf('pay')>=0))
+                    return 'qr_code';
+                }
+                // 4. card/UPI input field + pay button
+                var hasPayField = false;
+                var inputs = document.querySelectorAll('input');
+                for (var k = 0; k < inputs.length; k++) {
+                  var nm = ((inputs[k].name||'')+' '+(inputs[k].id||'')+' '+(inputs[k].placeholder||'')).toLowerCase();
+                  if (nm.indexOf('card')>=0||nm.indexOf('upi')>=0||nm.indexOf('cvv')>=0) { hasPayField = true; break; }
+                }
+                if (hasPayField) {
+                  var btns = document.querySelectorAll('button, input[type=submit], input[type=button], a');
+                  for (var m = 0; m < btns.length; m++) {
+                    var t = (btns[m].innerText||btns[m].value||'').toLowerCase();
+                    if (t.indexOf('pay now')>=0||t.indexOf('proceed to pay')>=0||
+                        t.indexOf('make payment')>=0||(t.indexOf('pay')==0&&t.length<20))
+                      return 'pay_button';
+                  }
+                }
+                return '';
+              }catch(e){ return ''; }
+            })()"""
+        )
+        val res = unwrapJsString(raw).trim().trim('"')
+        return res.isNotEmpty()
     }
 
     // ---------------- step dispatch (per-step timeout ke saath) ----------------
@@ -683,7 +832,7 @@ class FormEngine(private val appContext: Context) {
                     .put("has_image", b64.isNotEmpty())
             }
             "captcha_detect" -> captchaDetect()
-            "captcha_solve" -> captchaSolve(s)
+            "captcha_solve" -> captchaSolve()
             "back" -> { goBack(); JSONObject().put("nav", "back") }
             "forward" -> { goForward(); JSONObject().put("nav", "forward") }
             "scroll" -> scrollPage(s)
@@ -706,8 +855,15 @@ class FormEngine(private val appContext: Context) {
 
     // ---------------- engine-thread primitives ----------------
 
-    private fun evalJsSync(js: String, timeoutMs: Long = 30_000): String {
-        val latch = CountDownLatch(1)
+    /**
+     * v52: Public JS eval — operator AI Mode operate karne ke liye.
+     * (askAnythingJs, readAiAnswerJs jaise trained scripts)
+     */
+    fun evalJs(js: String, timeoutMs: Long = 30_000): String {
+        return try { evalJsSync(js, timeoutMs) } catch (_: Exception) { "null" }
+    }
+
+    private fun evalJsSync(js: String, timeoutMs: Long = 30_000): String {        val latch = CountDownLatch(1)
         var out = "null"
         handler!!.post {
             try {
@@ -1127,27 +1283,100 @@ class FormEngine(private val appContext: Context) {
         return JSONObject().put("key", s.key)
     }
 
+    /**
+     * v46 (A12 root fix): index-tap ke liye self-contained JS — tap se PEHLE
+     * page par elements dobara collect karta hai (snapshot wale order me),
+     * target ko scrollIntoView karta hai, phir FRESH rect ka center deta hai.
+     * Pehle cached rect par tap hota tha — scroll/DOM-change ke baad stale
+     * rect galat jagah tap karta tha.
+     * Returns: "FRESH:cx,cy,label" | "NOT_FOUND:n" | "INVISIBLE"
+     */
+    private fun indexTapJs(idx: Int): String {
+        return "(function(){" +
+          "var IDX=" + idx + ";" +
+          "function labelText(el,root){" +
+          "try{var id=el.getAttribute('id');" +
+          "if(id){var lb=null;try{lb=(root||document).querySelector('label[for=\"'+id+'\"]');}catch(x){}" +
+          "if(lb&&lb.innerText) return lb.innerText.trim().slice(0,80);}}catch(e){}" +
+          "try{var p=el.closest('label');" +
+          "if(p&&p.innerText) return p.innerText.trim().slice(0,80);}catch(e){}" +
+          "return '';}" +
+          "function eachDoc(fn){var docs=[document];" +
+          "try{Array.from(document.querySelectorAll('iframe')).forEach(function(f){" +
+          "try{if(f.contentDocument) docs.push(f.contentDocument);}catch(e){}});}catch(e){}" +
+          "docs.forEach(fn);}" +
+          "function eachRoot(fn){function walk(root){fn(root);var all;" +
+          "try{all=root.querySelectorAll('*');}catch(e){return;}" +
+          "for(var i=0;i<all.length;i++){var sr=null;" +
+          "try{sr=all[i].shadowRoot;}catch(e){} if(sr) walk(sr);}}" +
+          "eachDoc(function(doc){walk(doc);});}" +
+          "var items=[];" +
+          "eachRoot(function(root){var els;" +
+          "try{els=root.querySelectorAll('input,select,textarea');}catch(e){return;}" +
+          "Array.from(els).forEach(function(el){" +
+          "if(items.length>=60) return;" +
+          "var t='';try{t=el.getAttribute('type')||'';}catch(e){}" +
+          "if(t==='hidden'||t==='submit'||t==='button'||t==='image') return;" +
+          "var tag='',ph='',ar='',id='',nm='';" +
+          "try{tag=(el.tagName||'').toLowerCase();}catch(e){}" +
+          "try{ph=(el.getAttribute('placeholder')||'').slice(0,80);}catch(e){}" +
+          "try{ar=(el.getAttribute('aria-label')||'').slice(0,80);}catch(e){}" +
+          "try{id=(el.getAttribute('id')||'').slice(0,60);}catch(e){}" +
+          "try{nm=(el.getAttribute('name')||'').slice(0,60);}catch(e){}" +
+          "var lb=labelText(el,root)||ph||ar||nm||id||tag||'field';" +
+          "items.push({el:el,label:String(lb).slice(0,60)});});});" +
+          "eachRoot(function(root){var els;" +
+          "try{els=root.querySelectorAll('button,a,input[type=submit],input[type=button],[role=button]');}catch(e){return;}" +
+          "Array.from(els).forEach(function(el){" +
+          "if(items.length>=90) return;" +
+          "var txt='';try{txt=((el.innerText||el.getAttribute('value')||'')+'').trim().slice(0,60);}catch(e){}" +
+          "if(!txt) return;" +
+          "items.push({el:el,label:txt});});});" +
+          "var it=items[IDX];" +
+          "if(!it) return 'NOT_FOUND:'+items.length;" +
+          "try{it.el.scrollIntoView({block:'center',inline:'center'});}catch(e){}" +
+          "var r=null;try{r=it.el.getBoundingClientRect();}catch(e){}" +
+          "if(!r||r.width<=0||r.height<=0) return 'INVISIBLE';" +
+          "var cx=Math.round(r.x+r.width/2),cy=Math.round(r.y+r.height/2);" +
+          "return 'FRESH:'+cx+','+cy+','+String(it.label).replace(/,/g,';');" +
+          "})()"
+    }
+
     private fun clickEl(s: StepSpec): JSONObject {
-        // v42: index-mode — AI ne elements[] me se idx chuna; Hindi text
-        // match ki zaroorat nahi. Cached rect ke center par tapAt.
+        // v46 (A12): index-mode — FRESH rect par tap (scrollIntoView ke baad).
+        // Stale cached rect ka zamana gaya.
         if (s.selectorMode == "index") {
             val idx = s.selectorValue.trim().toIntOrNull()
-            val el = if (idx != null) lastElements.optJSONObject(idx) else null
-            val rect = el?.optJSONObject("rect")
-            if (el == null || rect == null) {
-                throw Exception("click: index $idx nahi mila (elements=${lastElements.length()})")
+                ?: throw Exception("click: index '${s.selectorValue}' number nahi hai")
+            val cachedLabel = lastElements.optJSONObject(idx)?.optString("label", "")
+            val raw = evalJsSync(indexTapJs(idx)).trim('"')
+            if (!raw.startsWith("FRESH:")) {
+                throw Exception("click: index $idx tap nahi ho paya ($raw) — naya snapshot lo")
             }
-            val cx = rect.optDouble("x", -1.0) + rect.optDouble("w", 0.0) / 2.0
-            val cy = rect.optDouble("y", -1.0) + rect.optDouble("h", 0.0) / 2.0
-            if (cx < 0 || cy < 0) {
-                throw Exception("click: index $idx ka rect invalid hai")
+            val parts = raw.removePrefix("FRESH:").split(",", limit = 3)
+            val cx = parts.getOrNull(0)?.toDoubleOrNull()
+            val cy = parts.getOrNull(1)?.toDoubleOrNull()
+            val freshLabel = parts.getOrNull(2).orEmpty()
+            if (cx == null || cy == null || cx < 0 || cy < 0) {
+                throw Exception("click: index $idx ka fresh rect invalid hai")
+            }
+            // Structural-shift guard: idx ab kisi aur element par hai to
+            // galat tap karne se achha hai AI naya snapshot le.
+            fun norm(t: String) = t.lowercase().replace("\\s+".toRegex(), " ").trim()
+            val nl1 = norm(cachedLabel.orEmpty())
+            val nl2 = norm(freshLabel)
+            if (nl1.length >= 3 && nl2.length >= 3 && nl1 != nl2) {
+                throw Exception(
+                    "click: index $idx ab '" + freshLabel.take(30) + "' hai " +
+                        "(pehle '" + (cachedLabel ?: "").take(30) + "') — page badal gaya, naya snapshot lo"
+                )
             }
             // rect CSS px me hai (getBoundingClientRect) — tapAt wahi leta hai.
             if (!tapAt(cx.toFloat(), cy.toFloat())) {
                 throw Exception("click: index $idx par tap fail hua")
             }
             Thread.sleep(1500)
-            return JSONObject().put("clicked", true).put("via", "index")
+            return JSONObject().put("clicked", true).put("via", "index-fresh")
         }
         val js = """(function(){
           var el=${finderJs(s.selectorMode, s.selectorValue)};
@@ -1226,6 +1455,10 @@ class FormEngine(private val appContext: Context) {
     /** scroll — L1: selector ho to element center me lao, nahi to page
      *  ek screen neeche scroll karo (lazy-load / lambe form ke liye). */
     private fun scrollPage(s: StepSpec): JSONObject {
+        // v46 (A10 root fix): direction support — pehle hamesha neeche scroll
+        // hota tha, upar jana namumkin tha.
+        val dirSign = if (s.direction == "up") -1 else 1
+        val dirName = if (s.direction == "up") "up" else "down"
         val js = if (s.selectorValue.isNotBlank()) {
             """(function(){
               var el=${finderJs(s.selectorMode.ifBlank { "css" }, s.selectorValue)};
@@ -1234,16 +1467,14 @@ class FormEngine(private val appContext: Context) {
               return 'SCROLLED';
             })()"""
         } else {
-            """(function(){
-              try{ window.scrollBy(0, Math.floor(window.innerHeight*0.8)); }catch(e){}
-              return 'SCROLLED';
-            })()"""
+            "(function(){try{window.scrollBy(0,Math.floor(window.innerHeight*0.8*$dirSign));" +
+                "return 'SCROLLED';}catch(e){return 'FAIL';}})()"
         }
         if (evalJsSync(js).trim('"') != "SCROLLED") {
             throw Exception("scroll: element nahi mila (${s.selectorMode}:${s.selectorValue})")
         }
         Thread.sleep(800)
-        return JSONObject().put("scrolled", true)
+        return JSONObject().put("scrolled", true).put("direction", dirName)
     }
 
     /** forward — WebView history forward + settle wait. */
@@ -1414,38 +1645,65 @@ class FormEngine(private val appContext: Context) {
             try {
                 // v33: scale/width/height/dispatchTouchEvent UI thread par.
                 sent = onMain {
-                    val wv = webView ?: return@onMain false
+                    // v46: ye dono early-exit par latch ginna zaroori — nahi to
+                    // neeche await(10s) poora timeout lega.
+                    val wv = webView ?: run { latch.countDown(); return@onMain false }
                     val scale = wv.scale
-                    if (scale <= 0f) return@onMain false
+                    if (scale <= 0f) run { latch.countDown(); return@onMain false }
                     fun cx(x: Double) = (x.coerceIn(0.0, 1000.0) / 1000.0 * wv.width / scale).toFloat()
                     fun cy(y: Double) = (y.coerceIn(0.0, 1000.0) / 1000.0 * wv.height / scale).toFloat()
-                    val now = android.os.SystemClock.uptimeMillis()
+                    val downTime = android.os.SystemClock.uptimeMillis()
+                    val x1c = cx(x1); val y1c = cy(y1)
+                    val x2c = cx(x2); val y2c = cy(y2)
                     val down = android.view.MotionEvent.obtain(
-                        now, now, android.view.MotionEvent.ACTION_DOWN, cx(x1), cy(y1), 0
+                        downTime, downTime, android.view.MotionEvent.ACTION_DOWN, x1c, y1c, 0
                     )
                     wv.dispatchTouchEvent(down)
-                    // 10 interpolated moves (~300ms) — slider pakad ke kheenchna
+                    down.recycle()
+                    // v46 (A5 root fix): REAL 30ms gaps ke saath moves — pehle
+                    // saare MOVE ek hi pal me dispatch hote the (synthetic future
+                    // timestamps ke saath), jo slider JS ko nakli lagta tha aur
+                    // drag animate nahi hota tha. Ab har move asal waqt par.
                     val steps = 10
-                    for (i in 1..steps) {
-                        val t = i.toFloat() / steps
-                        val mx = cx(x1) + (cx(x2) - cx(x1)) * t
-                        val my = cy(y1) + (cy(y2) - cy(y1)) * t
-                        val mv = android.view.MotionEvent.obtain(
-                            now, now + i * 30L, android.view.MotionEvent.ACTION_MOVE, mx, my, 0
-                        )
-                        wv.dispatchTouchEvent(mv)
-                        mv.recycle()
+                    var i = 1
+                    fun postNext() {
+                        mainHandler.postDelayed({
+                            try {
+                                val now = android.os.SystemClock.uptimeMillis()
+                                if (i <= steps) {
+                                    val t = i.toFloat() / steps
+                                    val mv = android.view.MotionEvent.obtain(
+                                        downTime, now,
+                                        android.view.MotionEvent.ACTION_MOVE,
+                                        x1c + (x2c - x1c) * t, y1c + (y2c - y1c) * t, 0
+                                    )
+                                    wv.dispatchTouchEvent(mv)
+                                    mv.recycle()
+                                    i++
+                                    postNext()
+                                } else {
+                                    val up = android.view.MotionEvent.obtain(
+                                        downTime, now,
+                                        android.view.MotionEvent.ACTION_UP, x2c, y2c, 0
+                                    )
+                                    wv.dispatchTouchEvent(up)
+                                    up.recycle()
+                                    latch.countDown()
+                                }
+                            } catch (_: Exception) {
+                                try { latch.countDown() } catch (_: Exception) { }
+                            }
+                        }, 30)
                     }
-                    val up = android.view.MotionEvent.obtain(
-                        now, now + 350, android.view.MotionEvent.ACTION_UP, cx(x2), cy(y2), 0
-                    )
-                    wv.dispatchTouchEvent(up)
-                    down.recycle(); up.recycle()
+                    postNext()
                     true
                 }
-            } catch (_: Exception) { }
-            latch.countDown()
+            } catch (_: Exception) {
+                try { latch.countDown() } catch (_: Exception) { }
+            }
         }
+        // v46: latch ab delayed swipe-chain ke AKHIR me ginta hai (UP ke baad),
+        // isliye await asal me poora swipe (~330ms) hone tak rukta hai.
         latch.await(10, TimeUnit.SECONDS)
         return sent
     }
@@ -1546,7 +1804,15 @@ class FormEngine(private val appContext: Context) {
           function push(kind, el, snippet){
             if(out.length>=10) return;
             if(!visible(el)){ invisible_markers++; return; }
-            out.push({kind:kind, rect:rect(el), html_snippet:(snippet||'').slice(0,300)});
+            var rc=rect(el);
+            // v46 (A4 root fix): normalized 0-1000 center — tapNormalized isi
+            // unit me kaam karta hai. rect (CSS px) waisa hi rakha gaya kyunki
+            // doosre Kotlin consumers usey CSS-px field rects se compare karte hain.
+            var vw2=window.innerWidth||document.documentElement.clientWidth||1;
+            var vh2=window.innerHeight||document.documentElement.clientHeight||1;
+            var w={kind:kind, rect:rc, html_snippet:(snippet||'').slice(0,300)};
+            if(rc){ w.cx1000=Math.round((rc.x+rc.w/2)/vw2*1000); w.cy1000=Math.round((rc.y+rc.h/2)/vh2*1000); }
+            out.push(w);
           }
           var docs=[document];
           try{
@@ -1631,7 +1897,7 @@ class FormEngine(private val appContext: Context) {
      * solver wired nahi hai to run "needs_admin" pe rukta hai (user ki
      * choice=solve preference ka handoff path).
      */
-    private fun captchaSolve(s: StepSpec): JSONObject {
+    private fun captchaSolve(): JSONObject {
         val det = captchaDetect()
         val widgets = det.optJSONArray("widgets") ?: JSONArray()
         val kind = widgets.optJSONObject(0)?.optString("kind", "unknown") ?: "unknown"

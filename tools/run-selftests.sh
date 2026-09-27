@@ -388,6 +388,47 @@ run_test_v44() {
 }
 run_test_v44
 
+# v45: CAPTCHA genuine-attempt semantics root fix.
+run_test_v45() {
+  local name="selftest_v45"
+  echo "== $name =="
+  "$KOTLINC" -J-Xmx1g -cp "$ANDR_JAR" \
+    "$APP/tools/selftest/SelfTestV45.kt" \
+    -d "$OUT/$name" >"$OUT/$name.log" 2>&1
+  if [ $? -ne 0 ]; then echo "COMPILE FAILED:"; tail -20 "$OUT/$name.log"; TOTAL_FAIL=$((TOTAL_FAIL+1)); return; fi
+  java -Dfm.app.dir="$APP" -cp "$OUT/$name:$STDLIB" com.formmitra.app.selftest.SelfTestV45Kt 2>&1 | tee "$OUT/$name.out" | grep -E "^(PASS|FAIL|SKIP)" | tail -12
+  local fails passes
+  fails=$(grep -cE "^(FAIL|Exception in thread)" "$OUT/$name.out" || true)
+  passes=$(grep -cE "^PASS" "$OUT/$name.out" || true)
+  echo "-> $name PASS: $passes FAIL: $fails"
+  TOTAL_FAIL=$((TOTAL_FAIL+fails))
+  TOTAL_PASS=$((TOTAL_PASS+passes))
+}
+run_test_v45
+
+# v46: full automation audit root-fix pins.
+run_test_v46() {
+  local name="selftest_v46"
+  echo "== $name =="
+  "$KOTLINC" -J-Xmx1g -cp "$ANDR_JAR" \
+    "$APP/tools/selftest/SelfTestV46.kt" \
+    -d "$OUT/$name" >"$OUT/$name.log" 2>&1
+  if [ $? -ne 0 ]; then echo "COMPILE FAILED:"; tail -20 "$OUT/$name.log"; TOTAL_FAIL=$((TOTAL_FAIL+1)); return; fi
+  java -Dfm.app.dir="$APP" -Dfm.server.dir="$WEB" -cp "$OUT/$name:$STDLIB" com.formmitra.app.selftest.SelfTestV46Kt 2>&1 | tee "$OUT/$name.out" | grep -E "^(PASS|FAIL|SKIP)" | tail -40
+  local fails passes
+  fails=$(grep -cE "^(FAIL|Exception in thread)" "$OUT/$name.out" || true)
+  passes=$(grep -cE "^PASS" "$OUT/$name.out" || true)
+  echo "-> $name PASS: $passes FAIL: $fails"
+  TOTAL_FAIL=$((TOTAL_FAIL+fails))
+  TOTAL_PASS=$((TOTAL_PASS+passes))
+}
+run_test_v46
+
+# v52: user orders 2026-09-27 — no ask-before-visit, no fail-count give-up
+run_test selftest_v52 SelfTestV52 \
+  "$SRC/agent/LearnLogic.kt" \
+  "$APP/tools/selftest/SelfTestV52.kt"
+
 echo "==============================="
 echo "TOTAL PASS: $TOTAL_PASS"
 echo "TOTAL FAILURES: $TOTAL_FAIL"
