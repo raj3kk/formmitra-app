@@ -1527,6 +1527,12 @@ class FormEngine(private val appContext: Context) {
               var op=parseFloat(cs.opacity||'1');
               if(!(op>0)) return false;
               if(el.getAttribute('aria-hidden')==='true') return false;
+              // v45: viewport intersection — off-screen (left:-9999px jaise)
+              // non-zero elements bhi FALSE POSITIVE the. Virtual test gate
+              // me pakda gaya (scenario: off-screen).
+              var vw=window.innerWidth||document.documentElement.clientWidth||0;
+              var vh=window.innerHeight||document.documentElement.clientHeight||0;
+              if(r.right<=0||r.bottom<=0||r.left>=vw||r.top>=vh) return false;
               var p=el.parentElement, d=0;
               while(p&&d<4){
                 var pcs=getComputedStyle(p);
@@ -1556,7 +1562,22 @@ class FormEngine(private val appContext: Context) {
               if(s.indexOf('recaptcha')>=0) kind='recaptcha';
               else if(s.indexOf('hcaptcha')>=0) kind='hcaptcha';
               else if(s.indexOf('turnstile')>=0||s.indexOf('challenges.cloudflare')>=0) kind='turnstile';
-              if(kind) push(kind, f, f.outerHTML);
+              if(!kind) return;
+              // v45: passive badge ke andar wala iframe (v3 / v2-invisible ka
+              // bottom-right badge) koi solvable challenge nahi hai — skip.
+              // Asli v2 checkbox iframe kabhi badge div ke andar nahi hota.
+              try{
+                var bp=f.parentElement, bd=0, inBadge=false;
+                while(bp&&bd<5){
+                  var bc='';
+                  try{ bc=bp.getAttribute('class')||''; }catch(x){ bc=''; }
+                  if(typeof bc!=='string') bc='';
+                  if(bc.toLowerCase().indexOf('grecaptcha-badge')>=0){ inBadge=true; break; }
+                  bp=bp.parentElement; bd++;
+                }
+                if(inBadge) return;
+              }catch(x){}
+              push(kind, f, f.outerHTML);
             });
             var all;
             try{ all=doc.querySelectorAll('*'); }catch(e){ return; }
@@ -1564,6 +1585,10 @@ class FormEngine(private val appContext: Context) {
               var c=(cls(e)+' '+(e.id||'')).toLowerCase();
               if(c.indexOf('captcha')<0) return;
               if(e.tagName==='IFRAME') return;
+              // v45: passive reCAPTCHA v3 badge (grecaptcha-badge) koi solvable
+              // challenge nahi hai — isko gine to FALSE POSITIVE. Virtual test
+              // gate me pakda gaya (scenario: v3-passive-badge).
+              if(c.indexOf('grecaptcha-badge')>=0) return;
               var kind='captcha_element';
               if(c.indexOf('hcaptcha')>=0) kind='hcaptcha';
               else if(c.indexOf('g-recaptcha')>=0||c.indexOf('recaptcha')>=0) kind='recaptcha';
