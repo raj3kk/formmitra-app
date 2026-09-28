@@ -124,14 +124,19 @@ object AiHelpSystem {
      */
     fun askAi(engine: FormEngine, question: String): String? {
         return try {
-            if (!ensureAiMode(engine, question)) {
+            // v58: ADMIN TAKEOVER — admin help browser chala raha ho to
+            // AI help rukti hai (uske page par nahi ladti).
+            AdminTakeover.waitIfDriving(work = false, tag = "aihelp")
+            // v58: SECRET REDACTION — sawal me page text ho to secrets mask
+            val q = SecretRedactor.redact(question)
+            if (!ensureAiMode(engine, q)) {
                 Log.w(TAG, "AI Mode ready nahi — puchh nahi paye")
                 return null
             }
-            // "Ask anything" me question daalo + send
-            try {
-                engine.evalHelpJs(AiModeOperator.askAnythingJs(question), 15000)
-            } catch (_: Exception) { }
+            // v58: DUPLICATE PROMPT FIX — ensureAiMode pehle hi question ko
+            // URL me daal kar kholta hai (Google khud process karta hai).
+            // Isliye askAnythingJs se DOBARA submit nahi karte — sirf tab
+            // jab URL query se jawab na aaye (neeche fallback).
             // v56 HIJACK GUARD: jawab padhne se pehle verify karo — help
             // browser abhi bhi AI Mode par hai? User ne beech me kahin aur
             // navigate kar diya ho to galat page ka jawab NA padho.
@@ -139,26 +144,23 @@ object AiHelpSystem {
             if (!helpUrl.contains("udm=50") && !helpUrl.contains("google.")) {
                 Log.w(TAG, "Hijack guard: help browser AI Mode par nahi " +
                     "(${helpUrl.take(60)}) — dobara establish kar raha")
-                if (!ensureAiMode(engine, question)) return null
-                try {
-                    engine.evalHelpJs(AiModeOperator.askAnythingJs(question), 15000)
-                } catch (_: Exception) { }
+                if (!ensureAiMode(engine, q)) return null
+                // Dobara establish par bhi URL me question hai — resubmit nahi
             }
-            // v56 FAST: jawab ka POLL — 100+ chars ka jawab aate hi turant
-            // return. Fixed 5s wait nahi. User order: "turant".
-            var answer: String? = null
-            pollHelp(12000) {
-                val raw = try {
-                    engine.evalHelpJs(AiModeOperator.readAiAnswerJs(), 10000)
-                } catch (_: Exception) { "null" }
-                val a = raw.trim().trim('"')
-                if (a.length >= 100 && !a.contains("NOT_FOUND")) {
-                    answer = a.take(3000)
-                    true
-                } else false
+            // v58: STABLE ANSWER POLL — streaming ka aadha jawab nahi.
+            // 100+ chars dikhe to 1.5s ruk kar dobara padho; dono baar SAME
+            // ho tabhi accept (streaming me text badalta rehta hai).
+            var answer = pollStableAnswer(engine, 15000)
+            // Fallback: URL query se jawab na aaye to EK BAAR ask box try
+            if (answer == null) {
+                Log.i(TAG, "URL query se jawab nahi — ask box fallback (ek baar)")
+                try {
+                    engine.evalHelpJs(AiModeOperator.askAnythingJs(q), 15000)
+                } catch (_: Exception) { }
+                answer = pollStableAnswer(engine, 10000)
             }
             if (answer != null) {
-                Log.i(TAG, "AI se jawab mila (${answer!!.length} chars)")
+                Log.i(TAG, "AI se jawab mila (${answer.length} chars, stable)")
             } else {
                 Log.w(TAG, "AI se kaam ka jawab nahi mila")
             }
@@ -167,6 +169,37 @@ object AiHelpSystem {
             Log.e(TAG, "askAi fail: ${(e.message ?: "").take(100)}")
             null
         }
+    }
+
+    /**
+     * v58: Stable answer poll — jawab tabhi lo jab streaming poori ho.
+     * Har 400ms check; 100+ chars mile to 1.2s baad dobara padho —
+     * dono identical hon to stable (streaming khatm).
+     */
+    private fun pollStableAnswer(engine: FormEngine, timeoutMs: Long): String? {
+        var answer: String? = null
+        var lastSeen = ""
+        val start = System.currentTimeMillis()
+        while (System.currentTimeMillis() - start < timeoutMs) {
+            val raw = try {
+                engine.evalHelpJs(AiModeOperator.readAiAnswerJs(), 10000)
+            } catch (_: Exception) { "null" }
+            val a = raw.trim().trim('"')
+            if (a.length >= 100 && !a.contains("NOT_FOUND")) {
+                if (a == lastSeen) {
+                    // Do baar same — streaming ruki, stable jawab
+                    answer = a.take(3000)
+                    break
+                }
+                lastSeen = a
+                // 1.2s ruko phir dobara check (streaming aage badhegi?)
+                try { Thread.sleep(1200) } catch (_: Exception) { }
+                continue
+            }
+            lastSeen = ""
+            try { Thread.sleep(400) } catch (_: Exception) { }
+        }
+        return answer
     }
 
     /**
@@ -182,7 +215,12 @@ object AiHelpSystem {
         screenshotB64: String
     ): String? {
         return try {
-            if (!ensureAiMode(engine, question)) return null
+            // v58: DUPLICATE FIX — poora sawal (screenshot context ke saath)
+            // PEHLE banao, phir EK BAAR AI Mode kholo. Pehle bare question
+            // URL me jata tha, phir alag q ask box me — do alag prompt.
+            val fullQ = "$question\n\n(Upar jo screenshot upload kiya hai usme jo " +
+                "dikh raha hai, uske hisaab se step-by-step batao kya karu)"
+            if (!ensureAiMode(engine, fullQ)) return null
             // 1. Screenshot AI Mode me UPLOAD karo (asli file upload)
             val uploaded = try {
                 engine.uploadWorkScreenshotToAiMode(screenshotB64)
@@ -199,16 +237,9 @@ object AiHelpSystem {
                     } catch (_: Exception) { false }
                 }
             }
-            // 2. Sawal puchho (screenshot ke context ke saath)
-            // NOTE: askAi khud ensureAiMode karta hai — pehle se AI Mode
-            // par hain to turant return (dobara load nahi).
-            val q = if (uploaded)
-                "$question\n\n(Upar jo screenshot upload kiya hai usme jo " +
-                "dikh raha hai, uske hisaab se step-by-step batao kya karu)"
-            else
-                "$question\n\n(Mere paas is page ka screenshot hai — " +
-                "page par ye dikh raha hai, iske hisaab se batao)"
-            askAi(engine, q)
+            // 2. Jawab ka wait — askAi (stable poll + fallback).
+            // NOTE: ensureAiMode dobara load nahi karega (pehle se AI Mode).
+            askAi(engine, fullQ)
         } catch (e: Exception) {
             Log.e(TAG, "askWithScreenshot fail: ${(e.message ?: "").take(100)}")
             null

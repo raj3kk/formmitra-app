@@ -107,7 +107,12 @@ object AgentLoop {
          * plan ka Hinglish summary — UI ise user ko dikhaye (notification /
          * chat). Plan banta hai to call hota hai, nahi to nahi.
          */
-        onPlan: (String) -> Unit = {}
+        onPlan: (String) -> Unit = {},
+        /**
+         * v58 SAME-RUN: OTP park se resume ho raha ho to purana server run ID
+         * — naya server run NA banao, isi ko continue karo.
+         */
+        resumeAgentRunId: String = ""
     ): FormEngine.RunResult {
         val stepsLog = JSONArray()
         val history = ArrayList<JSONObject>()
@@ -190,7 +195,15 @@ object AgentLoop {
         // (site-memory block neeche hai — local funs ke baad)
         // Server-side run record (best-effort — fail ho to bina reporting chalao)
         var agentRunId: String? = null
-        try { agentRunId = RunReporter.createRun(ctx, goal, startUrl, effectiveRunId) } catch (_: Exception) { }
+        try {
+            // v58 SAME-RUN: resume par purana server run continue karo,
+            // naya mat banao (nahi to server par duplicate run dikhega).
+            agentRunId = if (resumeAgentRunId.isNotEmpty()) {
+                resumeAgentRunId
+            } else {
+                RunReporter.createRun(ctx, goal, startUrl, effectiveRunId)
+            }
+        } catch (_: Exception) { }
         // (v37 AI MIND memory read — local funs ke BAAD, finish() se pehle)
 
         fun logStep(i: Int, action: String, ok: Boolean, detail: String) {
@@ -1016,9 +1029,20 @@ object AgentLoop {
             // ho rahi hai to limit extend karke DOBARA chalao.
             var effectiveMaxSteps = maxSteps
             var i = stepsTaken + 1
+            // v58: LOOP GUARD — i++ bypass karne wale `continue` (wrong-page
+            // recovery, browser recovery) ek hi step par 3 se zyada baar na
+            // chalen — nahi to infinite loop.
+            var guardStep = -1
+            var guardCount = 0
             outerLoop@ while (true) {
             while (i <= effectiveMaxSteps) {
                 onProgress(i)
+
+                // v58: ADMIN TAKEOVER — admin work browser chala raha ho to
+                // agent RUKTA hai (ladta nahi). Admin release kare (ya 30s
+                // idle) to wapas kaam shuru. Conflict/misunderstanding ka
+                // root solution.
+                AdminTakeover.waitIfDriving(work = true, tag = "step $i")
 
                 // (a)+(c) PARALLEL: DOM snapshot + screenshot ek saath
                 // (screenshot har 3rd step pe + mirror file UI agent ke liye)
@@ -1068,6 +1092,14 @@ object AgentLoop {
                         engine.goBack()
                         Thread.sleep(2000)
                         currentUrl = lastGoodUrl
+                        // v58 LOOP GUARD: ek hi step par 3 se zyada retry nahi
+                        if (guardStep == i) guardCount++ else { guardStep = i; guardCount = 1 }
+                        if (guardCount > 3) {
+                            logStep(i, "wrong_page_recovery", false,
+                                "3 baar back karke bhi galat page — agle step par")
+                            guardStep = -1; guardCount = 0
+                            i++
+                        }
                         continue
                     } catch (_: Exception) { }
                 }
@@ -1113,6 +1145,14 @@ object AgentLoop {
                         if (recovered) {
                             logStep(i, "browser_recovery", true,
                                 "Browser wapas zinda — kaam jaari")
+                            // v58 LOOP GUARD: ek hi step par 3 se zyada retry nahi
+                            if (guardStep == i) guardCount++ else { guardStep = i; guardCount = 1 }
+                            if (guardCount > 3) {
+                                logStep(i, "browser_recovery", false,
+                                    "3 baar recover karke bhi step atka — agle step par")
+                                guardStep = -1; guardCount = 0
+                                i++
+                            }
                             continue  // turant agla step, ruke nahi
                         } else {
                             logStep(i, "browser_recovery", false,
@@ -1387,7 +1427,8 @@ object AgentLoop {
                             // (non-blocking — queue aage badhegi, jawab par auto-resume).
                             val pr = handleServerPrompt(
                                 ctx, engine, promptObj,
-                                runIdNow, userProvided, sensitiveKeys, history
+                                runIdNow, userProvided, sensitiveKeys, history,
+                                resumeAgentRunId
                             )
                             // v37: user gate (otp/login/payment/device_auth/
                             // destructive) memory me (gates) — kya manga gaya.
@@ -2382,7 +2423,8 @@ object AgentLoop {
         runId: String,
         userProvided: JSONObject,
         sensitiveKeys: MutableSet<String>,
-        history: ArrayList<JSONObject>
+        history: ArrayList<JSONObject>,
+        resumeAgentRunId: String? = null
     ): Int {
         // CONTRACT SYNC (2026-09-26): kind canonicalize — server "choice"
         // ko "option_choice" bhejta hai; purana "choice" bhi accept.
@@ -2500,7 +2542,7 @@ object AgentLoop {
                     userProvided, sensitiveKeys, history, site
                 )
             }
-            OtpPark.park(ctx, runId, site, 0)
+            OtpPark.park(ctx, runId, site, 0, resumeAgentRunId ?: "")
             UserPrompt.raiseOnly(askReq)
             history.add(
                 JSONObject().put("action", "otp_parked").put("result", "parked")
@@ -3613,7 +3655,11 @@ object AgentLoop {
             message = "Pichla OTP galat tha ya expire ho gaya — naya OTP do.\n" +
                 "Site: $site"
         )
-        OtpPark.park(ctx, runId, site, retry + 1)
+        OtpPark.park(
+            ctx, runId, site, retry + 1,
+            // v58: pehle park me stored agentRunId preserve karo (same-run)
+            OtpPark.parkedAgentRunId(ctx)
+        )
         UserPrompt.raiseOnly(again)
         history.add(
             JSONObject().put("action", "otp_reask").put("result", "parked")
@@ -4043,11 +4089,13 @@ object AgentLoop {
             }
         }
         return if (attempts[0] >= 3) {
-            "CAPTCHA 3 baar try kiya ($kind), solve nahi hua — aap khud solve " +
-                "karke task dobara chalayein"
+            // v58: RESUME (restart nahi) — user Live me captcha solve kare,
+            // agent usi step se aage badhega. Task dobara chalane ki zaroorat nahi.
+            "CAPTCHA 3 baar try kiya ($kind), solve nahi hua — Live browser me " +
+                "aap khud solve kar dijiye, agent usi jagah se aage badhega"
         } else {
-            "CAPTCHA solve karne me baar-baar dikkat aayi (network/AI) — aap khud " +
-                "solve karke task dobara chalayein"
+            "CAPTCHA solve karne me baar-baar dikkat aayi (network/AI) — Live " +
+                "browser me aap khud solve kar dijiye, agent usi jagah se aage badhega"
         }
     }
 

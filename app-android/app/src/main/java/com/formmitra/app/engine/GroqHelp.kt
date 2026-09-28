@@ -127,11 +127,19 @@ Rules:
             sb.append("Pehle ye try kar chuka hun:\n")
             s.recentAttempts.take(5).forEach { sb.append("- $it\n") }
         }
+        // v56: "kya kr diya h" — Groq ko bhi pata ho jo ho gaya.
+        if (s.completedSoFar.isNotEmpty()) {
+            sb.append("Ab tak YE HO CHUKA HAI (dobara karne ko mat kaho):\n")
+            s.completedSoFar.take(8).forEach { sb.append("- $it\n") }
+        }
         if (pageText.isNotEmpty()) {
             sb.append("\nPage par ye text dikh raha hai:\n")
-            sb.append(pageText.take(1500))
+            // v58: SECRET REDACTION — password/OTP/token AI ko kabhi nahi
+            sb.append(SecretRedactor.redact(pageText.take(1500)))
             sb.append("\n")
         }
+        sb.append("\n")
+        sb.append(SecretRedactor.screenshotWarning())
         sb.append("\nAb batao — iske aage kya karun? Step by step.")
         return sb.toString()
     }
