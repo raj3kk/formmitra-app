@@ -128,9 +128,11 @@ class LiveTabView @JvmOverloads constructor(
         // Jab current browser blank ho (about:blank) aur koi automation
         // active na ho, to ye dikhega: "kuch nahi" ki jagah saaf message.
         placeholderText = TextView(ctx).apply {
+            // v61 (RC-D): AI Helper ka zikr add — user samjhe blank kyu hai.
             text = "🤖 Agent abhi koi kaam nahi kar raha\n\n" +
                 "Kaam shuru karte hi yahan LIVE dikhega — " +
-                "browser khud chalega, aap dekh sakte hain."
+                "browser khud chalega, aap dekh sakte hain.\n\n" +
+                "💡 AI Helper tabhi bharega jab agent ko AI se madad chahiye hogi."
             textSize = 16f
             setTextColor(0xFF616161.toInt())
             gravity = android.view.Gravity.CENTER
@@ -203,6 +205,11 @@ class LiveTabView @JvmOverloads constructor(
      * - workWv = agent ka KAAM wala browser (FormEngine)
      * - helpWv = agent ka HELP wala browser (AiHelpSystem / AI Mode)
      * Kabhi destroy nahi, kabhi naye nahi — exactly 2.
+     *
+     * v61 ROOT FIX (RC-B): renderer crash par LiveWebViewHost NAYA WebView
+     * banata hai. Pehle LiveTabView purane DESTROYED WebView par atka rehta
+     * tha → blank. Ab recreate listeners lagaye — naya WebView aate hi
+     * workWv/helpWv update + reattach.
      */
     private fun attachSharedBrowsers(ctx: Context) {
         try {
@@ -211,6 +218,9 @@ class LiveTabView @JvmOverloads constructor(
             workWv = wv
             attachToContainer(wv)
             applyTouchPolicy(wv, work = true)
+            // RC-B: crash-recreate par naya WebView follow karo.
+            com.formmitra.app.engine.LiveWebViewHost
+                .addRecreateListener(recreateWorkListener)
         } catch (t: Throwable) {
             android.util.Log.e("FmLiveTab", "shared work attach failed", t)
         }
@@ -220,10 +230,43 @@ class LiveTabView @JvmOverloads constructor(
             helpWv = hv
             attachToContainer(hv)
             applyTouchPolicy(hv, work = false)
+            // RC-B: crash-recreate par naya help WebView follow karo.
+            com.formmitra.app.engine.LiveWebViewHost
+                .addHelpRecreateListener(recreateHelpListener)
         } catch (t: Throwable) {
             android.util.Log.e("FmLiveTab", "shared help attach failed", t)
         }
         updateBrowserVisibility()
+    }
+
+    /** RC-B: work WebView recreate hua → naya instance pakdo + reattach. */
+    private val recreateWorkListener: (android.webkit.WebView) -> Unit = { newWv ->
+        try {
+            post {
+                try {
+                    workWv = newWv
+                    attachToContainer(newWv)
+                    applyTouchPolicy(newWv, work = true)
+                    updateBrowserVisibility()
+                    try { updatePlaceholder() } catch (_: Exception) { }
+                } catch (_: Exception) { }
+            }
+        } catch (_: Exception) { }
+    }
+
+    /** RC-B: help WebView recreate hua → naya instance pakdo + reattach. */
+    private val recreateHelpListener: (android.webkit.WebView) -> Unit = { newWv ->
+        try {
+            post {
+                try {
+                    helpWv = newWv
+                    attachToContainer(newWv)
+                    applyTouchPolicy(newWv, work = false)
+                    updateBrowserVisibility()
+                    try { updatePlaceholder() } catch (_: Exception) { }
+                } catch (_: Exception) { }
+            }
+        } catch (_: Exception) { }
     }
 
     /** WebView ko webContainer me lagao (purane parent se hata kar). */
@@ -298,8 +341,11 @@ class LiveTabView @JvmOverloads constructor(
             val isBlank = url.isNullOrEmpty() ||
                 url.startsWith("about:") ||
                 url == "about:blank"
+            // v61 (RC-E): dono flags check karo — taskId aur host ka
+            // isAutomationActive. OTP-park jaise states me alag ho sakte hain.
             val automationActive = try {
-                com.formmitra.app.engine.FormRunService.activeTaskId != null
+                com.formmitra.app.engine.FormRunService.activeTaskId != null ||
+                com.formmitra.app.engine.LiveWebViewHost.isAutomationActive()
             } catch (_: Exception) { false }
             val showPlaceholder = isBlank && !automationActive
             placeholderText?.visibility =
@@ -333,6 +379,13 @@ class LiveTabView @JvmOverloads constructor(
         visibility: Int
     ) {
         super.onVisibilityChanged(changedView, visibility)
+        // v61 ROOT FIX (RC-A): Live tab dikhe to WebView ko PAUSE mat karo.
+        // Pehle setLiveVisible() kabhi call nahi hota tha → user ke dekhte
+        // hue bhi WebView pause ho jata tha (freeze/blank frame).
+        try {
+            com.formmitra.app.engine.LiveWebViewHost
+                .setLiveVisible(visibility == View.VISIBLE)
+        } catch (_: Exception) { }
         if (visibility == View.VISIBLE) {
             try { reattachShared() } catch (_: Exception) { }
             try { updatePlaceholder() } catch (_: Exception) { }
@@ -376,6 +429,10 @@ class LiveTabView @JvmOverloads constructor(
             workWv?.let { attachToContainer(it) }
             helpWv?.let { attachToContainer(it) }
             updateBrowserVisibility()
+            // v61 ROOT FIX (RC-C): reattach ke baad WebView children ke END
+            // me chala jata hai → placeholder neeche dab jata tha (kabhi
+            // dikhta nahi). Placeholder ko wapas sabse upar lao.
+            try { placeholderText?.bringToFront() } catch (_: Exception) { }
             urlBar?.setText(currentWebView()?.url ?: "")
             startUrlSync()
         } catch (_: Exception) { }
@@ -488,6 +545,15 @@ class LiveTabView @JvmOverloads constructor(
             placeholderSyncHandler.removeCallbacks(placeholderSyncRunnable)
         } catch (_: Exception) { }
         AdminTakeover.onChange = null
+        // v61 (RC-B): recreate listeners hatao — leak nahi hona chahiye.
+        try {
+            com.formmitra.app.engine.LiveWebViewHost
+                .removeRecreateListener(recreateWorkListener)
+        } catch (_: Exception) { }
+        try {
+            com.formmitra.app.engine.LiveWebViewHost
+                .removeHelpRecreateListener(recreateHelpListener)
+        } catch (_: Exception) { }
         try {
             // SHARED WebViews KABHI destroy nahi — sirf detach.
             // (Engine ka browser band nahi hona chahiye.)
