@@ -2346,11 +2346,17 @@ class AgentChatView(
                 // (is work me pehle poochhe gaye keys).
                 val known = LinkedHashMap<String, String>(cardCachedDetails)
                 known.putAll(sessionDetails)
+                // v61: active automation ka run_id — server user message se
+                // automation ko reset/restart na kare.
+                val activeRun = try {
+                    com.formmitra.app.engine.FormRunService.activeTaskId
+                } catch (_: Exception) { null }
                 AgentApi.chat(
                     context, history.toList(), activeCategory,
                     activeCardId, activeCardToken, activeTrackingType,
                     knownDetails = known,
-                    askedAlready = askedKeys.toList()
+                    askedAlready = askedKeys.toList(),
+                    runId = activeRun
                 )
             } catch (_: Exception) {
                 AgentApi.ApiResult(-1, null)
@@ -3360,17 +3366,43 @@ class AgentChatView(
     }
 
     /** Task resume — wahi kaam/context agent ko wapas do. */
-    private fun resumeTask(t: JSONObject) {        val title = t.optString("name", "kaam").ifEmpty { "kaam" }
-        val status = t.optString("status", "")
-        val url = t.optString("target_url", t.optString("url", ""))
-        val sb = StringBuilder("📜 Purana kaam continue karo: \"$title\"")
-        if (status.isNotEmpty()) sb.append(" (status: $status)")
-        if (url.isNotEmpty()) sb.append("\nLink: $url")
-        sb.append(
-            "\nJahan ruka tha wahan se aage badhao — jo ho gaya wo dobara " +
-                "mat karo, jo detail chahiye maango."
-        )
-        sendMessage(sb.toString())
+    /**
+     * v61 ROOT FIX (user order 2026-09-28):
+     * "live tab me ja ke phir kaam tab me a ke chat me jate h to message
+     *  send ho jaata h... ye message nahi jaye"
+     *
+     * PEHLE: kaam par tap karte hi "📜 Purana kaam continue karo..." MESSAGE
+     * BHEJTA THA — jo automation ko disturb karta tha aur chat me unwanted
+     * message dikhta tha.
+     *
+     * AB: koi message NAHI bhejte. Sirf us kaam ki chat kholte hain
+     * (history load). Automation pehle se chal rahi ho to wahi chalti
+     * rahegi — chhune ki zaroorat nahi. User ko kuch nahi bolna, koi
+     * auto-message nahi.
+     */
+    private fun resumeTask(t: JSONObject) {
+        val title = t.optString("name", "kaam").ifEmpty { "kaam" }
+        try {
+            // Sirf chat context set karo — history/category.
+            // Koi sendMessage NAHI — automation apne aap chalti rahegi.
+            val cat = t.optString("category", "").ifEmpty { null }
+            if (cat != null && WorkCategories.of(cat) != null) {
+                try {
+                    // Category chip update (bina message ke).
+                    post {
+                        try {
+                            activeCategory = cat
+                            val label = WorkCategories.labelOf(cat)
+                            categoryChip.text = "🔖 $label  ✕"
+                            categoryChip.visibility = View.VISIBLE
+                        } catch (_: Exception) { }
+                    }
+                    loadChatHistory(cat, null)
+                } catch (_: Exception) { }
+            }
+            // Live activity indicator pehle se hai (onTabShown me) — wahi
+            // dikhayega agar automation chal rahi hai. Koi bubble nahi.
+        } catch (_: Exception) { }
     }
 
     /**
@@ -3386,8 +3418,52 @@ class AgentChatView(
      * yahin se shuru hoti hai; history category-wise alag rehti hai).
      * v50: Purana automation STATE saaf karo — nahi to purana kaam hi
      * redirect ho jata hai (user ki complaint).
+     * v61 ROOT FIX (user order 2026-09-28): "automation chlte rahe"
+     * Agar automation PEHLE SE chal rahi hai to bina puche MAT roko —
+     * user se confirm karo. Galti se "Naya kaam" dab jaye to purana
+     * kaam beech me na ruke.
      */
     fun startFreshWork() {
+        try {
+            // v61: automation chal rahi hai? Pehle puchho, phir roko.
+            val automationActive = try {
+                com.formmitra.app.engine.FormRunService.activeTaskId != null
+            } catch (_: Exception) { false }
+            if (automationActive) {
+                post {
+                    try {
+                        val act = context as? Activity
+                        if (act != null && !act.isFinishing && !act.isDestroyed) {
+                            android.app.AlertDialog.Builder(act)
+                                .setTitle("Ek kaam pehle se chal raha hai")
+                                .setMessage(
+                                    "🤖 Agent abhi ek kaam kar raha hai.\n\n" +
+                                        "Naya kaam shuru karne se purana kaam " +
+                                        "RUK jayega.\n\n" +
+                                        "Kya purana kaam rok kar naya shuru karu?"
+                                )
+                                .setPositiveButton("Haan, naya shuru karo") { _, _ ->
+                                    doStartFreshWork()
+                                }
+                                .setNegativeButton("Nahi, purana continue karo") { _, _ ->
+                                    // Kuch mat karo — purana automation chalta rahe.
+                                    // Chat wahi khula rahega, koi message nahi.
+                                }
+                                .setCancelable(true)
+                                .show()
+                        } else {
+                            // Activity nahi — safe side: mat roko.
+                        }
+                    } catch (_: Exception) { }
+                }
+                return
+            }
+            doStartFreshWork()
+        } catch (_: Exception) { }
+    }
+
+    /** v61: startFreshWork ka actual kaam (confirm ke baad). */
+    private fun doStartFreshWork() {
         try {
             // v50: Pehle purana automation roko + state saaf.
             try {
@@ -3957,7 +4033,11 @@ class AgentChatView(
             }, "track-offer-unseen").start()
         } catch (_: Exception) { }
         // POINT 28: line me kaam ho to entry par ek baar dikhao.
-        try { checkWorkQueue() } catch (_: Exception) { }
+        // v61: USER ORDER — tab switch par koi auto-message NAHI.
+        // "jb user ka koi kaam na ho user ko kch na bole kch message send
+        //  Auto na ho". Queue Work tab me dikhta hai — chat me bubble
+        //  bhejna band.
+        // try { checkWorkQueue() } catch (_: Exception) { }
         // POINT 17: Apply poora → "Iska status track karu?" card.
         try { checkTrackHandoff() } catch (_: Exception) { }
         // POINT 21: end-of-work summary cards.
@@ -4269,7 +4349,9 @@ class AgentChatView(
             bannerGoal = runGoal(latest)
             bannerUrl = runUrl(latest)
             bannerCategory = runFd(latest)?.optString("category", "").orEmpty()
-            val reason = runSummary(latest).ifEmpty { "Agent ko aapki madad chahiye" }
+            // v60: "Agent ko aapki madad chahiye" HATAYA (user order).
+            // Ab helpful status: kya ho raha hai, kya try ho raha hai.
+            val reason = runSummary(latest).ifEmpty { "Agent kaam kar raha hai — status update ka intezaar karein" }
             val low = reason.lowercase()
             bannerText.text =
                 if (low.contains("otp") || low.contains("login")) {
@@ -4477,12 +4559,9 @@ class AgentChatView(
                 }
             }
             "needs_user", "needs_attention" -> {
+                // v61: "madad chahiye" type text HATA DIYA (user standing order).
                 // Banner + VoiceHelp pehle se stuck announce karte hain —
-                // yahan sirf coordination bubble (double awaaz nahi).
-                addAssistantBubble(
-                    "😟 Main yahan atak gaya hun — 🧠 AI se dobara samajh raha hun.\n" +
-                        "Upar banner me dekho — tumhari madad chahiye to wahan batao."
-                )
+                // yahan koi bubble nahi, banner hi kaafi hai.
             }
             "done", "completed", "success" -> {
                 val msg = "✅ Ho gaya! ($label)\nProof History me dekh sakte ho."
@@ -4491,10 +4570,10 @@ class AgentChatView(
                 stopTracking()
             }
             "failed", "error", "cancelled" -> {
-                addAssistantBubble(
-                    "❌ Ye kaam poora nahi ho paya.\n" +
-                        "Upar banner me wajah dekho — 🔁 se dobara try kar sakte ho."
-                )
+                // v61: "dobara try" type text HATA DIYA (user standing order).
+                // Banner me wajah + retry button pehle se hai — bubble sirf
+                // brief status, koi "dobara try" instruction nahi.
+                addAssistantBubble("❌ Ye kaam poora nahi ho paya.")
                 stopTracking()
             }
         }

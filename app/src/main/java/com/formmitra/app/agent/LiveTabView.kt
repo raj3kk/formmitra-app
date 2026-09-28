@@ -64,6 +64,9 @@ class LiveTabView @JvmOverloads constructor(
     private var releaseBtn: Button? = null
     private var takeControlBtn: Button? = null
     private var releaseRow: LinearLayout? = null
+    // v61: blank browser par helpful placeholder (about:blank = "kuch nahi"
+    // lagta tha — user ko lagta tha live kaam nahi kar raha).
+    private var placeholderText: TextView? = null
 
     init {
         orientation = VERTICAL
@@ -120,6 +123,25 @@ class LiveTabView @JvmOverloads constructor(
         webContainer = webContainerView
         addView(webContainerView)
         attachSharedBrowsers(ctx)
+
+        // v61: blank browser placeholder — WebViews ke UPAR overlay.
+        // Jab current browser blank ho (about:blank) aur koi automation
+        // active na ho, to ye dikhega: "kuch nahi" ki jagah saaf message.
+        placeholderText = TextView(ctx).apply {
+            text = "🤖 Agent abhi koi kaam nahi kar raha\n\n" +
+                "Kaam shuru karte hi yahan LIVE dikhega — " +
+                "browser khud chalega, aap dekh sakte hain."
+            textSize = 16f
+            setTextColor(0xFF616161.toInt())
+            gravity = android.view.Gravity.CENTER
+            setPadding(48, 48, 48, 48)
+            setBackgroundColor(0xFFF5F5F5.toInt())
+            visibility = View.GONE
+        }
+        webContainerView.addView(
+            placeholderText,
+            FrameLayout.LayoutParams(-1, -1)
+        )
 
         // --- Status + release (release button SIRF ADMIN) ---
         statusText = TextView(ctx).apply {
@@ -260,6 +282,33 @@ class LiveTabView @JvmOverloads constructor(
             workWv?.visibility = if (showHelp) View.GONE else View.VISIBLE
             helpWv?.visibility = if (showHelp) View.VISIBLE else View.GONE
         } catch (_: Exception) { }
+        updatePlaceholder()
+    }
+
+    /**
+     * v61: placeholder show/hide logic.
+     * - Current browser blank (about:blank/null) AUR koi automation active
+     *   nahi → placeholder DIKHAO.
+     * - Automation chal rahi ho ya browser me koi page ho → CHHUPAO.
+     */
+    private fun updatePlaceholder() {
+        try {
+            val wv = currentWebView()
+            val url = try { wv?.url } catch (_: Exception) { null }
+            val isBlank = url.isNullOrEmpty() ||
+                url.startsWith("about:") ||
+                url == "about:blank"
+            val automationActive = try {
+                com.formmitra.app.engine.FormRunService.activeTaskId != null
+            } catch (_: Exception) { false }
+            val showPlaceholder = isBlank && !automationActive
+            placeholderText?.visibility =
+                if (showPlaceholder) View.VISIBLE else View.GONE
+            // Placeholder upar ho to WebView neeche — dono overlap nahi.
+            // (FrameLayout me placeholder baad me add hua = upar.)
+        } catch (_: Exception) {
+            try { placeholderText?.visibility = View.GONE } catch (_: Exception) { }
+        }
     }
 
     private fun showBrowser(showAi: Boolean) {
@@ -276,6 +325,8 @@ class LiveTabView @JvmOverloads constructor(
     /**
      * v56 se: Live tab visible ho to shared WebViews wapas yahan lao
      * (OperatorView ne liye hon to).
+     * v61: visible hote hi placeholder bhi refresh (automation state badal
+     * sakta hai jab tab chhupa tha).
      */
     override fun onVisibilityChanged(
         changedView: View,
@@ -284,7 +335,40 @@ class LiveTabView @JvmOverloads constructor(
         super.onVisibilityChanged(changedView, visibility)
         if (visibility == View.VISIBLE) {
             try { reattachShared() } catch (_: Exception) { }
+            try { updatePlaceholder() } catch (_: Exception) { }
+            startPlaceholderSync()
+        } else {
+            stopPlaceholderSync()
         }
+    }
+
+    // v61: placeholder ka periodic sync — automation start/stop hote hi
+    // placeholder update ho (tab khula ho to). Halka: 2s me ek baar.
+    private val placeholderSyncHandler = android.os.Handler(
+        android.os.Looper.getMainLooper()
+    )
+    private val placeholderSyncRunnable = object : Runnable {
+        override fun run() {
+            try {
+                if (visibility == View.VISIBLE) {
+                    updatePlaceholder()
+                    placeholderSyncHandler.postDelayed(this, 2000)
+                }
+            } catch (_: Exception) { }
+        }
+    }
+
+    private fun startPlaceholderSync() {
+        try {
+            placeholderSyncHandler.removeCallbacks(placeholderSyncRunnable)
+            placeholderSyncHandler.post(placeholderSyncRunnable)
+        } catch (_: Exception) { }
+    }
+
+    private fun stopPlaceholderSync() {
+        try {
+            placeholderSyncHandler.removeCallbacks(placeholderSyncRunnable)
+        } catch (_: Exception) { }
     }
 
     private fun reattachShared() {
@@ -399,6 +483,9 @@ class LiveTabView @JvmOverloads constructor(
     fun onDestroy() {
         try {
             urlSyncHandler.removeCallbacks(urlSyncRunnable)
+        } catch (_: Exception) { }
+        try {
+            placeholderSyncHandler.removeCallbacks(placeholderSyncRunnable)
         } catch (_: Exception) { }
         AdminTakeover.onChange = null
         try {

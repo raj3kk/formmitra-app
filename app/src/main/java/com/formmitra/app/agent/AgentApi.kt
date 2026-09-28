@@ -126,6 +126,22 @@ object AgentApi {
      * v14: transient failures (network/-1 ya 5xx) par ek bounded retry (2s
      * backoff) — 401/429/4xx par kabhi retry nahi.
      */
+    /**
+     * v48: MUSE HELP CHANNEL — generic authed POST/GET.
+     * Agent atakne par help request banata hai aur jawab poll karta hai.
+     */
+    fun postAuthed(ctx: Context, path: String, body: JSONObject): JSONObject? =
+        try {
+            val r = post(path, ctx, body)
+            r.json
+        } catch (_: Exception) { null }
+
+    fun getAuthed(ctx: Context, path: String): JSONObject? =
+        try {
+            val r = get(path, ctx)
+            r.json
+        } catch (_: Exception) { null }
+
     fun act(ctx: Context, body: JSONObject): ApiResult =
         postTransientRetry("/api/agent/act", ctx, body, 60_000, automationCardToken)
 
@@ -222,7 +238,8 @@ object AgentApi {
         cardToken: String? = null,
         trackingType: String? = null,
         knownDetails: Map<String, String> = emptyMap(),
-        askedAlready: List<String> = emptyList()
+        askedAlready: List<String> = emptyList(),
+        runId: String? = null
     ): ApiResult {
         val arr = JSONArray()
         for ((role, content) in messages) {
@@ -244,6 +261,10 @@ object AgentApi {
         if (askedAlready.isNotEmpty()) {
             body.put("asked_already", JSONArray(askedAlready.filter { it.isNotEmpty() }))
         }
+        // v61 ROOT FIX: active automation ka run_id bhejo — server ko pata
+        // chale ki automation chal rahi hai, to user message se usko
+        // reset/restart NA kare. Detail ho to isi run me lagaye.
+        if (!runId.isNullOrEmpty()) body.put("run_id", runId)
         return postWithTimeout("/api/agent/chat", ctx, body, TIMEOUT_MS, cardToken)
     }
 

@@ -281,6 +281,8 @@ run_test_v38() {
   "$KOTLINC" -J-Xmx1g -cp "$ANDR_JAR" \
     "$APP/tools/selftest/SelfTestV38.kt" \
     "$SRC/engine/LiveWebViewHost.kt" \
+    "$SRC/engine/AdminTakeover.kt" \
+    "$SRC/engine/AdminActionCapture.kt" \
     "$SRC/agent/LiveActivity.kt" \
     "$SRC/engine/ErrorCatcher.kt" \
     -d "$OUT/$name" >"$OUT/$name.log" 2>&1
@@ -428,6 +430,19 @@ run_test_v46
 run_test selftest_v52 SelfTestV52 \
   "$SRC/agent/LearnLogic.kt" \
   "$APP/tools/selftest/SelfTestV52.kt"
+
+# v53: AI Help System bounded + no give-up
+# (AiHelpSystem FormEngine par depend karta hai — source-check pattern,
+# jaise SelfTestV46. Sirf LearnLogic compile hota hai.)
+run_test selftest_v53 SelfTestV53 \
+  "$SRC/agent/LearnLogic.kt" \
+  "$APP/tools/selftest/SelfTestV53.kt"
+
+# v55: GroqHelp + smart question + auto-refresh
+# (GroqHelp/AiHelpSystem FormEngine par depend karte hain — source-check
+# pattern. Koi compile dependency nahi.)
+run_test selftest_v55 SelfTestV55 \
+  "$APP/tools/selftest/SelfTestV55.kt"
 
 echo "==============================="
 echo "TOTAL PASS: $TOTAL_PASS"
