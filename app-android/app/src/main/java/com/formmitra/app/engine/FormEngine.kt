@@ -63,10 +63,11 @@ class FormEngine(private val appContext: Context) {
      * problem agent puchega AI se."
      *
      * Ye WebView kaam wale page ko CHHUYE BINA AI se baat karta hai —
-     * navigate-away-and-back ki zaroorat nahi. Hidden rehta hai (engine-owned).
+     * navigate-away-and-back ki zaroorat nahi.
+     * v56: ab ye LiveWebViewHost ka SHARED helpWebView hai (Live tab ke
+     * "🤖 AI Helper" me visible) — hidden engine-owned nahi.
      * Saare method calls MAIN thread par (WebView ka niyam).
      */
-    @Volatile private var helpWebView: WebView? = null
 
     /**
      * v38 — SHARED WEBVIEW MODE (Live WebView, user order 2026-09-26).
@@ -875,30 +876,34 @@ class FormEngine(private val appContext: Context) {
         return try { evalJsSync(js, timeoutMs) } catch (_: Exception) { "null" }
     }
 
-    // ============ v53: HELP WEBVIEW (AI Mode browser) ============
+    // ============ v56: HELP WEBVIEW (AI Mode browser — SHARED) ============
 
     /**
-     * Help WebView lao (lazy create, MAIN thread par).
-     * AI Mode yahin khulta hai — kaam wala page untouched rehta hai.
+     * v56 — Help WebView lao: LiveWebViewHost ka SHARED help WebView.
+     *
+     * ROOT FIX: Pehle ye HIDDEN engine-owned WebView banata tha — agent ki
+     * help user ko KAHIN dikhti hi nahi thi (Live tab ka "🤖 AI Helper" ek
+     * ALAG WebView tha). Ab yehi shared helpWebView milta hai jo Live tab
+     * ke AI Helper section me VISIBLE hai — agent jo help karta hai
+     * (AI Mode kholna, screenshot upload, sawal puchhna) user LIVE dekhta hai.
+     * Kaam wala page untouched rehta hai. WebView kabhi destroy nahi hota.
      */
     fun getHelpWebView(): WebView? {
-        helpWebView?.let { return it }
+        // Purana hidden WebView ab nahi banta (compat: field hata diya).
         return try {
-            onMain {
-                if (helpWebView == null) {
-                    val wv = WebView(appContext)
-                    applyEngineSetup(wv)
-                    // Desktop mode (user order — dono browser desktop)
-                    try {
-                        wv.settings.userAgentString =
-                            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
-                            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                    } catch (_: Exception) { }
-                    helpWebView = wv
-                }
-                helpWebView
+            val wv = LiveWebViewHost.acquireHelp(appContext) { w ->
+                applyEngineSetup(w)
             }
+            try {
+                LiveWebViewHost.addHelpRecreateListener(helpRecreateListener)
+            } catch (_: Exception) { }
+            wv
         } catch (_: Exception) { null }
+    }
+
+    /** v56: renderer-crash par host naya help WebView de to reference badlo. */
+    private val helpRecreateListener: (WebView) -> Unit = { _ ->
+        // getHelpWebView() hamesha host se fresh leta hai — kuch nahi karna.
     }
 
     /**
@@ -1230,6 +1235,37 @@ class FormEngine(private val appContext: Context) {
     }
 
     /**
+     * v58 SMART-FIND: website ka layout badal jaye to automation NA toote.
+     *
+     * Primary selector (mode+value) pehle try hota hai. Na mile to
+     * automatically fallback: element ka text → label → placeholder.
+     * JS me `||` short-circuit se — pehla jo mile wahi return.
+     *
+     * Yehi "smartly handle" hai: selector purana ho gaya ho to bhi
+     * agent text/label se element dhoondh kar kaam jaari rakhta hai.
+     */
+    private fun smartFinderJs(s: StepSpec): String {
+        val parts = mutableListOf<String>()
+        if (s.selectorValue.isNotEmpty()) {
+            parts.add(finderJs(s.selectorMode, s.selectorValue))
+        }
+        // Fallback 1: element ka visible text
+        if (s.text.isNotEmpty() && parts.none { it.contains(JSONObject.quote(s.text)) }) {
+            parts.add(finderJs("text", s.text))
+        }
+        // Fallback 2: label
+        if (s.label.isNotEmpty() && s.label != s.text &&
+            parts.none { it.contains(JSONObject.quote(s.label)) }
+        ) {
+            parts.add(finderJs("text", s.label))
+        }
+        if (parts.isEmpty()) return finderJs(s.selectorMode, s.selectorValue)
+        if (parts.size == 1) return parts[0]
+        // Pehla jo mile — baaki try hi nahi honge (short-circuit)
+        return "(function(){ return (${parts.joinToString(") || (")}); })()"
+    }
+
+    /**
      * v24-refine (AI-training): AI ke diye selector ka target page par abhi
      * zinda hai ya nahi — execute se pehle LOCAL sanity (koi AI call nahi,
      * quota bachat). Wahi finderJs jo execute use karta hai (shadow DOM +
@@ -1246,6 +1282,19 @@ class FormEngine(private val appContext: Context) {
             evalJsSync("!!(${finderJs(mode, value)})", 8_000).trim() == "true"
         } catch (_: Exception) {
             true // check khud fail → block mat karo (fail-open on check error)
+        }
+    }
+
+    /**
+     * v58 SMART: StepSpec ke liye alive check — primary ya fallback
+     * (text/label) me se koi bhi mile to alive. Layout badalne par
+     * bhi pattern ko "mara hua" na samjho jab tak text/label se mil raha ho.
+     */
+    fun selectorAliveSmart(s: StepSpec): Boolean {
+        return try {
+            evalJsSync("!!(${smartFinderJs(s)})", 8_000).trim() == "true"
+        } catch (_: Exception) {
+            true
         }
     }
 
@@ -1298,7 +1347,7 @@ class FormEngine(private val appContext: Context) {
     private fun fillField(s: StepSpec): JSONObject {
         val q = JSONObject.quote(s.text)
         val js = """(function(){
-          var el=${finderJs(s.selectorMode, s.selectorValue)};
+          var el=${smartFinderJs(s)};
           if(!el) return JSON.stringify({status:'NOT_FOUND',value:''});
           try{ el.scrollIntoView({block:'center'}); }catch(e){}
           try{ el.focus(); }catch(e){}
@@ -1352,7 +1401,7 @@ class FormEngine(private val appContext: Context) {
     private fun selectOption(s: StepSpec): JSONObject {
         val q = JSONObject.quote(s.option)
         val js1 = """(function(){
-          var el=${finderJs(s.selectorMode, s.selectorValue)};
+          var el=${smartFinderJs(s)};
           if(!el) return JSON.stringify({status:'NOT_FOUND'});
           if((el.tagName||'').toLowerCase()==='select'){
             var nd=$q.toLowerCase(), pick=null, i;
@@ -1399,7 +1448,7 @@ class FormEngine(private val appContext: Context) {
     /** toggle — checkbox/radio: target state ke liye zaroorat ho tabhi click. */
     private fun toggleCheck(s: StepSpec): JSONObject {
         val js = """(function(){
-          var el=${finderJs(s.selectorMode, s.selectorValue)};
+          var el=${smartFinderJs(s)};
           if(!el) return JSON.stringify({status:'NOT_FOUND'});
           var before=!!el.checked;
           var want = '${s.state}'==='on' ? true : ('${s.state}'==='off' ? false : !before);
@@ -1438,7 +1487,7 @@ class FormEngine(private val appContext: Context) {
         val qk = JSONObject.quote(pair.first)
         val qc = JSONObject.quote(pair.second)
         val target = if (s.selectorValue.isNotEmpty())
-            "var el=${finderJs(s.selectorMode, s.selectorValue)};"
+            "var el=${smartFinderJs(s)};"
         else
             "var el=document.activeElement||document.body;"
         val js = """(function(){
@@ -1552,7 +1601,7 @@ class FormEngine(private val appContext: Context) {
             return JSONObject().put("clicked", true).put("via", "index-fresh")
         }
         val js = """(function(){
-          var el=${finderJs(s.selectorMode, s.selectorValue)};
+          var el=${smartFinderJs(s)};
           if(!el) return 'NOT_FOUND';
           try{ el.scrollIntoView({block:'center'}); }catch(e){}
           el.click();
@@ -1567,7 +1616,7 @@ class FormEngine(private val appContext: Context) {
 
     private fun waitForElement(s: StepSpec) {
         val js = """(function(){
-          var el=${finderJs(s.selectorMode, s.selectorValue)};
+          var el=${smartFinderJs(s)};
           if(!el) return 'false';
           try{
             var r=el.getBoundingClientRect();
