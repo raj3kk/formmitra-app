@@ -57,6 +57,19 @@ class FormEngine(private val appContext: Context) {
     @Volatile private var webView: WebView? = null
 
     /**
+     * v53: HELP WEBVIEW — AI Mode ke liye ALAG browser.
+     * User order (2026-09-27): "AI helper wala browser fix karo permanent —
+     * browser khol ke help search karo, AI Mode me jaake rahe, wahi jo
+     * problem agent puchega AI se."
+     *
+     * Ye WebView kaam wale page ko CHHUYE BINA AI se baat karta hai —
+     * navigate-away-and-back ki zaroorat nahi.
+     * v56: ab ye LiveWebViewHost ka SHARED helpWebView hai (Live tab ke
+     * "🤖 AI Helper" me visible) — hidden engine-owned nahi.
+     * Saare method calls MAIN thread par (WebView ka niyam).
+     */
+
+    /**
      * v38 — SHARED WEBVIEW MODE (Live WebView, user order 2026-09-26).
      * true = ye engine apna WebView NAHI banata; LiveWebViewHost ka ek
      * shared WebView use karta hai — wahi WebView "🖥️ Live" toggle me
@@ -863,6 +876,171 @@ class FormEngine(private val appContext: Context) {
         return try { evalJsSync(js, timeoutMs) } catch (_: Exception) { "null" }
     }
 
+    // ============ v56: HELP WEBVIEW (AI Mode browser — SHARED) ============
+
+    /**
+     * v56 — Help WebView lao: LiveWebViewHost ka SHARED help WebView.
+     *
+     * ROOT FIX: Pehle ye HIDDEN engine-owned WebView banata tha — agent ki
+     * help user ko KAHIN dikhti hi nahi thi (Live tab ka "🤖 AI Helper" ek
+     * ALAG WebView tha). Ab yehi shared helpWebView milta hai jo Live tab
+     * ke AI Helper section me VISIBLE hai — agent jo help karta hai
+     * (AI Mode kholna, screenshot upload, sawal puchhna) user LIVE dekhta hai.
+     * Kaam wala page untouched rehta hai. WebView kabhi destroy nahi hota.
+     */
+    fun getHelpWebView(): WebView? {
+        // Purana hidden WebView ab nahi banta (compat: field hata diya).
+        return try {
+            val wv = LiveWebViewHost.acquireHelp(appContext) { w ->
+                applyEngineSetup(w)
+            }
+            try {
+                LiveWebViewHost.addHelpRecreateListener(helpRecreateListener)
+            } catch (_: Exception) { }
+            wv
+        } catch (_: Exception) { null }
+    }
+
+    /** v56: renderer-crash par host naya help WebView de to reference badlo. */
+    private val helpRecreateListener: (WebView) -> Unit = { _ ->
+        // getHelpWebView() hamesha host se fresh leta hai — kuch nahi karna.
+    }
+
+    /**
+     * Help browser me URL kholo (MAIN thread par).
+     */
+    fun loadHelpUrl(url: String): Boolean {
+        return try {
+            val wv = getHelpWebView() ?: return false
+            onMain { wv.loadUrl(url) }
+            true
+        } catch (_: Exception) { false }
+    }
+
+    /**
+     * Help browser ka current URL.
+     */
+    fun helpCurrentUrl(): String {
+        return try {
+            val wv = getHelpWebView() ?: return ""
+            onMain { wv.url ?: "" }
+        } catch (_: Exception) { "" }
+    }
+
+    /**
+     * Help browser par JS chalao (AI Mode operate karne ke liye).
+     */
+    fun evalHelpJs(js: String, timeoutMs: Long = 30_000): String {
+        return try {
+            val wv = getHelpWebView() ?: return "null"
+            val latch = java.util.concurrent.CountDownLatch(1)
+            var out = "null"
+            mainHandler.post {
+                try {
+                    wv.evaluateJavascript(js) { v ->
+                        out = v ?: "null"
+                        latch.countDown()
+                    }
+                } catch (_: Exception) { latch.countDown() }
+            }
+            latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            out
+        } catch (_: Exception) { "null" }
+    }
+
+    /**
+     * Help browser ka screenshot (base64 PNG).
+     */
+    fun captureHelpPngBase64(): String {
+        return try {
+            val wv = getHelpWebView() ?: return ""
+            onMain {
+                val bmp = android.graphics.Bitmap.createBitmap(
+                    wv.width.coerceAtLeast(1),
+                    wv.height.coerceAtLeast(1),
+                    android.graphics.Bitmap.Config.ARGB_8888
+                )
+                val canvas = android.graphics.Canvas(bmp)
+                wv.draw(canvas)
+                val out = java.io.ByteArrayOutputStream()
+                bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 90, out)
+                if (!bmp.isRecycled) bmp.recycle()
+                android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
+            }
+        } catch (_: Exception) { "" }
+    }
+
+    /**
+     * v53: WORK SCREENSHOT → AI MODE UPLOAD.
+     * User order: "kaam me dikkat aayi to screenshot leke AI Mode me
+     * upload karke puchega."
+     *
+     * 1. base64 screenshot ko temp PNG file me save karo
+     * 2. pendingUploadFile arm karo
+     * 3. AI Mode ke image/Lens upload button ko JS se click karo
+     * 4. onShowFileChooser fire → screenshot file mil jayegi
+     *
+     * @return true = upload button mila aur click hua
+     */
+    fun uploadWorkScreenshotToAiMode(screenshotB64: String): Boolean {
+        return try {
+            if (screenshotB64.isEmpty()) return false
+            // 1. Temp file me save karo
+            val bytes = android.util.Base64.decode(
+                screenshotB64, android.util.Base64.DEFAULT
+            )
+            val file = java.io.File(
+                appContext.cacheDir,
+                "ai_help_shot_${System.currentTimeMillis()}.png"
+            )
+            java.io.FileOutputStream(file).use { it.write(bytes) }
+            // 2. File chooser arm karo
+            pendingUploadFile = file
+            val latch = java.util.concurrent.CountDownLatch(1)
+            pendingUploadLatch = latch
+            try {
+                // 3. AI Mode ka image upload button click karo (help WebView)
+                val clicked = evalHelpJs(
+                    """(function(){
+                        // Google AI Mode / Search ke image upload buttons
+                        var btn = document.querySelector('div[aria-label*="image" i][role="button"]') ||
+                            document.querySelector('button[aria-label*="Lens" i]') ||
+                            document.querySelector('div[aria-label*="Lens" i]') ||
+                            document.querySelector('input[type="file"][accept*="image"]') ||
+                            Array.from(document.querySelectorAll('div[role="button"],button')).find(b => {
+                                var t = (b.getAttribute('aria-label')||'').toLowerCase();
+                                return t.indexOf('upload image')>=0 || t.indexOf('lens')>=0 ||
+                                       t.indexOf('image search')>=0;
+                            });
+                        if (!btn) return 'UPLOAD_BTN_NOT_FOUND';
+                        btn.click();
+                        return 'UPLOAD_CLICKED';
+                    })()""", 15000
+                )
+                android.util.Log.i(
+                    "FmEngine",
+                    "AI Mode upload button: ${clicked.take(40)}"
+                )
+                // 4. File chooser ka intezar (15s)
+                latch.await(15, java.util.concurrent.TimeUnit.SECONDS)
+            } finally {
+                pendingUploadFile = null
+                pendingUploadLatch = null
+                // Temp file saaf karo (privacy)
+                try { file.delete() } catch (_: Exception) { }
+            }
+            true
+        } catch (e: Exception) {
+            android.util.Log.e(
+                "FmEngine",
+                "uploadWorkScreenshotToAiMode fail: ${(e.message ?: "").take(80)}"
+            )
+            try { pendingUploadFile = null } catch (_: Exception) { }
+            try { pendingUploadLatch = null } catch (_: Exception) { }
+            false
+        }
+    }
+
     private fun evalJsSync(js: String, timeoutMs: Long = 30_000): String {        val latch = CountDownLatch(1)
         var out = "null"
         handler!!.post {
@@ -1436,7 +1614,7 @@ class FormEngine(private val appContext: Context) {
     // ---------------- history nav ----------------
 
     /** back — WebView history back + settle wait. */
-    private fun goBack() {
+    fun goBack() {
         val latch = CountDownLatch(1)
         handler!!.post {
             try {

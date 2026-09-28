@@ -21,7 +21,28 @@ import android.util.Log
 object AiModeMemory {
 
     private const val TAG = "AiModeMemory"
-    private const val PREFS = "ai_mode_memory_v52"
+    private const val PREFS_BASE = "ai_mode_memory_v52"
+
+    /**
+     * v56 DATA ISOLATION (user order: "kisi aur ka data kisi aur user me
+     * na jaye"): memory file user-scoped. Selected card ID se scope banta
+     * hai — User A ka seekha hua User B ko kabhi nahi dikhega.
+     * Card nahi selected to "shared" scope (pehle jaisa behavior).
+     */
+    private fun prefsName(ctx: Context): String {
+        return try {
+            val cardId = com.formmitra.app.agent.CardStore
+                .selectedCardId(ctx).orEmpty()
+            if (cardId.isNotEmpty()) {
+                "${PREFS_BASE}_${cardId.hashCode().toString(16)}"
+            } else {
+                PREFS_BASE
+            }
+        } catch (_: Exception) { PREFS_BASE }
+    }
+
+    private fun prefs(ctx: Context) =
+        ctx.getSharedPreferences(prefsName(ctx), Context.MODE_PRIVATE)
 
     /**
      * Seekha hua save karo.
@@ -29,7 +50,7 @@ object AiModeMemory {
     fun learn(ctx: Context, problem: String, understanding: String) {
         try {
             val key = "learn_${problem.hashCode()}"
-            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            prefs(ctx)
                 .edit()
                 .putString(key, understanding)
                 .putLong("${key}_time", System.currentTimeMillis())
@@ -46,7 +67,7 @@ object AiModeMemory {
     fun getLearned(ctx: Context, problem: String): String? {
         return try {
             val key = "learn_${problem.hashCode()}"
-            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            prefs(ctx)
                 .getString(key, null)
         } catch (_: Exception) { null }
     }
@@ -56,7 +77,7 @@ object AiModeMemory {
      */
     fun count(ctx: Context): Int {
         return try {
-            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            prefs(ctx)
                 .all.keys.count { it.startsWith("learn_") && !it.endsWith("_time") }
         } catch (_: Exception) { 0 }
     }
@@ -71,7 +92,7 @@ object AiModeMemory {
             return false
         }
         return try {
-            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            prefs(ctx)
                 .edit().clear().apply()
             Log.i(TAG, "Memory cleared (user confirmed)")
             true

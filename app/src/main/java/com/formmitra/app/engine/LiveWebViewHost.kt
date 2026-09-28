@@ -78,6 +78,23 @@ object LiveWebViewHost {
     @Volatile private var setup: ((WebView) -> Unit)? = null
     @Volatile private var setupApplied = false
 
+    /**
+     * v56 — HELP WEBVIEW (dusra persistent browser).
+     * Live tab me EXACTLY do browsers:
+     *  1. workWebView (webView) — "🌐 User Browser": agent ka kaam wala browser.
+     *  2. helpWebView — "🤖 AI Helper": agent ki help (AI Mode) wala browser.
+     * Dono host ke paas PERSISTENT rehte hain — kabhi destroy nahi hote
+     * (sirf renderer-crash par recreate + URL restore). FormEngine ka
+     * getHelpWebView() ab hidden WebView NAHI banata — yehi shared
+     * helpWebView deta hai, jo Live tab me VISIBLE hai.
+     */
+    @Volatile private var helpWebView: WebView? = null
+    @Volatile private var helpLastUrl: String = ""
+    @Volatile private var helpSetup: ((WebView) -> Unit)? = null
+    @Volatile private var helpSetupApplied = false
+    private val helpRecreateListeners =
+        CopyOnWriteArrayList<(WebView) -> Unit>()
+
     private val recreateListeners = CopyOnWriteArrayList<(WebView) -> Unit>()
 
     fun addRecreateListener(l: (WebView) -> Unit) { recreateListeners.add(l) }
@@ -85,6 +102,16 @@ object LiveWebViewHost {
 
     /** Current hosted WebView (null = abhi bana hi nahi). */
     fun current(): WebView? = webView
+
+    /** v56: current HELP WebView (AI Helper browser). */
+    fun currentHelp(): WebView? = helpWebView
+
+    fun addHelpRecreateListener(l: (WebView) -> Unit) {
+        helpRecreateListeners.add(l)
+    }
+    fun removeHelpRecreateListener(l: (WebView) -> Unit) {
+        helpRecreateListeners.remove(l)
+    }
 
     /** Koi automation (form run / operator session) chal rahi hai? */
     fun isAutomationActive(): Boolean = automationActive
@@ -184,6 +211,82 @@ object LiveWebViewHost {
         }
     }
 
+    /**
+     * v56 — HELP BROWSER acquire (AI Helper).
+     * FormEngine.getHelpWebView() / AiHelpSystem yahin se lega.
+     * Pehli baar banega (desktop UA + engine setup); dobara wahi milega.
+     * Live tab ke "🤖 AI Helper" section me YEHI WebView attach hota hai —
+     * agent jo help karta hai wo user ko LIVE dikhta hai.
+     */
+    fun acquireHelp(appCtx: Context, setup: (WebView) -> Unit): WebView {
+        val ac = try { appCtx.applicationContext } catch (_: Exception) { appCtx }
+        helpSetup = setup
+        return onMain {
+            var wv = helpWebView
+            if (wv == null) {
+                wv = WebView(ac)
+                try {
+                    wv.webViewClient = HostWebViewClient()
+                } catch (_: Exception) { }
+                try {
+                    // Desktop mode (user order — dono browser desktop).
+                    wv.settings.userAgentString =
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
+                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                } catch (_: Exception) { }
+                try {
+                    setup(wv)
+                    helpSetupApplied = true
+                } catch (t: Throwable) {
+                    Log.e(TAG, "help engine setup failed (non-fatal)", t)
+                }
+                helpWebView = wv
+            } else if (!helpSetupApplied) {
+                try {
+                    setup(wv)
+                } catch (t: Throwable) {
+                    Log.e(TAG, "late help setup failed (non-fatal)", t)
+                }
+                helpSetupApplied = true
+            }
+            try { wv.onResume() } catch (_: Exception) { }
+            wv
+        }
+    }
+
+    /**
+     * v56 — Sirf dekhne ke liye HELP WebView pakka karo (idle AI Helper).
+     * Engine setup NAHI lagta (help shuru hogi to acquireHelp me lagega).
+     */
+    fun ensureHelpForViewing(appCtx: Context): WebView {
+        val ac = try { appCtx.applicationContext } catch (_: Exception) { appCtx }
+        return onMain {
+            var wv = helpWebView
+            if (wv == null) {
+                wv = WebView(ac)
+                try {
+                    wv.webViewClient = HostWebViewClient()
+                } catch (_: Exception) { }
+                try {
+                    wv.settings.userAgentString =
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
+                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                } catch (_: Exception) { }
+                try {
+                    wv.loadUrl("about:blank")
+                } catch (_: Exception) { }
+                helpWebView = wv
+            }
+            wv
+        }
+    }
+
+    /** v56: help browser ka aakhri URL (crash-recreate par restore). */
+    fun trackHelpUrl(url: String) {
+        val u = url.trim()
+        if (u.isNotEmpty() && !u.startsWith("about:")) helpLastUrl = u
+    }
+
     /** Hidden mode ka measure/layout (screenshot/render ke liye). */
     fun layoutForHidden() {
         try {
@@ -204,19 +307,27 @@ object LiveWebViewHost {
         } catch (_: Exception) { }
     }
 
-    /** Automation khatm — blank + battery policy (destroy NAHI). */
+    /**
+     * Automation khatm — battery policy (destroy NAHI).
+     *
+     * v56 ROOT FIX ("browser band ho jata hai"):
+     * Pehle yahan webView.loadUrl("about:blank") hota tha — run ke
+     * PARK/finish hote hi browser BLANK ho jata tha. OTP gate par run jab
+     * park hota tha (AgentLoop finally → engine.stop() → release()), user
+     * dekhta tha "browser band ho gaya", aur resume par page dobara load
+     * karna padta tha (state/cookies/form-data risk).
+     * Ab: page JAISE KA TAISA rehta hai — last URL, DOM, cookies, history
+     * sab bache rehte hain. Naya run apna URL khud load karega.
+     */
     fun release() {
         automationActive = false
         try {
             onMain {
-                try {
-                    webView?.loadUrl("about:blank")
-                } catch (_: Exception) { }
                 layoutForHidden()
                 applyPowerPolicyLocked()
             }
         } catch (_: Exception) { }
-        Log.i(TAG, "released (idle)")
+        Log.i(TAG, "released (idle, page preserved)")
     }
 
     /** Live view attach/detach ki suchna — battery policy badalti hai. */
@@ -230,7 +341,21 @@ object LiveWebViewHost {
     /**
      * Aakhri dekha hua URL (crash-recreate par wapas kholne ke liye).
      * Public taaki HostWebViewClient (nested class) track kar sake.
+     * v56: kaunsa WebView hai us hisaab se work/help me track karo.
      */
+    fun trackUrl(view: WebView?, url: String) {
+        val u = url.trim()
+        if (u.isEmpty() || u.startsWith("about:")) return
+        try {
+            if (view != null && view === helpWebView) {
+                helpLastUrl = u
+                return
+            }
+        } catch (_: Exception) { }
+        lastUrl = u
+    }
+
+    /** Purana signature (compat) — work browser me track. */
     fun trackUrl(url: String) {
         val u = url.trim()
         if (u.isNotEmpty() && !u.startsWith("about:")) lastUrl = u
@@ -258,9 +383,14 @@ object LiveWebViewHost {
      * report (usko engine khud handle karega).
      */
     fun handleRenderProcessGone(crashed: WebView?, detail: String) {
-        val isHosted = try {
+        // v56: kaunsa browser crash hua — work ya help?
+        val crashedWork = try {
             crashed != null && crashed === webView
         } catch (_: Exception) { false }
+        val crashedHelp = try {
+            crashed != null && crashed === helpWebView
+        } catch (_: Exception) { false }
+        val isHosted = crashedWork || crashedHelp
         // Report hamesha (hosted ho ya private-mode).
         try {
             val ctx = try { crashed?.context?.applicationContext } catch (_: Exception) { null }
@@ -282,26 +412,65 @@ object LiveWebViewHost {
             val appCtx = try { crashed?.context?.applicationContext } catch (_: Exception) { null }
                 ?: return
             onMain {
-                try {
-                    (webView?.parent as? ViewGroup)?.removeView(webView)
-                } catch (_: Exception) { }
-                try {
-                    webView?.destroy()
-                } catch (_: Exception) { }
-                val wv = createWebViewLocked(appCtx)
-                val url = lastUrl
-                if (url.isNotEmpty()) {
+                if (crashedWork) {
                     try {
-                        wv.loadUrl(url)
+                        (webView?.parent as? ViewGroup)?.removeView(webView)
                     } catch (_: Exception) { }
-                }
-                webView = wv
-                applyPowerPolicyLocked()
-                for (l in recreateListeners) {
                     try {
-                        l(wv)
+                        webView?.destroy()
+                    } catch (_: Exception) { }
+                    val wv = createWebViewLocked(appCtx)
+                    val url = lastUrl
+                    if (url.isNotEmpty()) {
+                        try {
+                            wv.loadUrl(url)
+                        } catch (_: Exception) { }
+                    }
+                    webView = wv
+                    applyPowerPolicyLocked()
+                    for (l in recreateListeners) {
+                        try {
+                            l(wv)
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "recreate listener failed (non-fatal)", t)
+                        }
+                    }
+                } else if (crashedHelp) {
+                    // v56: AI Helper browser crash — wapas banao + URL restore.
+                    try {
+                        (helpWebView?.parent as? ViewGroup)?.removeView(helpWebView)
+                    } catch (_: Exception) { }
+                    try {
+                        helpWebView?.destroy()
+                    } catch (_: Exception) { }
+                    val wv = WebView(appCtx)
+                    try {
+                        wv.webViewClient = HostWebViewClient()
+                    } catch (_: Exception) { }
+                    try {
+                        wv.settings.userAgentString =
+                            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
+                            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    } catch (_: Exception) { }
+                    try {
+                        helpSetup?.invoke(wv)
+                        helpSetupApplied = helpSetup != null
                     } catch (t: Throwable) {
-                        Log.e(TAG, "recreate listener failed (non-fatal)", t)
+                        Log.e(TAG, "help recreate setup failed (non-fatal)", t)
+                    }
+                    val url = helpLastUrl
+                    if (url.isNotEmpty()) {
+                        try {
+                            wv.loadUrl(url)
+                        } catch (_: Exception) { }
+                    }
+                    helpWebView = wv
+                    for (l in helpRecreateListeners) {
+                        try {
+                            l(wv)
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "help recreate listener failed (non-fatal)", t)
+                        }
                     }
                 }
             }
@@ -344,7 +513,7 @@ object LiveWebViewHost {
 
         override fun onPageFinished(view: WebView?, url: String?) {
             try {
-                if (url != null) LiveWebViewHost.trackUrl(url)
+                if (url != null) LiveWebViewHost.trackUrl(view, url)
             } catch (_: Exception) { }
             try {
                 super.onPageFinished(view, url)
@@ -357,7 +526,7 @@ object LiveWebViewHost {
             isReload: Boolean
         ) {
             try {
-                if (url != null) LiveWebViewHost.trackUrl(url)
+                if (url != null) LiveWebViewHost.trackUrl(view, url)
             } catch (_: Exception) { }
             try {
                 super.doUpdateVisitedHistory(view, url, isReload)

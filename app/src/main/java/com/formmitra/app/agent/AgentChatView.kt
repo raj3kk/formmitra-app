@@ -188,6 +188,10 @@ class AgentChatView(
     private val sendWatchdog = Handler(Looper.getMainLooper())
     private var sendToken = 0
     private var lastFailedText: String? = null
+    // v48: duplicate-send guard — back aake chat dobara khulne par wahi
+    // message dobara na jaye (idempotency: same text + 60s window = block).
+    private var lastSentText: String = ""
+    private var lastSentAt: Long = 0L
 
     // verify-before-save: is session me verify ho chuki details
     private val sessionDetails = LinkedHashMap<String, String>()
@@ -326,36 +330,12 @@ class AgentChatView(
             setOnClickListener { showDetailsCard() }
         })
         // POINT 2+12 (merged): chat ↔ fullscreen live operator view toggle.
-        // Yehi fullscreen view Profile ke "Live Operator" se khulta hai —
-        // ek hi OperatorView, do entry points.
-        // v38: usi me LIVE WebView (screenshot nahi, asli live).
-        val liveButton = Button(context).apply {
-            text = "🖥️ Live"
-            textSize = 13f
-            minimumWidth = 0
-            setTextColor(Color.WHITE)
-            background = android.graphics.drawable.GradientDrawable().apply {
-                setColor(Color.argb(40, 255, 255, 255))
-                cornerRadius = dp(10).toFloat()
-            }
-            setOnClickListener {
-                try {
-                    val i = android.content.Intent(
-                        context,
-                        com.formmitra.app.agent.OperatorView::class.java
-                    )
-                    // Active run ka context (agar ho) — live view wahi dikhaye.
-                    com.formmitra.app.engine.FormRunService.activeTaskId
-                        ?.let { i.putExtra("run_id", it) }
-                    context.startActivity(i)
-                } catch (t: Throwable) {
-                    android.util.Log.e("FmChat", "live view open failed", t)
-                    toast("⚠️ Live view nahi khul paya — dobara try karo")
-                }
-            }
-        }
-        liveBtn = liveButton
-        header.addView(liveButton)
+        // v56: CHAT SE LIVE HATA DIYA (user order 2026-09-28).
+        // "Agent ka live work browser chat me nahi rehna chahiye —
+        // chat se live browser remove karo."
+        // Live browser ab SIRF Live tab me hai ("🌐 User Browser" +
+        // "🤖 AI Helper") — wahi do browsers, agent ka kaam wahin dikhta hai.
+        // Isliye ye button ab nahi banta.
         // v38 addition #4: attach par pichle event se dot restore karo.
         try {
             LiveActivity.lastEvent()?.let { updateLiveDot(it) }
@@ -1617,10 +1597,139 @@ class AgentChatView(
                 textSize = 14f
                 setTextColor(Color.parseColor("#202124"))
             })
+            // v56: "🔄 Dobara try karo" button PERMANENT REMOVE (user order
+            // 2026-09-28: "Chat me upar 'Dobara try kare' show hota hai
+            // usko permanent remove kro").
+            // Card me ab sirf: reason + screenshots + catcher report copy +
+            // fix guidance. Retry ke liye user History se resume karega.
+            if (!ok) {
+                // v49 CATCHER: "🐞 Report copy karo" — user copy karke Muse
+                // chat me paste karega, Muse theek karega.
+                val catcherBtn = Button(context).apply {
+                    text = "🐞 Catcher report copy karo"
+                    textSize = 14f
+                    setTextColor(Color.parseColor("#5D4037"))
+                    val d = GradientDrawable()
+                    d.setColor(Color.parseColor("#FFECB3"))
+                    d.cornerRadius = dp(10).toFloat()
+                    background = d
+                    layoutParams = LayoutParams(
+                        LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+                    ).apply { setMargins(0, dp(8), 0, 0) }
+                }
+                catcherBtn.setOnClickListener {
+                    try {
+                        val act = context as? Activity
+                        if (act == null) {
+                            toast("Activity nahi mili")
+                            return@setOnClickListener
+                        }
+                        // Catcher report banao — kya hua, kahan atka.
+                        val report = com.formmitra.app.engine.ErrorCatcher.formatReport(
+                            where = "Kaam atka: ${s.workName}",
+                            workName = s.workName,
+                            sessionId = s.runId,
+                            t = RuntimeException(s.pendingText.take(200)),
+                            extra = mapOf(
+                                "Status" to s.status,
+                                "Ho gaya tha" to s.doneText.take(200),
+                                "Baaki tha" to s.pendingText.take(200),
+                                "Screenshots" to "${s.proofCount} (History me)"
+                            )
+                        )
+                        // Clipboard me copy.
+                        try {
+                            val cm = act.getSystemService(
+                                android.content.Context.CLIPBOARD_SERVICE
+                            ) as android.content.ClipboardManager
+                            cm.setPrimaryClip(
+                                android.content.ClipData.newPlainText(
+                                    "catcher_report", report
+                                )
+                            )
+                            toast(
+                                "✓ Copy ho gaya — Muse chat me paste karo"
+                            )
+                        } catch (_: Exception) {
+                            toast("Copy nahi ho paya")
+                        }
+                    } catch (_: Exception) { }
+                }
+                card.addView(catcherBtn)
+                // Fix guidance button — issue ke hisaab se tarika.
+                val fixBtn = Button(context).apply {
+                    text = "💡 Issue kaise theek karun?"
+                    textSize = 14f
+                    setTextColor(Color.parseColor("#1A73E8"))
+                    val d = GradientDrawable()
+                    d.setColor(Color.parseColor("#E8F0FE"))
+                    d.cornerRadius = dp(10).toFloat()
+                    background = d
+                    layoutParams = LayoutParams(
+                        LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+                    ).apply { setMargins(0, dp(8), 0, 0) }
+                }
+                fixBtn.setOnClickListener {
+                    try {
+                        val guidance = buildFixGuidance(s.pendingText, s.status)
+                        AlertDialog.Builder(context)
+                            .setTitle("💡 Kya kar sakte ho")
+                            .setMessage(guidance)
+                            .setPositiveButton("Samajh gaya", null)
+                            .show()
+                    } catch (_: Exception) { }
+                }
+                card.addView(fixBtn)
+            }
             messageList.addView(card, lp)
             scrollToBottom()
         } catch (t: Throwable) {
             android.util.Log.e("FmSummary", "card failed", t)
+        }
+    }
+
+    /**
+     * v49: failure reason se fix guidance banao.
+     * User ki demand: "jo issue k karan band hua, wo issue thik karne ka tarika."
+     * v56: "Dobara try karo" button permanent hata diya — guidance me uska
+     * zikr nahi. Retry ke liye History se resume karo.
+     */
+    private fun buildFixGuidance(pendingText: String, status: String): String {
+        val p = pendingText.lowercase()
+        return when {
+            "otp" in p ->
+                "🔢 OTP ki dikkat:\n\n" +
+                "1. OTP SMS 2-5 min me aata hai — thoda wait karo\n" +
+                "2. Galat OTP dala ho to History se resume karo\n" +
+                "3. Phone me network check karo\n" +
+                "4. OTP aaye hi nahi to website par 'Resend OTP' dabao, phir History se resume karo"
+            "password" in p || "login" in p || "id" in p ->
+                "🔑 Login ki dikkat:\n\n" +
+                "1. ID/password sahi hai na — ek baar check karo\n" +
+                "2. Website par khud login karke dekho\n" +
+                "3. Password bhool gaye ho to 'Forgot password' se reset karo\n" +
+                "4. Phir History se resume karo"
+            "captcha" in p ->
+                "🧩 Captcha aaya hai:\n\n" +
+                "1. Ye tumhe khud solve karna hoga\n" +
+                "2. Agent captcha aane par ruk jayega aur tumse puchega\n" +
+                "3. Captcha solve karke History se resume karo"
+            "internet" in p || "network" in p || "connect" in p ->
+                "📡 Internet ki dikkat:\n\n" +
+                "1. WiFi/mobile data on hai na — check karo\n" +
+                "2. Flight mode on to nahi hai\n" +
+                "3. Net theek ho jaye to History se resume karo"
+            "payment" in p ->
+                "💳 Payment page mila:\n\n" +
+                "1. Safety ke liye agent payment par ruk jata hai\n" +
+                "2. Tumhe khud payment karna hoga\n" +
+                "3. Payment ho jaye to History se resume karo"
+            else ->
+                "⚠️ Kaam atak gaya:\n\n" +
+                "1. History se resume karo — aksar dusri baar ho jata hai\n" +
+                "2. Na ho to website khud kholkar dekho — kya dikh raha hai\n" +
+                "3. Screenshot lekar Muse ko bhejo — turant theek karenge\n" +
+                "4. Catcher report copy karke chat me paste karo"
         }
     }
 
@@ -1937,6 +2046,13 @@ class AgentChatView(
     fun sendMessage(raw: String) {
         val text = raw.trim()
         if (text.isEmpty() || waiting) return
+        // v48: same message 60s ke andar dobara = duplicate (back-press /
+        // double-tap / draft-restore se) → block karo.
+        val now = System.currentTimeMillis()
+        if (text == lastSentText && now - lastSentAt < 60_000) {
+            try { input.text.clear(); clearDraft() } catch (_: Exception) { }
+            return
+        }
         // POINT 20: mid-run correction — active run ho aur user kahe field
         // galat hai to loop me bhejo, same run continue (STOP se alag).
         if (handleMidRunCorrection(text)) return
@@ -2169,6 +2285,8 @@ class AgentChatView(
         try {
             waiting = true
             lastFailedText = t
+            lastSentText = t
+            lastSentAt = System.currentTimeMillis()
             input.text.clear()
             clearDraft()
             sendBtn.isEnabled = false
@@ -2578,6 +2696,11 @@ class AgentChatView(
         val type = activeTrackingType
         val wk = workKeyFor(cat, type) ?: cat
         try {
+            // v50: PEHLE automation roko — nahi to delete ke baad bhi
+            // background me chalta rehta (user ki complaint).
+            try {
+                com.formmitra.app.engine.AutomationStopper.stopAll(context)
+            } catch (_: Exception) { }
             history.clear()
             sessionDetails.clear()
             askedKeys.clear()
@@ -2590,7 +2713,7 @@ class AgentChatView(
             e.apply()
             // Khaali state persist — dobara purani memory wapas na aaye.
             persistWorkMemory()
-            toast("🗑️ Chat saaf ho gayi")
+            toast("🗑️ Chat saaf ho gayi — automation bhi ruk gaya")
         } catch (t: Throwable) {
             android.util.Log.e("FmChat", "clearCurrentChat failed", t)
             toast("⚠️ Saaf karne me dikkat — dobara try karo")
@@ -3241,9 +3364,23 @@ class AgentChatView(
     /**
      * v43: Work tab se "Naya kaam" — agent chat kholo (nayi baat-cheet
      * yahin se shuru hoti hai; history category-wise alag rehti hai).
+     * v50: Purana automation STATE saaf karo — nahi to purana kaam hi
+     * redirect ho jata hai (user ki complaint).
      */
     fun startFreshWork() {
         try {
+            // v50: Pehle purana automation roko + state saaf.
+            try {
+                com.formmitra.app.engine.AutomationStopper.stopAll(context)
+            } catch (_: Exception) { }
+            try {
+                // Chat state reset — purani baat-cheet naye kaam me na ghuse.
+                history.clear()
+                sessionDetails.clear()
+                askedKeys.clear()
+                cardCachedDetails.clear()
+                post { messageList.removeAllViews() }
+            } catch (_: Exception) { }
             post {
                 try {
                     addAssistantBubble(
@@ -3671,10 +3808,12 @@ class AgentChatView(
                             }
                         )
                     } catch (_: Exception) {
+                        // v56: "Dobara try karo" button permanent remove
+                        // (user order) — sirf error message, retry nahi.
                         addErrorBubble(
-                            "⚠️ Kaam shuru karte waqt dikkat aayi — dobara try karo.",
-                            "🔁 Dobara try karo"
-                        ) { enqueueTask(title, url, category, knownDetails, askedAlready, onDone) }
+                            "⚠️ Kaam shuru karte waqt dikkat aayi.",
+                            null, null
+                        )
                     }
                     onDone()
                 }
@@ -4348,10 +4487,12 @@ class AgentChatView(
             } catch (t: Throwable) {
                 android.util.Log.e("FmRetry", "retryTask failed", t)
                 post {
+                    // v56: "Dobara try karo" button permanent remove —
+                    // sirf error message.
                     addErrorBubble(
                         "⚠️ Dobara chalate waqt dikkat aayi.",
-                        "🔁 Dobara try karo"
-                    ) { retryTask() }
+                        null, null
+                    )
                     retryBtn.isEnabled = true
                 }
             }

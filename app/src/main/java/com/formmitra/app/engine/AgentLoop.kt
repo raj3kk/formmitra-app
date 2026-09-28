@@ -1007,6 +1007,9 @@ object AgentLoop {
             }
 
             var currentUrl = startUrl
+            // v53: wrong-page recovery tracking
+            var lastGoodUrl = startUrl
+            var lastActionWasNav = false
             val captchaAttempts = intArrayOf(0)
             // G2 resume: startStep steps pehle ho chuke — (startStep + 1) se continue.
             for (i in (stepsTaken + 1)..maxSteps) {
@@ -1040,6 +1043,29 @@ object AgentLoop {
                 }
                 val url = snap.optString("url", "").ifEmpty { currentUrl }
                 val title = snap.optString("title", "")
+                // v53: WRONG-PAGE RECOVERY (user order: "galti se kahin aur
+                // visit kar gaya to back karke aage badh sake").
+                // Agar current URL last-good URL se bilkul alag hai AUR
+                // page par interactable elements nahi hain AUR pichla action
+                // navigation nahi tha → back jao.
+                val interactiveCount = try {
+                    snap.optJSONArray("interactives")?.length() ?: 0
+                } catch (_: Exception) { 0 }
+                if (lastGoodUrl.isNotEmpty() &&
+                    url.isNotEmpty() &&
+                    !urlsRelated(url, lastGoodUrl) &&
+                    interactiveCount < 3 &&
+                    lastActionWasNav == false
+                ) {
+                    logStep(i, "wrong_page_recovery", false,
+                        "Galat page par aa gaye the ($url) — back ja rahe")
+                    try {
+                        engine.goBack()
+                        Thread.sleep(2000)
+                        currentUrl = lastGoodUrl
+                        continue
+                    } catch (_: Exception) { }
+                }
                 currentUrl = url
 
                 // (b) CAPTCHA safety net (v14 full protocol: max 3 attempts)
@@ -1744,6 +1770,14 @@ object AgentLoop {
                     }
                     consecErrors = 0
                     stepsTaken++
+                    // v53: last-good tracking (wrong-page recovery ke liye).
+                    // Action safal hua → ye page theek hai.
+                    val stypeNow = (stepMap["action"] as? String).orEmpty()
+                    lastActionWasNav = (stypeNow == "goto" || stypeNow == "navigate")
+                    try {
+                        val u = engine.pageUrl()
+                        if (u.isNotEmpty()) lastGoodUrl = u
+                    } catch (_: Exception) { }
                     // v36: verified step → work-pattern ke liye collect.
                     // Sirf source KEY (card/user/detail ka naam) — personal
                     // VALUE kabhi nahi. goto ka URL selector me (mode=url).
@@ -1907,6 +1941,20 @@ object AgentLoop {
                                 i, "smart_retry", true,
                                 "Step $stepFails baar fail — naya tareeka try kar rahe (give-up nahi)"
                             )
+                            // v54: SMART MOVE — 2 baar fail par pehle REFRESH.
+                            // (User: "refresh agent khud karega automated")
+                            // Stale/atka page aksar refresh se thik hota hai.
+                            // Sirf ek baar per step (dobara nahi).
+                            if (stepFails == 2) {
+                                try {
+                                    logStep(
+                                        i, "smart_refresh", true,
+                                        "2 baar fail — page refresh karke dobara try"
+                                    )
+                                    engine.opReload()
+                                    Thread.sleep(2000)
+                                } catch (_: Exception) { }
+                            }
                             // AI Mode se samjho (agar pehle nahi samjha)
                             val problemDesc = "step '$action' $stepFails baar fail — naya tareeka chahiye"
                             val smartSolved = tryAiModeStrategy(
@@ -1941,24 +1989,86 @@ object AgentLoop {
                             val visionSolved = tryOperatorVisionHelp(
                                 ctx, engine, goal, currentUrl, history
                             )
-                            // v52: AI MODE STRATEGY — operator khud AI Mode me
-                            // jaake AI se baat karega, read karke samjhega.
+                            // v53: AI HELP SYSTEM — permanent companion.
+                            // Help browser (alag WebView) me AI Mode kholo,
+                            // problem puchho, jawab samjho, trained ho.
                             // (Vision AI se na ho to ye try karo)
-                            var aiModeSolved = false
+                            var aiHelpSolved = false
                             if (!visionSolved) {
+                                // v54: SMART SITUATION — agent khud full detail
+                                // bhejta hai: link + page + kya kar raha tha +
+                                // kitni baar fail + pehle kya try kiya.
+                                // (User: "kya puchna kya situation h kya age krna")
+                                val pageTitle = try {
+                                    engine.evalJs("document.title", 8000)
+                                        .take(120)
+                                } catch (_: Exception) { "" }
+                                // Recent attempts — history se (dobara wahi na ho)
+                                val recentTries = try {
+                                    history.takeLast(6).mapNotNull { h ->
+                                        try {
+                                            val a = h.optString("action", "")
+                                            val ok = h.optBoolean("ok", true)
+                                            if (a.isNotEmpty() && !ok) "$a (fail)"
+                                            else null
+                                        } catch (_: Exception) { null }
+                                    }.distinct().take(5)
+                                } catch (_: Exception) { emptyList<String>() }
+                                // v56: "kya kr diya h" — ab tak jo SUCCESSFULLY
+                                // complete hua (AI dobara karne ko na kahe).
+                                val doneSoFar = try {
+                                    history.mapNotNull { h ->
+                                        try {
+                                            val a = h.optString("action", "")
+                                            val ok = h.optBoolean("ok", false)
+                                            // ok=true wale steps = ho gaya
+                                            if (a.isNotEmpty() && ok) a else null
+                                        } catch (_: Exception) { null }
+                                    }.distinct().takeLast(8)
+                                } catch (_: Exception) { emptyList<String>() }
+                                val situation = AiHelpSystem.HelpSituation(
+                                    goal = goal,
+                                    problem = "step '$action' fail ho raha hai",
+                                    currentUrl = currentUrl,
+                                    pageTitle = pageTitle,
+                                    attemptedAction = action,
+                                    failCount = stepFails,
+                                    recentAttempts = recentTries,
+                                    completedSoFar = doneSoFar
+                                )
+                                // Work page ka screenshot (KAAM WALE browser ka)
+                                val workShot = try {
+                                    engine.capturePngBase64()
+                                } catch (_: Exception) { "" }
+                                val helpResult = AiHelpSystem.helpCycle(
+                                    ctx, engine, situation,
+                                    workScreenshotB64 = workShot.ifEmpty { null }
+                                )
+                                if (helpResult.success) {
+                                    visionHistory.add(org.json.JSONObject()
+                                        .put("type", "ai_help")
+                                        .put("source", helpResult.source)
+                                        .put("understanding",
+                                            helpResult.understanding.take(500)))
+                                    aiHelpSolved = true
+                                }
+                            }
+                            // v52: AI MODE STRATEGY (fallback — purana tareeka)
+                            var aiModeSolved = false
+                            if (!visionSolved && !aiHelpSolved) {
                                 val problemDesc = "step '$action' fail ho raha hai"
                                 aiModeSolved = tryAiModeStrategy(
                                     ctx, engine, goal, problemDesc,
                                     currentUrl, history
                                 )
                             }
-                            // Vision/AI-Mode results ko main history me milao
+                            // Vision/AI-Help results ko main history me milao
                             // (brain dekhega)
                             if (visionHistory.isNotEmpty()) {
                                 history.addAll(visionHistory)
                                 visionHistory.clear()
                             }
-                            if (visionSolved || aiModeSolved) {
+                            if (visionSolved || aiHelpSolved || aiModeSolved) {
                                 // Step fail count reset (nayi koshish)
                                 stepFailCounts[stepSig] = 0
                             }
@@ -4374,6 +4484,21 @@ object AgentLoop {
      *
      * @return true = AI Mode se actionable samajh mila
      */
+    /**
+     * v53: Do URLs related hain? (wrong-page recovery ke liye)
+     * Same host ya ek dusre ka prefix → related.
+     */
+    private fun urlsRelated(a: String, b: String): Boolean {
+        return try {
+            if (a.isEmpty() || b.isEmpty()) return true
+            val ua = java.net.URL(a)
+            val ub = java.net.URL(b)
+            if (ua.host.equals(ub.host, ignoreCase = true)) return true
+            if (a.startsWith(b) || b.startsWith(a)) return true
+            false
+        } catch (_: Exception) { true }
+    }
+
     private fun tryAiModeStrategy(
         ctx: Context,
         engine: FormEngine,
@@ -4395,49 +4520,47 @@ object AgentLoop {
                     .put("understanding", learned.take(500)))
                 return true
             }
-            // 1. Current page save karo
-            val returnUrl = currentUrl.ifEmpty { "" }
-            // 2. AI Mode search kholo
+            // v56 ROOT FIX: HELP browser (shared AI Helper) use karo —
+            // KAAM wala browser CHHUO MAT. Pehle ye fallback kaam wale
+            // browser ko AI Mode par le jata tha aur wapas lata tha —
+            // beech me page state bigadne ka risk tha.
+            // Live tab ke "🤖 AI Helper" me ye LIVE dikhta hai.
+            try {
+                com.formmitra.app.agent.LiveActivity.emitStep("", "ai_help")
+            } catch (_: Exception) { }
+            // 1. AI Mode search HELP browser me kholo (kaam wala untouched)
             val query = "$goal — $problem kaise solve kare"
             val aiUrl = AiModeOperator.AI_MODE_SEARCH +
                 java.net.URLEncoder.encode(query, "UTF-8")
-            try {
-                engine.runAgentStep(org.json.JSONObject()
-                    .put("type", "goto")
-                    .put("url", aiUrl))
-            } catch (_: Exception) { }
+            if (!engine.loadHelpUrl(aiUrl)) {
+                android.util.Log.w("AgentLoop", "AI Mode: help browser nahi khula")
+                return false
+            }
             Thread.sleep(4000)  // AI Overview load hone do
-            // 3. AI Overview READ karo (understanding = read karke)
+            // 2. AI Overview READ karo (understanding = read karke)
             var answer = ""
             try {
-                val raw = engine.evalJs(AiModeOperator.readAiAnswerJs(), 15000)
+                val raw = engine.evalHelpJs(AiModeOperator.readAiAnswerJs(), 15000)
                 answer = raw.trim().trim('"').take(2000)
             } catch (_: Exception) { }
-            // 4. Doubt ho to follow-up puchho
+            // 3. Doubt ho to follow-up puchho
             if (answer.length < 200 || answer.contains("NOT_FOUND")) {
                 try {
-                    engine.evalJs(
+                    engine.evalHelpJs(
                         AiModeOperator.askAnythingJs(
                             "Iske baare me step by step batao: $problem"
                         ), 10000
                     )
                     Thread.sleep(5000)
-                    val raw2 = engine.evalJs(
+                    val raw2 = engine.evalHelpJs(
                         AiModeOperator.readAiAnswerJs(), 15000)
                     val a2 = raw2.trim().trim('"').take(2000)
                     if (a2.length > answer.length) answer = a2
                 } catch (_: Exception) { }
             }
-            // 5. Wapas original page par jao
-            if (returnUrl.isNotEmpty()) {
-                try {
-                    engine.runAgentStep(org.json.JSONObject()
-                        .put("type", "goto")
-                        .put("url", returnUrl))
-                    Thread.sleep(2000)
-                } catch (_: Exception) { }
-            }
-            // 6. Samajh memory me rakho (trained)
+            // 4. Wapas jane ki zaroorat NAHI — kaam wala browser kabhi
+            //    chhoda hi nahi tha (v56).
+            // 5. Samajh memory me rakho (trained)
             if (answer.length >= 100) {
                 AiModeMemory.learn(ctx, problem, answer)
                 visionHistory.add(org.json.JSONObject()

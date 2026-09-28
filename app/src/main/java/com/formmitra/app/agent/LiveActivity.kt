@@ -143,6 +143,8 @@ object LiveActivity {
             "preflight_plan", "preflight" -> "Plan bana raha hai"
             "pattern_replay" -> "Seekha hua kaam dohra raha hai"
             "ai_diagnosis", "ai_single_step", "ai" -> "Soch raha hai"
+            // v56: AI Helper browser se help — user Live tab me dekhe.
+            "ai_help" -> "🤖 AI Helper se puchh raha hai"
             "precheck" -> "Taiyaari kar raha hai"
             "site_memory", "fieldmap", "correct_field" -> "Details taiyaar kar raha hai"
             // Internal log-only noise — indicator me flash mat karo.
