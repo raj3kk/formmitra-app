@@ -115,5 +115,13 @@ fun main() {
             !groqHelpSrc.contains("Log.d(TAG, key")
     )
 
+    // ============ 6. v62 stopRequested idle-block fix ============
+    val runServiceSrc = File(srcDir, "engine/FormRunService.kt").readText()
+    check(
+        "stopService idle par stopRequested nahi lagata (permanent block fix)",
+        runServiceSrc.contains("if (activeTaskId != null)") &&
+            runServiceSrc.contains("stopRequested = true")
+    )
+
     println("$failures FAILURES")
 }

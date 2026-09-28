@@ -137,7 +137,14 @@ class FormRunService : Service() {
         fun stopService(ctx: Context) {
             try {
                 // Pehle stop-request lagao (naye claims block).
-                synchronized(activeLock) { stopRequested = true }
+                // v62 FIX: SIRF tabhi lagao jab koi task actually chal raha ho.
+                // Idle par lagane se flag hamesha atak jata (koi thread
+                // releaseClaim nahi karta) → automation permanent block.
+                synchronized(activeLock) {
+                    if (activeTaskId != null) {
+                        stopRequested = true
+                    }
+                }
                 // Phir service stop (onDestroy me thread interrupt + cleanup).
                 ctx.stopService(Intent(ctx, FormRunService::class.java))
             } catch (_: Exception) { }
