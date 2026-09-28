@@ -2707,7 +2707,7 @@ class AgentChatView(
         val typeLabel = activeTrackingType?.let { " › ${WorkCategories.trackLabelOf(it)}" } ?: ""
         AlertDialog.Builder(act)
             .setTitle("🗑️ Chat saaf karein?")
-            .setMessage("🔖 $label$typeLabel — is kaam ki baat-cheet (screen + saved history + yaad ki hui details) delete ho jayegi. Ye wapas nahi aayegi.\n\nDoosre kaam ki chat ko kuch nahi hoga.")
+            .setMessage("🔖 $label$typeLabel — is kaam ki baat-cheet (screen + saved history + yaad ki hui details) delete ho jayegi. Ye wapas nahi aayegi.\n\n⚠️ Agar automation chal rahi hai to wo bhi RUK jayegi.\n\nDoosre kaam ki chat ko kuch nahi hoga.")
             .setPositiveButton("Saaf karo") { d, _ ->
                 d.dismiss()
                 clearCurrentChat()
@@ -3488,13 +3488,29 @@ class AgentChatView(
         } catch (_: Exception) { }
     }
 
-    /** Tracking resume — taaza status puchho. */
+    /**
+     * v61 ROOT FIX (audit 2026-09-28): resumeTask() jaisa hi bug tha —
+     * tracking par tap karte hi "🔍 Is tracking ka taaza status batao..."
+     * MESSAGE BHEJTA THA. Ab koi message NAHI — sirf tracking context
+     * khulta hai. User ko kuch nahi bolna, koi auto-message nahi.
+     */
     private fun resumeTracking(tr: JSONObject) {
-        val label = tr.optString("label", "tracking").ifEmpty { "tracking" }
-        sendMessage(
-            "🔍 Is tracking ka taaza status batao: \"$label\". " +
-                "Agar koi naya update ho to detail me batao."
-        )
+        // Sirf tracking context set karo — koi sendMessage NAHI.
+        // Tracking ka status LiveActivity/poll se waise bhi dikhta hai.
+        try {
+            val cat = tr.optString("category", "").ifEmpty { null }
+            if (cat != null && WorkCategories.of(cat) != null) {
+                post {
+                    try {
+                        activeCategory = cat
+                        val label = WorkCategories.labelOf(cat)
+                        categoryChip.text = "🔖 $label  ✕"
+                        categoryChip.visibility = View.VISIBLE
+                    } catch (_: Exception) { }
+                }
+                loadChatHistory(cat, null)
+            }
+        } catch (_: Exception) { }
     }
 
     /** Tracking band karo — confirmation ke saath (har delete par confirm). */
