@@ -65,6 +65,77 @@ object CaptchaConsent {
 @Suppress("UNCHECKED_CAST")
 object AgentLoop {
 
+    /**
+     * v59 SMART COMPLETION — user order: "task complete ho to bache hue
+     * steps mat karo, turant ruko aur user ko screenshot ke saath batao".
+     *
+     * Har successful step ke baad page dekho — agar goal poora dikh raha
+     * hai (success message, confirmation, thank-you page, etc.) to
+     * completion summary return karo (null = abhi poora nahi).
+     *
+     * Ye server ke "done" ka intezaar nahi karta — agent khud smartly
+     * decide karta hai.
+     */
+    private fun checkSmartCompletion(
+        goal: String,
+        engine: FormEngine,
+        stepIdx: Int
+    ): String? {
+        try {
+            // Pehle 3 steps me check mat karo (shuruaat me false positive)
+            if (stepIdx < 3) return null
+            val snap = try { engine.domSnapshot() } catch (_: Exception) { return null }
+            val title = snap.optString("title", "").lowercase()
+            val text = snap.optString("page_text", "").lowercase()
+            val url = snap.optString("url", "").lowercase()
+            val combined = "$title $text".take(5000)
+
+            // Completion signals — goal type ke hisaab se
+            val goalLower = goal.lowercase()
+
+            // 1. Form submission success
+            val formSuccess = listOf(
+                "successfully submitted", "form submitted", "application submitted",
+                "successfully registered", "registration successful",
+                "thank you for", "धन्यवाद", "सफलतापूर्वक",
+                "application successful", "submitted successfully"
+            )
+            // 2. Payment/booking confirmation
+            val bookingSuccess = listOf(
+                "booking confirmed", "booking successful", "payment successful",
+                "order placed", "order confirmed", "ticket booked",
+                "confirmation number", "booking id", "pnr"
+            )
+            // 3. Download/document ready
+            val docSuccess = listOf(
+                "download ready", "document ready", "certificate ready",
+                "admit card", "download your"
+            )
+
+            val allSignals = formSuccess + bookingSuccess + docSuccess
+            for (signal in allSignals) {
+                if (combined.contains(signal)) {
+                    // Goal se match karo — sirf relevant signal par done
+                    val signalWords = signal.split(" ")
+                    val goalWords = goalLower.split(" ").filter { it.length > 3 }
+                    val relevant = signalWords.any { sw ->
+                        goalWords.any { gw -> gw.contains(sw) || sw.contains(gw) }
+                    } || goalLower.contains("form") || goalLower.contains("apply") ||
+                        goalLower.contains("register") || goalLower.contains("book")
+                    if (relevant) {
+                        return "Ho gaya ✅ — $signal (page par confirm dikha, bache steps skip kiye)"
+                    }
+                }
+            }
+            // 4. URL me success indicators
+            if (url.contains("success") || url.contains("confirmation") ||
+                url.contains("thank") || url.contains("complete")) {
+                return "Ho gaya ✅ — confirmation page khul gaya (bache steps skip kiye)"
+            }
+        } catch (_: Exception) { }
+        return null
+    }
+
     fun runAgentTask(
         ctx: Context,
         engine: FormEngine,
@@ -485,14 +556,46 @@ object AgentLoop {
          * needs_user finish. Iske upar kuch nahi (user hi final authority).
          */
         fun finishUserGate(i: Int, action: String, msg: String): FormEngine.RunResult {
+            // v60: GIVE-UP NAHI — final smart attempt.
+            // (User: "restriction mat lagao — root cause dhoondo, AI se naya link lo,
+            //  'aapki madad chahiye' wala give-up hatao")
+            // Pehle: kya ye link-fail hai? To fresh link try karo.
+            // Phir: AI Mode se root cause samjho.
+            // Tab bhi na ho to user ko HELPFUL message do (madad-maangna nahi).
+            var finalTried = false
+            try {
+                if (action == "goto" || action == "act") {
+                    logStep(
+                        i, "final_smart", true,
+                        "Aakhri koshish — AI se root cause + naya tareeka"
+                    )
+                    // AI Mode se root cause puchho
+                    // (startUrl available hai — enclosing runAgentTask ka param)
+                    val smartOk = tryAiModeStrategy(
+                        ctx, engine, goal,
+                        "Sab try ho gaya, kaam '$goal' atka hai — root cause batao aur naya tareeka do",
+                        startUrl, history
+                    )
+                    finalTried = smartOk
+                }
+            } catch (_: Exception) { }
             logStep(
                 i, "ladder", true, EscalationLadder.auditEntry(
                     ladderLevel, EscalationLadder.L_USER, action,
-                    "agent/AI se nahi hua — aapki madad chahiye", false
+                    if (finalTried) "final smart attempt kiya — aage badh rahe"
+                    else "sare smart tareeke try kiye — situation report",
+                    false
                 ).toString().take(300)
             )
             ladderLevel = EscalationLadder.L_USER
-            return finish("needs_user", msg)
+            // v60: "aapki madad chahiye" HATAYA — helpful status do, bheekh nahi.
+            val helpfulMsg = if (finalTried) {
+                "Naya tareeka mil gaya hai — aage badh raha hoon. $msg"
+            } else {
+                // Kya try kiya, kya mila — saaf report (well-arranged)
+                "Atak gaya tha, ye try kiya: $msg. AI se naya tareeka dhoondh raha hoon — thoda rukiye."
+            }
+            return finish("needs_user", helpfulMsg)
         }
 
         /**
@@ -2054,9 +2157,31 @@ object AgentLoop {
                                     Thread.sleep(2000)
                                 } catch (_: Exception) { }
                             }
-                            // AI Mode se samjho (agar pehle nahi samjha)
+                            // v60: GOTO-SPECIFIC — same link baar-baar fail to NAYA LINK dhoondo.
+                            // (User: "wahi purana link dobara mat kholo — AI se naya link lekar aage badho")
+                            // Link thik tha, process gadbad thi → root cause samjho; link galat/error
+                            // page aaya to AI Mode se fresh official link nikalo, purana hatao.
+                            var freshLinkSolved = false
+                            if (action == "goto") {
+                                val failedUrl = try {
+                                    (stepMap["url"] as? String).orEmpty()
+                                } catch (_: Exception) { "" }
+                                if (failedUrl.isNotEmpty()) {
+                                    logStep(
+                                        i, "fresh_link", true,
+                                        "goto '$failedUrl' $stepFails baar fail — AI se naya link dhoondh rahe"
+                                    )
+                                    freshLinkSolved = tryFreshLinkViaAi(
+                                        ctx, engine, goal, failedUrl, currentUrl
+                                    )
+                                    if (freshLinkSolved) {
+                                        stepFailCounts[stepSig] = 0
+                                    }
+                                }
+                            }
+                            // AI Mode se samjho (agar pehle nahi samjha aur fresh link se na hua)
                             val problemDesc = "step '$action' $stepFails baar fail — naya tareeka chahiye"
-                            val smartSolved = tryAiModeStrategy(
+                            val smartSolved = if (freshLinkSolved) true else tryAiModeStrategy(
                                 ctx, engine, goal, problemDesc,
                                 currentUrl, history
                             )
@@ -2204,6 +2329,25 @@ object AgentLoop {
                         )
                     }
                 }
+                // v59 SMART COMPLETION (user order): task poora ho gaya ho
+                // to bache hue steps mat karo — turant ruko, screenshot lo,
+                // user ko chat me batao. Server ke "done" ka intezaar mat karo.
+                try {
+                    val smartDone = checkSmartCompletion(goal, engine, i)
+                    if (smartDone != null) {
+                        logStep(i, "smart_complete", true,
+                            "Task poora dikh raha hai — bache steps skip, user ko bata rahe")
+                        // Screenshot lo (chat notification ke liye)
+                        try {
+                            val shot = engine.capturePngBase64()
+                            if (shot.isNotEmpty()) {
+                                mirrorShot()
+                                try { onProof() } catch (_: Exception) { }
+                            }
+                        } catch (_: Exception) { }
+                        return finish("done", smartDone)
+                    }
+                } catch (_: Exception) { }
                 i++  // v56: while loop me manual increment
             }  // while (i <= effectiveMaxSteps)
             // v56 NEVER-STOP: user order "kaam kabhi band nahi hona chahiye".
@@ -4634,6 +4778,81 @@ object AgentLoop {
             if (a.startsWith(b) || b.startsWith(a)) return true
             false
         } catch (_: Exception) { true }
+    }
+
+    /**
+     * v60: GOTO fail hone par AI Mode se NAYA official link dhoondo.
+     * (User: "purana link dobara mat kholo — AI se naya link lekar aage badho")
+     * - Help browser me AI se puchho: "[goal] ka sahi official website link kya hai?"
+     * - Naya link mile to us par goto karo (purana link hatao, fallback me bhi nahi).
+     * - Returns true agar naya link milkar khul gaya.
+     */
+    private fun tryFreshLinkViaAi(
+        ctx: Context,
+        engine: FormEngine,
+        goal: String,
+        failedUrl: String,
+        currentUrl: String
+    ): Boolean {
+        return try {
+            android.util.Log.i("AgentLoop",
+                "Fresh link: '$failedUrl' fail — AI se naya link dhoondh rahe...")
+            try {
+                com.formmitra.app.agent.LiveActivity.emitStep("", "ai_help")
+            } catch (_: Exception) { }
+            // AI Mode se puchho: sahi link kya hai?
+            val query = "$goal official website sahi link"
+            val aiUrl = AiModeOperator.AI_MODE_SEARCH +
+                java.net.URLEncoder.encode(
+                    "$query (purana link $failedUrl kaam nahi kar raha, naya official link batao)",
+                    "UTF-8"
+                )
+            // Help browser me AI Mode kholo (kaam wala browser untouched)
+            if (!engine.loadHelpUrl(aiUrl)) {
+                android.util.Log.w("AgentLoop", "Fresh link: help browser nahi khula")
+                return false
+            }
+            Thread.sleep(4000)  // AI Overview load hone do
+            var aiAnswer = ""
+            try {
+                val raw = engine.evalHelpJs(AiModeOperator.readAiAnswerJs(), 15000)
+                aiAnswer = raw.trim().trim('"').take(2000)
+            } catch (_: Exception) { }
+            // Answer me se URL nikalo
+            val urlPattern = java.util.regex.Pattern.compile(
+                """https?://[^\s]+"""
+            )
+            val matcher = urlPattern.matcher(aiAnswer)
+            var newLink: String? = null
+            while (matcher.find()) {
+                val candidate = matcher.group()
+                // Purana failed link nahi, aur naya link hona chahiye
+                if (candidate != failedUrl && !candidate.contains("google.com/search")) {
+                    newLink = candidate
+                    break
+                }
+            }
+            if (newLink != null) {
+                android.util.Log.i("AgentLoop", "Fresh link mila: $newLink")
+                // Naya link kholo
+                val spec = org.json.JSONObject()
+                    .put("type", "goto")
+                    .put("url", newLink)
+                val result = engine.runAgentStep(spec)
+                val ok = result.optBoolean("ok", true)
+                if (ok) {
+                    // Purana failed link ko memory se hatao (dobara na aaye)
+                    try {
+                        val prefs = ctx.getSharedPreferences("formmitra_failed_links", 0)
+                        prefs.edit().putLong(failedUrl, System.currentTimeMillis()).apply()
+                    } catch (_: Exception) { }
+                    return true
+                }
+            }
+            false
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun tryAiModeStrategy(

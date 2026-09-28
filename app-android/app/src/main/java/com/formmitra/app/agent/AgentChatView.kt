@@ -188,6 +188,8 @@ class AgentChatView(
     private val sendWatchdog = Handler(Looper.getMainLooper())
     private var sendToken = 0
     private var lastFailedText: String? = null
+    // v59: duplicate "Shuru karo" cards roko — aakhri plan ka ID yaad rakho
+    private var lastPlanCardKey: String? = null
     // v48: duplicate-send guard — back aake chat dobara khulne par wahi
     // message dobara na jaye (idempotency: same text + 60s window = block).
     private var lastSentText: String = ""
@@ -858,6 +860,18 @@ class AgentChatView(
     // ---------- plan card ----------
 
     private fun addPlanCard(plan: JSONObject) {
+        // v59 DUPLICATE GUARD (user order): "Shuru karo" card baar-baar
+        // na aaye. Same plan dobara aaye to skip.
+        try {
+            val planKey = plan.optString("id", "").ifEmpty {
+                plan.optString("title", "") + "|" + plan.optString("official_link", "")
+            }
+            if (planKey.isNotEmpty() && planKey == lastPlanCardKey) {
+                android.util.Log.i("FmChat", "Duplicate plan card skip: $planKey")
+                return
+            }
+            lastPlanCardKey = planKey.ifEmpty { null }
+        } catch (_: Exception) { }
         val card = LinearLayout(context).apply {
             orientation = VERTICAL
             val d = GradientDrawable()
@@ -4128,6 +4142,44 @@ class AgentChatView(
         addAssistantBubble(CardUnlockPolicy.lockDoneText(nm))
     }
 
+    /**
+     * v59: Non-OTP prompts chat me — ek-ek karke smartly puchho.
+     * User order: "Popup sirf OTP ke liye, baaki chat me one-by-one".
+     */
+    private fun showPromptInChat(prompt: UserPrompt.Request) {
+        try {
+            // Duplicate guard — same prompt dobara na puchho
+            val promptKey = "${prompt.runId}:${prompt.kind}:${prompt.fields.size}"
+            if (promptKey == lastPromptChatKey) return
+            lastPromptChatKey = promptKey
+
+            val msg = when (prompt.kind) {
+                "input" -> {
+                    val field = prompt.fields.firstOrNull()
+                    val label = field?.label ?: "jaankari"
+                    "Mujhe ek cheez chahiye: **$label**?\nBatao, main aage badhta hun."
+                }
+                "choice" -> {
+                    "Ek chota sa faisla chahiye:\n${prompt.message ?: ""}"
+                }
+                "login" -> {
+                    "Is site par login chahiye. ${prompt.message ?: "Login karke batao, main wait kar raha hun."}"
+                }
+                "document" -> {
+                    "Ek document chahiye: ${prompt.message ?: "Document select karo."}"
+                }
+                else -> prompt.message ?: "Ek jaankari chahiye."
+            }
+            addAssistantBubble(msg)
+            // LiveActivity me bhi gate dikhao (transient, message nahi)
+            try {
+                LiveActivity.emitGate(prompt.runId, prompt.kind)
+            } catch (_: Exception) { }
+        } catch (_: Exception) { }
+    }
+
+    private var lastPromptChatKey: String? = null
+
     private fun pollTaskStatus() {
         Thread {
             val runs = try { AgentApi.listRuns(context) } catch (_: Exception) { null }
@@ -4135,15 +4187,21 @@ class AgentChatView(
             post {
                 handlePollResult(runs)
                 if (prompt != null) {
-                    val act = context as? Activity
-                    // v29 zero-crash gate: finishing/destroyed activity par
-                    // dialog show() = BadTokenException = UI-thread crash.
-                    if (act != null && !act.isFinishing && !act.isDestroyed &&
-                        !PromptDialog.isShowing(prompt.runId)
-                    ) {
-                        try {
-                            PromptDialog.show(act, prompt)
-                        } catch (_: Exception) { }
+                    // v59 OTP-ONLY POPUP: sirf OTP popup me, baaki chat me.
+                    if (prompt.kind != "otp") {
+                        // Non-OTP → chat me ek-ek karke puchho (smart, one-by-one)
+                        try { showPromptInChat(prompt) } catch (_: Exception) { }
+                    } else {
+                        val act = context as? Activity
+                        // v29 zero-crash gate: finishing/destroyed activity par
+                        // dialog show() = BadTokenException = UI-thread crash.
+                        if (act != null && !act.isFinishing && !act.isDestroyed &&
+                            !PromptDialog.isShowing(prompt.runId)
+                        ) {
+                            try {
+                                PromptDialog.show(act, prompt)
+                            } catch (_: Exception) { }
+                        }
                     }
                 }
             }
@@ -4211,7 +4269,9 @@ class AgentChatView(
             bannerGoal = runGoal(latest)
             bannerUrl = runUrl(latest)
             bannerCategory = runFd(latest)?.optString("category", "").orEmpty()
-            val reason = runSummary(latest).ifEmpty { "Agent ko aapki madad chahiye" }
+            // v60: "Agent ko aapki madad chahiye" HATAYA (user order).
+            // Ab helpful status: kya ho raha hai, kya try ho raha hai.
+            val reason = runSummary(latest).ifEmpty { "Agent kaam kar raha hai — status update ka intezaar karein" }
             val low = reason.lowercase()
             bannerText.text =
                 if (low.contains("otp") || low.contains("login")) {
