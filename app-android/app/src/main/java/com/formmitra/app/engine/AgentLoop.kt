@@ -1011,8 +1011,13 @@ object AgentLoop {
             var lastGoodUrl = startUrl
             var lastActionWasNav = false
             val captchaAttempts = intArrayOf(0)
-            // G2 resume: startStep steps pehle ho chuke — (startStep + 1) se continue.
-            for (i in (stepsTaken + 1)..maxSteps) {
+            // v56 NEVER-STOP: user order "kaam kabhi band nahi hona chahiye".
+            // Outer labeled loop: inner while khatm hone par agar progress
+            // ho rahi hai to limit extend karke DOBARA chalao.
+            var effectiveMaxSteps = maxSteps
+            var i = stepsTaken + 1
+            outerLoop@ while (true) {
+            while (i <= effectiveMaxSteps) {
                 onProgress(i)
 
                 // (a)+(c) PARALLEL: DOM snapshot + screenshot ek saath
@@ -1067,6 +1072,59 @@ object AgentLoop {
                     } catch (_: Exception) { }
                 }
                 currentUrl = url
+
+                // v56 BROWSER HEALTH — user order: "browser atak gaya band ho
+                // gaya to agent smartly handle kare, kaam kabhi band nahi".
+                // Agar snapshot khaali hai (browser dead/unresponsive) to
+                // smart recovery: reload → last-good URL → continue. Kabhi
+                // rukna nahi.
+                val snapEmpty = snap.length() == 0
+                if (snapEmpty || interactiveCount == 0) {
+                    val alive = try {
+                        engine.evalJs("document.readyState", 5000)
+                            .contains("complete", ignoreCase = true) ||
+                        engine.evalJs("document.readyState", 5000)
+                            .contains("interactive", ignoreCase = true) ||
+                        engine.evalJs("1+1", 5000).trim() == "2"
+                    } catch (_: Exception) { false }
+                    if (!alive) {
+                        logStep(i, "browser_recovery", false,
+                            "Browser jawab nahi de raha — smart recovery")
+                        var recovered = false
+                        // 1. Reload try karo
+                        try {
+                            engine.evalJs("location.reload()", 3000)
+                            Thread.sleep(3000)
+                            val after = engine.evalJs("1+1", 8000).trim()
+                            if (after == "2") recovered = true
+                        } catch (_: Exception) { }
+                        // 2. Reload na ho to last-good URL par wapas jao
+                        if (!recovered && lastGoodUrl.isNotEmpty()) {
+                            try {
+                                logStep(i, "browser_recovery", false,
+                                    "Reload fail — last-good page par wapas: " +
+                                    lastGoodUrl.take(60))
+                                engine.opGoto(lastGoodUrl)
+                                Thread.sleep(4000)
+                                val after = engine.evalJs("1+1", 8000).trim()
+                                if (after == "2") recovered = true
+                            } catch (_: Exception) { }
+                        }
+                        if (recovered) {
+                            logStep(i, "browser_recovery", true,
+                                "Browser wapas zinda — kaam jaari")
+                            continue  // turant agla step, ruke nahi
+                        } else {
+                            logStep(i, "browser_recovery", false,
+                                "Browser recover nahi hua — phir bhi koshish jaari")
+                            // Rukna nahi — brain ko batate hain, wo decide karega
+                            history.add(JSONObject()
+                                .put("type", "browser_recovery_failed")
+                                .put("note", "Browser jawab nahi de raha, " +
+                                    "reload bhi fail. Alternative tareeka socho."))
+                        }
+                    }
+                }
 
                 // (b) CAPTCHA safety net (v14 full protocol: max 3 attempts)
                 val capNote = handleCaptcha(ctx, engine, url, snap, captchaAttempts)
@@ -1994,6 +2052,7 @@ object AgentLoop {
                             // problem puchho, jawab samjho, trained ho.
                             // (Vision AI se na ho to ye try karo)
                             var aiHelpSolved = false
+                            var aiModeWasAttempted = false  // v56: scope ke bahar chahiye
                             if (!visionSolved) {
                                 // v54: SMART SITUATION — agent khud full detail
                                 // bhejta hai: link + page + kya kar raha tha +
@@ -2014,6 +2073,18 @@ object AgentLoop {
                                         } catch (_: Exception) { null }
                                     }.distinct().take(5)
                                 } catch (_: Exception) { emptyList<String>() }
+                                // v56: "kya kr diya h" — ab tak jo SUCCESSFULLY
+                                // complete hua (AI dobara karne ko na kahe).
+                                val doneSoFar = try {
+                                    history.mapNotNull { h ->
+                                        try {
+                                            val a = h.optString("action", "")
+                                            val ok = h.optBoolean("ok", false)
+                                            // ok=true wale steps = ho gaya
+                                            if (a.isNotEmpty() && ok) a else null
+                                        } catch (_: Exception) { null }
+                                    }.distinct().takeLast(8)
+                                } catch (_: Exception) { emptyList<String>() }
                                 val situation = AiHelpSystem.HelpSituation(
                                     goal = goal,
                                     problem = "step '$action' fail ho raha hai",
@@ -2021,7 +2092,8 @@ object AgentLoop {
                                     pageTitle = pageTitle,
                                     attemptedAction = action,
                                     failCount = stepFails,
-                                    recentAttempts = recentTries
+                                    recentAttempts = recentTries,
+                                    completedSoFar = doneSoFar
                                 )
                                 // Work page ka screenshot (KAAM WALE browser ka)
                                 val workShot = try {
@@ -2039,15 +2111,24 @@ object AgentLoop {
                                             helpResult.understanding.take(500)))
                                     aiHelpSolved = true
                                 }
+                                aiModeWasAttempted = helpResult.aiModeAttempted
                             }
                             // v52: AI MODE STRATEGY (fallback — purana tareeka)
+                            // v56 FAST: helpCycle me AI Mode pehle hi try ho
+                            // chuka hai (aiModeAttempted) to dobara SAME cheez
+                            // repeat mat karo — turant aage badho. User order:
+                            // "turant... turant aage badhaye kaam ko".
                             var aiModeSolved = false
-                            if (!visionSolved && !aiHelpSolved) {
+                            if (!visionSolved && !aiHelpSolved &&
+                                !aiModeWasAttempted) {
                                 val problemDesc = "step '$action' fail ho raha hai"
                                 aiModeSolved = tryAiModeStrategy(
                                     ctx, engine, goal, problemDesc,
                                     currentUrl, history
                                 )
+                            } else if (!visionSolved && !aiHelpSolved) {
+                                android.util.Log.i("AgentLoop", "AI Mode pehle hi try ho chuka — " +
+                                    "redundant retry skip, turant aage")
                             }
                             // Vision/AI-Help results ko main history me milao
                             // (brain dekhega)
@@ -2082,7 +2163,28 @@ object AgentLoop {
                         )
                     }
                 }
+                i++  // v56: while loop me manual increment
+            }  // while (i <= effectiveMaxSteps)
+            // v56 NEVER-STOP: user order "kaam kabhi band nahi hona chahiye".
+            // Loop khatm hua (i > effectiveMaxSteps). Agar PROGRESS ho rahi
+            // hai (stuck nahi) to limit extend karke DOBARA loop chalao —
+            // rukna nahi. Sirf sach me phasne par needs_user.
+            val makingProgress = try {
+                val recent = history.takeLast(10)
+                var successCount = 0
+                for (h in recent) {
+                    val t = h.optString("type", "")
+                    if (t == "action_success" || t == "step_ok") successCount++
+                }
+                successCount >= 2 && stuckCount < 3
+            } catch (_: Exception) { false }
+            if (makingProgress && effectiveMaxSteps < 120) {
+                effectiveMaxSteps += 20
+                android.util.Log.i("AgentLoop", "Progress ho rahi hai — limit $effectiveMaxSteps tak extend, rukna nahi")
+                continue@outerLoop  // v56: dobara inner while chalao
             }
+            break@outerLoop  // v56: sach me phas gaye ya limit max — bahar niklo
+            }  // outerLoop
             return finish(
                 "needs_user",
                 "$maxSteps steps ho gaye, kaam poora nahi hua — aap dekh lein"
@@ -4507,49 +4609,47 @@ object AgentLoop {
                     .put("understanding", learned.take(500)))
                 return true
             }
-            // 1. Current page save karo
-            val returnUrl = currentUrl.ifEmpty { "" }
-            // 2. AI Mode search kholo
+            // v56 ROOT FIX: HELP browser (shared AI Helper) use karo —
+            // KAAM wala browser CHHUO MAT. Pehle ye fallback kaam wale
+            // browser ko AI Mode par le jata tha aur wapas lata tha —
+            // beech me page state bigadne ka risk tha.
+            // Live tab ke "🤖 AI Helper" me ye LIVE dikhta hai.
+            try {
+                com.formmitra.app.agent.LiveActivity.emitStep("", "ai_help")
+            } catch (_: Exception) { }
+            // 1. AI Mode search HELP browser me kholo (kaam wala untouched)
             val query = "$goal — $problem kaise solve kare"
             val aiUrl = AiModeOperator.AI_MODE_SEARCH +
                 java.net.URLEncoder.encode(query, "UTF-8")
-            try {
-                engine.runAgentStep(org.json.JSONObject()
-                    .put("type", "goto")
-                    .put("url", aiUrl))
-            } catch (_: Exception) { }
+            if (!engine.loadHelpUrl(aiUrl)) {
+                android.util.Log.w("AgentLoop", "AI Mode: help browser nahi khula")
+                return false
+            }
             Thread.sleep(4000)  // AI Overview load hone do
-            // 3. AI Overview READ karo (understanding = read karke)
+            // 2. AI Overview READ karo (understanding = read karke)
             var answer = ""
             try {
-                val raw = engine.evalJs(AiModeOperator.readAiAnswerJs(), 15000)
+                val raw = engine.evalHelpJs(AiModeOperator.readAiAnswerJs(), 15000)
                 answer = raw.trim().trim('"').take(2000)
             } catch (_: Exception) { }
-            // 4. Doubt ho to follow-up puchho
+            // 3. Doubt ho to follow-up puchho
             if (answer.length < 200 || answer.contains("NOT_FOUND")) {
                 try {
-                    engine.evalJs(
+                    engine.evalHelpJs(
                         AiModeOperator.askAnythingJs(
                             "Iske baare me step by step batao: $problem"
                         ), 10000
                     )
                     Thread.sleep(5000)
-                    val raw2 = engine.evalJs(
+                    val raw2 = engine.evalHelpJs(
                         AiModeOperator.readAiAnswerJs(), 15000)
                     val a2 = raw2.trim().trim('"').take(2000)
                     if (a2.length > answer.length) answer = a2
                 } catch (_: Exception) { }
             }
-            // 5. Wapas original page par jao
-            if (returnUrl.isNotEmpty()) {
-                try {
-                    engine.runAgentStep(org.json.JSONObject()
-                        .put("type", "goto")
-                        .put("url", returnUrl))
-                    Thread.sleep(2000)
-                } catch (_: Exception) { }
-            }
-            // 6. Samajh memory me rakho (trained)
+            // 4. Wapas jane ki zaroorat NAHI — kaam wala browser kabhi
+            //    chhoda hi nahi tha (v56).
+            // 5. Samajh memory me rakho (trained)
             if (answer.length >= 100) {
                 AiModeMemory.learn(ctx, problem, answer)
                 visionHistory.add(org.json.JSONObject()

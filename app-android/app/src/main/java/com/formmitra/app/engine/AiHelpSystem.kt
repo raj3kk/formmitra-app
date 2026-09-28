@@ -30,7 +30,15 @@ object AiHelpSystem {
     private const val TAG = "AiHelpSystem"
 
     /** Ek stuck point par max help cycles (loop-guard). */
-    private const val MAX_CYCLES = 3
+    private const val MAX_CYCLES = 2  // v56 FAST: 3→2 (polling se har
+    // cycle tez hai; zyada repeat = slow, fayda kam)
+
+    /**
+     * v56: kya abhi AI help chal rahi hai? (Live tab isse dekhkar AI Helper
+     * ka page overwrite nahi karta.)
+     */
+    @Volatile private var helping = false
+    fun isHelping(): Boolean = helping
 
     /** AI Mode URL. */
     private const val AI_MODE_URL = "https://www.google.com/search?udm=50&q="
@@ -39,7 +47,27 @@ object AiHelpSystem {
     private const val HELP_SEARCH = "https://www.google.com/search?q="
 
     /**
+     * v56 FAST: fixed sleep ki jagah POLLING. Condition jaldi true ho to
+     * turant return — 4s wait tabhi jab zaroori ho. User order: "turant".
+     * @return true agar timeout se pehle condition true hui
+     */
+    private fun pollHelp(
+        timeoutMs: Long,
+        check: () -> Boolean
+    ): Boolean {
+        val start = System.currentTimeMillis()
+        while (System.currentTimeMillis() - start < timeoutMs) {
+            try {
+                if (check()) return true
+            } catch (_: Exception) { }
+            try { Thread.sleep(400) } catch (_: Exception) { }
+        }
+        return try { check() } catch (_: Exception) { false }
+    }
+
+    /**
      * AI Mode khula hai ya nahi — nahi to kholo.
+     * v56 FAST: polling — page jaldi load ho to turant aage.
      * @return true = AI Mode ready
      */
     fun ensureAiMode(engine: FormEngine, query: String): Boolean {
@@ -55,16 +83,18 @@ object AiHelpSystem {
                 java.net.URLEncoder.encode(query, "UTF-8")
             Log.i(TAG, "AI Mode khol raha: ${query.take(50)}")
             if (!engine.loadHelpUrl(url)) return false
-            Thread.sleep(4000)
-            // Verify: AI Mode khula?
-            val after = engine.helpCurrentUrl()
-            if (after.contains("udm=50")) return true
+            // v56 FAST: poll karo — udm=50 aate hi turant return
+            if (pollHelp(8000) {
+                engine.helpCurrentUrl().contains("udm=50")
+            }) return true
             // Nahi khula to help search se try karo
             Log.i(TAG, "AI Mode direct nahi khula — help search se try")
             val helpUrl = HELP_SEARCH +
                 java.net.URLEncoder.encode("$query AI Mode", "UTF-8")
             if (!engine.loadHelpUrl(helpUrl)) return false
-            Thread.sleep(4000)
+            if (!pollHelp(6000) {
+                try { engine.helpCurrentUrl().isNotEmpty() } catch (_: Exception) { false }
+            }) return false
             // Help page se AI Mode tab par jao (JS se click)
             try {
                 engine.evalHelpJs(
@@ -79,9 +109,9 @@ object AiHelpSystem {
                         }
                         return "NOT_FOUND";
                     })()""", 10000)
-                Thread.sleep(3000)
             } catch (_: Exception) { }
-            engine.helpCurrentUrl().contains("udm=50")
+            // v56 FAST: click ke baad poll — udm=50 aate hi return
+            pollHelp(6000) { engine.helpCurrentUrl().contains("udm=50") }
         } catch (e: Exception) {
             Log.e(TAG, "ensureAiMode fail: ${(e.message ?: "").take(100)}")
             false
@@ -102,19 +132,37 @@ object AiHelpSystem {
             try {
                 engine.evalHelpJs(AiModeOperator.askAnythingJs(question), 15000)
             } catch (_: Exception) { }
-            Thread.sleep(5000)
-            // Jawab READ karo
-            val raw = try {
-                engine.evalHelpJs(AiModeOperator.readAiAnswerJs(), 15000)
-            } catch (_: Exception) { "null" }
-            val answer = raw.trim().trim('"')
-            if (answer.length >= 100 && !answer.contains("NOT_FOUND")) {
-                Log.i(TAG, "AI se jawab mila (${answer.length} chars)")
-                answer.take(3000)
+            // v56 HIJACK GUARD: jawab padhne se pehle verify karo — help
+            // browser abhi bhi AI Mode par hai? User ne beech me kahin aur
+            // navigate kar diya ho to galat page ka jawab NA padho.
+            val helpUrl = try { engine.helpCurrentUrl() } catch (_: Exception) { "" }
+            if (!helpUrl.contains("udm=50") && !helpUrl.contains("google.")) {
+                Log.w(TAG, "Hijack guard: help browser AI Mode par nahi " +
+                    "(${helpUrl.take(60)}) — dobara establish kar raha")
+                if (!ensureAiMode(engine, question)) return null
+                try {
+                    engine.evalHelpJs(AiModeOperator.askAnythingJs(question), 15000)
+                } catch (_: Exception) { }
+            }
+            // v56 FAST: jawab ka POLL — 100+ chars ka jawab aate hi turant
+            // return. Fixed 5s wait nahi. User order: "turant".
+            var answer: String? = null
+            pollHelp(12000) {
+                val raw = try {
+                    engine.evalHelpJs(AiModeOperator.readAiAnswerJs(), 10000)
+                } catch (_: Exception) { "null" }
+                val a = raw.trim().trim('"')
+                if (a.length >= 100 && !a.contains("NOT_FOUND")) {
+                    answer = a.take(3000)
+                    true
+                } else false
+            }
+            if (answer != null) {
+                Log.i(TAG, "AI se jawab mila (${answer!!.length} chars)")
             } else {
                 Log.w(TAG, "AI se kaam ka jawab nahi mila")
-                null
             }
+            answer
         } catch (e: Exception) {
             Log.e(TAG, "askAi fail: ${(e.message ?: "").take(100)}")
             null
@@ -140,8 +188,20 @@ object AiHelpSystem {
                 engine.uploadWorkScreenshotToAiMode(screenshotB64)
             } catch (_: Exception) { false }
             Log.i(TAG, "Screenshot upload: $uploaded")
-            Thread.sleep(3000)
+            // v56 FAST: upload process hone ka poll (fixed 3s nahi)
+            if (uploaded) {
+                pollHelp(4000) {
+                    try {
+                        val r = engine.evalHelpJs(
+                            "(document.body.innerText||'').length", 5000
+                        ).trim()
+                        (r.toLongOrNull() ?: 0) > 500
+                    } catch (_: Exception) { false }
+                }
+            }
             // 2. Sawal puchho (screenshot ke context ke saath)
+            // NOTE: askAi khud ensureAiMode karta hai — pehle se AI Mode
+            // par hain to turant return (dobara load nahi).
             val q = if (uploaded)
                 "$question\n\n(Upar jo screenshot upload kiya hai usme jo " +
                 "dikh raha hai, uske hisaab se step-by-step batao kya karu)"
@@ -176,7 +236,10 @@ object AiHelpSystem {
         val pageTitle: String = "",
         val attemptedAction: String = "",
         val failCount: Int = 0,
-        val recentAttempts: List<String> = emptyList()
+        val recentAttempts: List<String> = emptyList(),
+        // v56: user order — "kya kr diya h" bhi puchho. Ab tak jo
+        // successfully complete ho chuka hai (dobara karne ko na kahe).
+        val completedSoFar: List<String> = emptyList()
     )
 
     /**
@@ -202,6 +265,11 @@ object AiHelpSystem {
         if (s.recentAttempts.isNotEmpty()) {
             sb.append("Pehle ye try kar chuka hun (dobara mat batao):\n")
             s.recentAttempts.take(5).forEach { sb.append("- $it\n") }
+        }
+        // v56: "kya kr diya h" — jo complete ho gaya, dobara karne ko na kahe.
+        if (s.completedSoFar.isNotEmpty()) {
+            sb.append("Ab tak YE HO CHUKA HAI (dobara karne ko mat kaho):\n")
+            s.completedSoFar.take(8).forEach { sb.append("- $it\n") }
         }
         if (withScreenshot) {
             sb.append("\nUpar jo screenshot upload kiya hai, wo KAAM WALE " +
@@ -269,32 +337,22 @@ object AiHelpSystem {
                 success = true
             )
         }
-        // 1. GROQ — key hai to seedha puchho (fast, browser ka wait nahi)
-        // (User order: "groq uska v help le jb jaruri ho jha p lena chaiye")
-        // Jab agent atka ho aur samajh chahiye = jaruri jagah.
+        // v56 USER ORDER: "groq fallback me hona chahiye" — PRIMARY = AI Mode
+        // browser (user ka pasandeeda), GROQ = FALLBACK (jab AI Mode na ho).
+        // Order: Memory → AI Mode → Groq.
+        //
+        // 1. AI MODE BROWSER — PRIMARY. Bounded help cycles (screenshot ke
+        // saath). v56: helping flag — Live tab AI Helper ka page overwrite
+        // nahi karega.
+        helping = true
+        // Live activity: user dekhe agent AI Helper use kar raha hai.
         try {
-            // Page ka text context ke liye (screenshot Groq ko nahi jata —
-            // text API hai; situation + page text kaafi hai)
-            val pageText = try {
-                engine.evalJs(
-                    "document.body ? document.body.innerText.slice(0,1500) : ''",
-                    8000
-                )
-            } catch (_: Exception) { "" }
-            val groqAnswer = GroqHelp.askForHelp(ctx, situation, pageText)
-            if (groqAnswer != null && groqAnswer.length >= 50) {
-                Log.i(TAG, "Groq se samajh mila — memory me save kar raha")
-                AiModeMemory.learn(ctx, memKey, groqAnswer)
-                return HelpResult(
-                    understanding = groqAnswer,
-                    source = "groq",
-                    success = true
-                )
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Groq help fail: ${(e.message ?: "").take(80)}")
-        }
-        // 2-4. AI Mode browser — bounded help cycles (screenshot ke saath)
+            com.formmitra.app.agent.LiveActivity.emitStep(
+                "", "ai_help"
+            )
+        } catch (_: Exception) { }
+        var aiModeOk = false
+        try {
         for (cycle in 1..MAX_CYCLES) {
             Log.i(TAG, "Help cycle $cycle/$MAX_CYCLES: ${situation.problem}".take(80))
             try {
@@ -317,22 +375,52 @@ object AiHelpSystem {
                     return HelpResult(
                         understanding = answer,
                         source = "ai_mode",
-                        success = true
+                        success = true,
+                        aiModeAttempted = true
                     )
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Cycle $cycle fail: ${(e.message ?: "").take(80)}")
             }
-            // Cycle ke beech thoda rukho
-            if (cycle < MAX_CYCLES) {
-                try { Thread.sleep(2000) } catch (_: Exception) { }
+            // v56 FAST: cycle ke beech fixed 2s wait nahi — polling pehle
+            // se har step me hai. Turant agla cycle.
+        }
+        aiModeOk = true  // AI Mode try hua (jawab mila ya nahi)
+        } finally {
+            helping = false
+        }
+        // 2. GROQ — FALLBACK. Sirf jab AI Mode se jawab NA mila.
+        // (User order 2026-09-28: "groq ai jb na ho tb aye")
+        Log.i(TAG, "AI Mode se jawab nahi mila — Groq fallback try kar raha")
+        try {
+            // Page ka text context ke liye (screenshot Groq ko nahi jata —
+            // text API hai; situation + page text kaafi hai)
+            val pageText = try {
+                engine.evalJs(
+                    "document.body ? document.body.innerText.slice(0,1500) : ''",
+                    8000
+                )
+            } catch (_: Exception) { "" }
+            val groqAnswer = GroqHelp.askForHelp(ctx, situation, pageText)
+            if (groqAnswer != null && groqAnswer.length >= 50) {
+                Log.i(TAG, "Groq fallback se samajh mila — memory me save")
+                AiModeMemory.learn(ctx, memKey, groqAnswer)
+                return HelpResult(
+                    understanding = groqAnswer,
+                    source = "groq",
+                    success = true,
+                    aiModeAttempted = true
+                )
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Groq fallback fail: ${(e.message ?: "").take(80)}")
         }
         Log.w(TAG, "Help cycles khatm — samajh nahi mila")
         return HelpResult(
             understanding = "",
             source = "none",
-            success = false
+            success = false,
+            aiModeAttempted = true  // v56 FAST: caller dobara AI Mode na try kare
         )
     }
 
@@ -342,7 +430,10 @@ object AiHelpSystem {
     data class HelpResult(
         val understanding: String,
         val source: String,  // "memory" | "ai_mode" | "none"
-        val success: Boolean
+        val success: Boolean,
+        // v56 FAST: kya is cycle me AI Mode browser try hua? Agar haan to
+        // caller dobara AI Mode na try kare (redundant repeat = slow).
+        val aiModeAttempted: Boolean = false
     )
 
     /**
