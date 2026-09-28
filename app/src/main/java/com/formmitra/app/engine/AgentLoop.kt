@@ -65,6 +65,77 @@ object CaptchaConsent {
 @Suppress("UNCHECKED_CAST")
 object AgentLoop {
 
+    /**
+     * v59 SMART COMPLETION — user order: "task complete ho to bache hue
+     * steps mat karo, turant ruko aur user ko screenshot ke saath batao".
+     *
+     * Har successful step ke baad page dekho — agar goal poora dikh raha
+     * hai (success message, confirmation, thank-you page, etc.) to
+     * completion summary return karo (null = abhi poora nahi).
+     *
+     * Ye server ke "done" ka intezaar nahi karta — agent khud smartly
+     * decide karta hai.
+     */
+    private fun checkSmartCompletion(
+        goal: String,
+        engine: FormEngine,
+        stepIdx: Int
+    ): String? {
+        try {
+            // Pehle 3 steps me check mat karo (shuruaat me false positive)
+            if (stepIdx < 3) return null
+            val snap = try { engine.domSnapshot() } catch (_: Exception) { return null }
+            val title = snap.optString("title", "").lowercase()
+            val text = snap.optString("page_text", "").lowercase()
+            val url = snap.optString("url", "").lowercase()
+            val combined = "$title $text".take(5000)
+
+            // Completion signals — goal type ke hisaab se
+            val goalLower = goal.lowercase()
+
+            // 1. Form submission success
+            val formSuccess = listOf(
+                "successfully submitted", "form submitted", "application submitted",
+                "successfully registered", "registration successful",
+                "thank you for", "धन्यवाद", "सफलतापूर्वक",
+                "application successful", "submitted successfully"
+            )
+            // 2. Payment/booking confirmation
+            val bookingSuccess = listOf(
+                "booking confirmed", "booking successful", "payment successful",
+                "order placed", "order confirmed", "ticket booked",
+                "confirmation number", "booking id", "pnr"
+            )
+            // 3. Download/document ready
+            val docSuccess = listOf(
+                "download ready", "document ready", "certificate ready",
+                "admit card", "download your"
+            )
+
+            val allSignals = formSuccess + bookingSuccess + docSuccess
+            for (signal in allSignals) {
+                if (combined.contains(signal)) {
+                    // Goal se match karo — sirf relevant signal par done
+                    val signalWords = signal.split(" ")
+                    val goalWords = goalLower.split(" ").filter { it.length > 3 }
+                    val relevant = signalWords.any { sw ->
+                        goalWords.any { gw -> gw.contains(sw) || sw.contains(gw) }
+                    } || goalLower.contains("form") || goalLower.contains("apply") ||
+                        goalLower.contains("register") || goalLower.contains("book")
+                    if (relevant) {
+                        return "Ho gaya ✅ — $signal (page par confirm dikha, bache steps skip kiye)"
+                    }
+                }
+            }
+            // 4. URL me success indicators
+            if (url.contains("success") || url.contains("confirmation") ||
+                url.contains("thank") || url.contains("complete")) {
+                return "Ho gaya ✅ — confirmation page khul gaya (bache steps skip kiye)"
+            }
+        } catch (_: Exception) { }
+        return null
+    }
+
     fun runAgentTask(
         ctx: Context,
         engine: FormEngine,
@@ -107,7 +178,12 @@ object AgentLoop {
          * plan ka Hinglish summary — UI ise user ko dikhaye (notification /
          * chat). Plan banta hai to call hota hai, nahi to nahi.
          */
-        onPlan: (String) -> Unit = {}
+        onPlan: (String) -> Unit = {},
+        /**
+         * v58 SAME-RUN: OTP park se resume ho raha ho to purana server run ID
+         * — naya server run NA banao, isi ko continue karo.
+         */
+        resumeAgentRunId: String = ""
     ): FormEngine.RunResult {
         val stepsLog = JSONArray()
         val history = ArrayList<JSONObject>()
@@ -190,7 +266,15 @@ object AgentLoop {
         // (site-memory block neeche hai — local funs ke baad)
         // Server-side run record (best-effort — fail ho to bina reporting chalao)
         var agentRunId: String? = null
-        try { agentRunId = RunReporter.createRun(ctx, goal, startUrl, effectiveRunId) } catch (_: Exception) { }
+        try {
+            // v58 SAME-RUN: resume par purana server run continue karo,
+            // naya mat banao (nahi to server par duplicate run dikhega).
+            agentRunId = if (resumeAgentRunId.isNotEmpty()) {
+                resumeAgentRunId
+            } else {
+                RunReporter.createRun(ctx, goal, startUrl, effectiveRunId)
+            }
+        } catch (_: Exception) { }
         // (v37 AI MIND memory read — local funs ke BAAD, finish() se pehle)
 
         fun logStep(i: Int, action: String, ok: Boolean, detail: String) {
@@ -1011,9 +1095,25 @@ object AgentLoop {
             var lastGoodUrl = startUrl
             var lastActionWasNav = false
             val captchaAttempts = intArrayOf(0)
-            // G2 resume: startStep steps pehle ho chuke — (startStep + 1) se continue.
-            for (i in (stepsTaken + 1)..maxSteps) {
+            // v56 NEVER-STOP: user order "kaam kabhi band nahi hona chahiye".
+            // Outer labeled loop: inner while khatm hone par agar progress
+            // ho rahi hai to limit extend karke DOBARA chalao.
+            var effectiveMaxSteps = maxSteps
+            var i = stepsTaken + 1
+            // v58: LOOP GUARD — i++ bypass karne wale `continue` (wrong-page
+            // recovery, browser recovery) ek hi step par 3 se zyada baar na
+            // chalen — nahi to infinite loop.
+            var guardStep = -1
+            var guardCount = 0
+            outerLoop@ while (true) {
+            while (i <= effectiveMaxSteps) {
                 onProgress(i)
+
+                // v58: ADMIN TAKEOVER — admin work browser chala raha ho to
+                // agent RUKTA hai (ladta nahi). Admin release kare (ya 30s
+                // idle) to wapas kaam shuru. Conflict/misunderstanding ka
+                // root solution.
+                AdminTakeover.waitIfDriving(work = true, tag = "step $i")
 
                 // (a)+(c) PARALLEL: DOM snapshot + screenshot ek saath
                 // (screenshot har 3rd step pe + mirror file UI agent ke liye)
@@ -1063,10 +1163,79 @@ object AgentLoop {
                         engine.goBack()
                         Thread.sleep(2000)
                         currentUrl = lastGoodUrl
+                        // v58 LOOP GUARD: ek hi step par 3 se zyada retry nahi
+                        if (guardStep == i) guardCount++ else { guardStep = i; guardCount = 1 }
+                        if (guardCount > 3) {
+                            logStep(i, "wrong_page_recovery", false,
+                                "3 baar back karke bhi galat page — agle step par")
+                            guardStep = -1; guardCount = 0
+                            i++
+                        }
                         continue
                     } catch (_: Exception) { }
                 }
                 currentUrl = url
+
+                // v56 BROWSER HEALTH — user order: "browser atak gaya band ho
+                // gaya to agent smartly handle kare, kaam kabhi band nahi".
+                // Agar snapshot khaali hai (browser dead/unresponsive) to
+                // smart recovery: reload → last-good URL → continue. Kabhi
+                // rukna nahi.
+                val snapEmpty = snap.length() == 0
+                if (snapEmpty || interactiveCount == 0) {
+                    val alive = try {
+                        engine.evalJs("document.readyState", 5000)
+                            .contains("complete", ignoreCase = true) ||
+                        engine.evalJs("document.readyState", 5000)
+                            .contains("interactive", ignoreCase = true) ||
+                        engine.evalJs("1+1", 5000).trim() == "2"
+                    } catch (_: Exception) { false }
+                    if (!alive) {
+                        logStep(i, "browser_recovery", false,
+                            "Browser jawab nahi de raha — smart recovery")
+                        var recovered = false
+                        // 1. Reload try karo
+                        try {
+                            engine.evalJs("location.reload()", 3000)
+                            Thread.sleep(3000)
+                            val after = engine.evalJs("1+1", 8000).trim()
+                            if (after == "2") recovered = true
+                        } catch (_: Exception) { }
+                        // 2. Reload na ho to last-good URL par wapas jao
+                        if (!recovered && lastGoodUrl.isNotEmpty()) {
+                            try {
+                                logStep(i, "browser_recovery", false,
+                                    "Reload fail — last-good page par wapas: " +
+                                    lastGoodUrl.take(60))
+                                engine.opGoto(lastGoodUrl)
+                                Thread.sleep(4000)
+                                val after = engine.evalJs("1+1", 8000).trim()
+                                if (after == "2") recovered = true
+                            } catch (_: Exception) { }
+                        }
+                        if (recovered) {
+                            logStep(i, "browser_recovery", true,
+                                "Browser wapas zinda — kaam jaari")
+                            // v58 LOOP GUARD: ek hi step par 3 se zyada retry nahi
+                            if (guardStep == i) guardCount++ else { guardStep = i; guardCount = 1 }
+                            if (guardCount > 3) {
+                                logStep(i, "browser_recovery", false,
+                                    "3 baar recover karke bhi step atka — agle step par")
+                                guardStep = -1; guardCount = 0
+                                i++
+                            }
+                            continue  // turant agla step, ruke nahi
+                        } else {
+                            logStep(i, "browser_recovery", false,
+                                "Browser recover nahi hua — phir bhi koshish jaari")
+                            // Rukna nahi — brain ko batate hain, wo decide karega
+                            history.add(JSONObject()
+                                .put("type", "browser_recovery_failed")
+                                .put("note", "Browser jawab nahi de raha, " +
+                                    "reload bhi fail. Alternative tareeka socho."))
+                        }
+                    }
+                }
 
                 // (b) CAPTCHA safety net (v14 full protocol: max 3 attempts)
                 val capNote = handleCaptcha(ctx, engine, url, snap, captchaAttempts)
@@ -1329,7 +1498,8 @@ object AgentLoop {
                             // (non-blocking — queue aage badhegi, jawab par auto-resume).
                             val pr = handleServerPrompt(
                                 ctx, engine, promptObj,
-                                runIdNow, userProvided, sensitiveKeys, history
+                                runIdNow, userProvided, sensitiveKeys, history,
+                                resumeAgentRunId
                             )
                             // v37: user gate (otp/login/payment/device_auth/
                             // destructive) memory me (gates) — kya manga gaya.
@@ -1994,6 +2164,7 @@ object AgentLoop {
                             // problem puchho, jawab samjho, trained ho.
                             // (Vision AI se na ho to ye try karo)
                             var aiHelpSolved = false
+                            var aiModeWasAttempted = false  // v56: scope ke bahar chahiye
                             if (!visionSolved) {
                                 // v54: SMART SITUATION — agent khud full detail
                                 // bhejta hai: link + page + kya kar raha tha +
@@ -2052,15 +2223,24 @@ object AgentLoop {
                                             helpResult.understanding.take(500)))
                                     aiHelpSolved = true
                                 }
+                                aiModeWasAttempted = helpResult.aiModeAttempted
                             }
                             // v52: AI MODE STRATEGY (fallback — purana tareeka)
+                            // v56 FAST: helpCycle me AI Mode pehle hi try ho
+                            // chuka hai (aiModeAttempted) to dobara SAME cheez
+                            // repeat mat karo — turant aage badho. User order:
+                            // "turant... turant aage badhaye kaam ko".
                             var aiModeSolved = false
-                            if (!visionSolved && !aiHelpSolved) {
+                            if (!visionSolved && !aiHelpSolved &&
+                                !aiModeWasAttempted) {
                                 val problemDesc = "step '$action' fail ho raha hai"
                                 aiModeSolved = tryAiModeStrategy(
                                     ctx, engine, goal, problemDesc,
                                     currentUrl, history
                                 )
+                            } else if (!visionSolved && !aiHelpSolved) {
+                                android.util.Log.i("AgentLoop", "AI Mode pehle hi try ho chuka — " +
+                                    "redundant retry skip, turant aage")
                             }
                             // Vision/AI-Help results ko main history me milao
                             // (brain dekhega)
@@ -2095,7 +2275,47 @@ object AgentLoop {
                         )
                     }
                 }
+                // v59 SMART COMPLETION (user order): task poora ho gaya ho
+                // to bache hue steps mat karo — turant ruko, screenshot lo,
+                // user ko chat me batao. Server ke "done" ka intezaar mat karo.
+                try {
+                    val smartDone = checkSmartCompletion(goal, engine, i)
+                    if (smartDone != null) {
+                        logStep(i, "smart_complete", true,
+                            "Task poora dikh raha hai — bache steps skip, user ko bata rahe")
+                        // Screenshot lo (chat notification ke liye)
+                        try {
+                            val shot = engine.capturePngBase64()
+                            if (shot.isNotEmpty()) {
+                                mirrorShot()
+                                try { onProof() } catch (_: Exception) { }
+                            }
+                        } catch (_: Exception) { }
+                        return finish("done", smartDone)
+                    }
+                } catch (_: Exception) { }
+                i++  // v56: while loop me manual increment
+            }  // while (i <= effectiveMaxSteps)
+            // v56 NEVER-STOP: user order "kaam kabhi band nahi hona chahiye".
+            // Loop khatm hua (i > effectiveMaxSteps). Agar PROGRESS ho rahi
+            // hai (stuck nahi) to limit extend karke DOBARA loop chalao —
+            // rukna nahi. Sirf sach me phasne par needs_user.
+            val makingProgress = try {
+                val recent = history.takeLast(10)
+                var successCount = 0
+                for (h in recent) {
+                    val t = h.optString("type", "")
+                    if (t == "action_success" || t == "step_ok") successCount++
+                }
+                successCount >= 2 && stuckCount < 3
+            } catch (_: Exception) { false }
+            if (makingProgress && effectiveMaxSteps < 120) {
+                effectiveMaxSteps += 20
+                android.util.Log.i("AgentLoop", "Progress ho rahi hai — limit $effectiveMaxSteps tak extend, rukna nahi")
+                continue@outerLoop  // v56: dobara inner while chalao
             }
+            break@outerLoop  // v56: sach me phas gaye ya limit max — bahar niklo
+            }  // outerLoop
             return finish(
                 "needs_user",
                 "$maxSteps steps ho gaye, kaam poora nahi hua — aap dekh lein"
@@ -2293,7 +2513,8 @@ object AgentLoop {
         runId: String,
         userProvided: JSONObject,
         sensitiveKeys: MutableSet<String>,
-        history: ArrayList<JSONObject>
+        history: ArrayList<JSONObject>,
+        resumeAgentRunId: String? = null
     ): Int {
         // CONTRACT SYNC (2026-09-26): kind canonicalize — server "choice"
         // ko "option_choice" bhejta hai; purana "choice" bhi accept.
@@ -2411,7 +2632,7 @@ object AgentLoop {
                     userProvided, sensitiveKeys, history, site
                 )
             }
-            OtpPark.park(ctx, runId, site, 0)
+            OtpPark.park(ctx, runId, site, 0, resumeAgentRunId ?: "")
             UserPrompt.raiseOnly(askReq)
             history.add(
                 JSONObject().put("action", "otp_parked").put("result", "parked")
@@ -3524,7 +3745,11 @@ object AgentLoop {
             message = "Pichla OTP galat tha ya expire ho gaya — naya OTP do.\n" +
                 "Site: $site"
         )
-        OtpPark.park(ctx, runId, site, retry + 1)
+        OtpPark.park(
+            ctx, runId, site, retry + 1,
+            // v58: pehle park me stored agentRunId preserve karo (same-run)
+            OtpPark.parkedAgentRunId(ctx)
+        )
         UserPrompt.raiseOnly(again)
         history.add(
             JSONObject().put("action", "otp_reask").put("result", "parked")
@@ -3954,11 +4179,13 @@ object AgentLoop {
             }
         }
         return if (attempts[0] >= 3) {
-            "CAPTCHA 3 baar try kiya ($kind), solve nahi hua — aap khud solve " +
-                "karke task dobara chalayein"
+            // v58: RESUME (restart nahi) — user Live me captcha solve kare,
+            // agent usi step se aage badhega. Task dobara chalane ki zaroorat nahi.
+            "CAPTCHA 3 baar try kiya ($kind), solve nahi hua — Live browser me " +
+                "aap khud solve kar dijiye, agent usi jagah se aage badhega"
         } else {
-            "CAPTCHA solve karne me baar-baar dikkat aayi (network/AI) — aap khud " +
-                "solve karke task dobara chalayein"
+            "CAPTCHA solve karne me baar-baar dikkat aayi (network/AI) — Live " +
+                "browser me aap khud solve kar dijiye, agent usi jagah se aage badhega"
         }
     }
 

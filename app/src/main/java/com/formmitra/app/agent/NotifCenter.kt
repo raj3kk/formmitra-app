@@ -93,6 +93,13 @@ object NotifCenter {
      *            notification update hoti hai, nayi nahi banti.
      * @return notification id (0 = category OFF thi, kuch nahi dikhaya).
      */
+    // v59: SPAM FILTER (user order: "kaam ka notification aaye sirf").
+    // STATUS category ke repetitive notifications ko throttle karo —
+    // same key 5 min me dobara aaye to skip. TASK/DETAIL/DOC/APPROVAL
+    // (kaam ke) hamesha aayenge.
+    private val lastSpamCheck = mutableMapOf<String, Long>()
+    private const val SPAM_WINDOW_MS = 5 * 60 * 1000L
+
     fun notify(
         ctx: Context,
         cat: Cat,
@@ -105,6 +112,19 @@ object NotifCenter {
         deepUrl: String = ""
     ): Int {
         try {
+            // v59 SPAM FILTER: STATUS (low-value) ko throttle karo
+            if (cat == Cat.STATUS) {
+                val spamKey = if (key.isNotEmpty()) key else "$title|$body"
+                val now = System.currentTimeMillis()
+                val last = synchronized(lastSpamCheck) {
+                    lastSpamCheck[spamKey] ?: 0L
+                }
+                if (now - last < SPAM_WINDOW_MS) {
+                    Log.i(TAG, "STATUS spam throttle — skip: ${title.take(40)}")
+                    return 0
+                }
+                synchronized(lastSpamCheck) { lastSpamCheck[spamKey] = now }
+            }
             if (!NotifSettings.isEnabled(ctx, cat)) {
                 Log.i(TAG, "category ${cat.name} OFF — notification skip")
                 return 0

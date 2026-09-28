@@ -108,6 +108,18 @@ class FormRunService : Service() {
         }
 
         /**
+         * v50: Service poori tarah roko — delete / naya kaam par.
+         */
+        fun stopService(ctx: Context) {
+            try {
+                // Active task ka flag saaf — loop agle check par rukega.
+                try { activeTaskId = null } catch (_: Exception) { }
+                // Phir service stop (onDestroy me cleanup hoga).
+                ctx.stopService(Intent(ctx, FormRunService::class.java))
+            } catch (_: Exception) { }
+        }
+
+        /**
          * v36 (point 10): [Band karo] — active run band karne ki request.
          * Notification action se aata hai.
          */
@@ -189,6 +201,21 @@ class FormRunService : Service() {
             val (entry, rest) = WorkQueue.dequeue(queueSnapshot(ctx))
             if (entry != null) persistQueue(ctx, rest)
             return entry
+        }
+
+        /**
+         * v46 (A1 root fix): bahar se queue kick — operator session khatm hone
+         * par ruka hua form task shuru ho. Sirf tab jab koi claim active nahi
+         * aur operator bhi active nahi (nahi to wahi collision dobara).
+         */
+        fun kickQueue(ctx: Context) {
+            try {
+                if (com.formmitra.app.engine.OperatorSession.isActive) return
+                synchronized(activeLock) {
+                    if (activeTaskId != null) return
+                }
+                pumpQueue(ctx)
+            } catch (_: Exception) { }
         }
 
         /**
@@ -320,10 +347,12 @@ class FormRunService : Service() {
                 getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             val dekh = PendingIntent.getActivity(
                 this, 9101,
-                // v42: "Chal raha kaam dekho" → seedha LIVE view (OperatorView).
-                // Pehle MainActivity khulta tha — user kaam wali jagah nahi pahunch pata tha.
-                Intent(this, com.formmitra.app.agent.OperatorView::class.java).apply {
+                // v58: "Chal raha kaam dekho" → MainActivity ka LIVE tab.
+                // OperatorView seedha kholne se shared WebView steal hota tha
+                // (reparent) — ab Live tab hi browsers ka ghar hai.
+                Intent(this, com.formmitra.app.MainActivity::class.java).apply {
                     flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    putExtra("open_tab", "/live")
                 },
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
@@ -456,6 +485,29 @@ class FormRunService : Service() {
             FlowAnnouncer.say(this, "Form bharna shuru ho gaya: $name")
         } catch (_: Exception) { }
 
+        // v46 (A1 root fix): Operator session active ho to uska shared WebView
+        // mat chheeno — task line me lagao, operator chalta rahega. (Pehle form
+        // run operator ka WebView hijack kar leta tha — dono ek saath toot te the.
+        // OperatorSession.start me reverse guard pehle se hai.)
+        if (com.formmitra.app.engine.OperatorSession.isActive) {
+            val opClaimId = task.optString("run_id").ifEmpty { task.optString("id") }
+            val pos = try {
+                enqueueTask(this, task)
+            } catch (_: Exception) { queueSize(this) + 1 }
+            try {
+                android.util.Log.i(
+                    "FormRunService",
+                    "operator active — task queued at #$pos (run=$opClaimId)"
+                )
+            } catch (_: Exception) { }
+            notifySimple(
+                NOTIF_ID + 20,
+                "Line me lagaya \uD83D\uDCCB $name",
+                "Operator chal raha hai — khatam hote hi apne aap shuru hoga."
+            )
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         // POINT 28: doosra kaam pehle ko MAARTA nahi — line me lagta hai.
         // Pehla khatam hote hi agla apne aap shuru hoga. Har kaam ki
         // alag history entry barkarar (run_id alag-alag).
@@ -491,6 +543,19 @@ class FormRunService : Service() {
                         "FormRunService",
                         "1-active limit: fresh start rejected (active=$activeTaskId)"
                     )
+                } catch (_: Exception) { }
+                // v46 (A2 root fix): server-claimed task local reject par wapas
+                // queued karo (10-min cooldown) — nahi to server par in_progress
+                // me phansa rehta (lost task) aur har poll par reject-loop chalta.
+                try {
+                    val rejId = claimId
+                    Thread({
+                        try {
+                            com.formmitra.app.engine.FormApi.unclaimTask(
+                                this, rejId, "1-active limit (non-owner reject)"
+                            )
+                        } catch (_: Exception) { }
+                    }, "fm-unclaim").apply { isDaemon = true }.start()
                 } catch (_: Exception) { }
                 notifyOneActiveLimit(name)
                 stopSelf(startId)
@@ -578,7 +643,11 @@ class FormRunService : Service() {
             watchdogHandler.postDelayed(watchdog, 60_000L)
         } catch (_: Exception) { }
 
-        return START_NOT_STICKY
+        // v59 BACKGROUND FIX (user order): "app background me na chale to
+        // notification nahi ata". Task chal raha ho to service STICKY —
+        // system kill kare to restart ho, kaam na ruke. Task khatm hone
+        // par stopSelf() khud band kar dega.
+        return START_STICKY
     }
 
     private fun runTask(task: JSONObject, name: String) {
@@ -603,6 +672,11 @@ class FormRunService : Service() {
             } catch (_: Exception) { }
             return
         }
+        // v49: retry ke liye goal/URL save — atke hue kaam ka "Dobara try
+        // karo" button isi se kaam karega.
+        try {
+            RunGoalStore.save(this, runId, idemGoal, idemUrl)
+        } catch (_: Exception) { }
         var lastReported = 0
         // POINT 17/21: is run ki category (handoff + summary ke liye).
         val firstStepForCat = stepsJson.optJSONObject(0)
@@ -730,6 +804,10 @@ class FormRunService : Service() {
                     startStep = startStep,
                     knownDetails = knownDetails,
                     askedAlready = askedAlready,
+                    // v58 SAME-RUN: resume task me agent_run_id ho to purana
+                    // server run continue karo (naya mat banao).
+                    resumeAgentRunId = firstStep.optString("agent_run_id", "")
+                        .ifEmpty { task.optString("agent_run_id", "") },
                     // POINT 21: proof screenshots gino (summary card).
                     onProof = { proofShots++ },
                     // v36 SMART COORDINATION: pre-flight plan bana → user ko
@@ -843,7 +921,8 @@ class FormRunService : Service() {
             )
             "needs_admin" -> notifyEvent(
                 NotifCenter.Cat.TASK, "Dhyaan chahiye: $name",
-                "Captcha aaya hai — aapko dekhna hoga.", runId, runKey
+                "Captcha solve nahi ho paya — Live me aap solve kar dijiye, " +
+                    "agent wahin se aage badhega.", runId, runKey
             )
             "needs_user" -> notifyEvent(
                 NotifCenter.Cat.DETAIL, "Ek detail chahiye ✋ $name",
@@ -945,12 +1024,13 @@ class FormRunService : Service() {
         }
     }
 
-    /** v42: notification tap → LIVE view (OperatorView), taaki user seedha
-     * wahan pahunche jahan kaam ho raha hai. Pehle MainActivity khulta tha —
-     * user "kaam chalu hai" dekhkar tap karta tha par live page nahi dikhta tha. */
+    /** v58: notification tap → MainActivity LIVE tab (/live), taaki user seedha
+     * wahan pahunche jahan kaam ho raha hai. OperatorView seedha kholne se
+     * shared WebView steal/reparent hota tha — ab Live tab hi ghar hai. */
     private fun tapIntent(): PendingIntent {
-        val i = Intent(this, com.formmitra.app.agent.OperatorView::class.java).apply {
+        val i = Intent(this, com.formmitra.app.MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("open_tab", "/live")
         }
         return PendingIntent.getActivity(
             this, 4200, i,

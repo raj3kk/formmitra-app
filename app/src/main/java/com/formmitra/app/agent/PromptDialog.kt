@@ -65,6 +65,13 @@ object PromptDialog {
     fun dismiss() { showingFor = "" }
 
     fun show(activity: Activity, req: UserPrompt.Request) {
+        // v59 OTP-ONLY POPUP (user order): "Popup sirf OTP ke liye".
+        // Baaki sab (input/choice/login/document/payment/device_auth) —
+        // popup MAT dikhao, chat me handle hoga. false = popup nahi dikhaya.
+        if (req.kind != "otp") {
+            android.util.Log.i("FmPrompt", "Non-OTP prompt (${req.kind}) — popup skip, chat me jayega")
+            return
+        }
         if (showingFor == req.runId) return
         showingFor = req.runId
         // v36 — LIVE ACTIVITY INDICATOR (user order 2026-09-26): gate khulne
@@ -518,6 +525,8 @@ object PromptDialog {
                 textSize = 16f
                 // L1-UPGRADE: pata values pre-filled — sirf khaali bharega user
                 req.prefill[f.key]?.let { if (it.isNotEmpty()) setText(it) }
+                // v50: card se auto-fill — Field.prefill me value ho to dikhao.
+                if (text.isEmpty() && f.prefill.isNotEmpty()) setText(f.prefill)
                 layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
                 inputType = when (f.type) {
                     "otp", "number", "phone" -> InputType.TYPE_CLASS_NUMBER
@@ -604,6 +613,15 @@ object PromptDialog {
                 } catch (_: Exception) { }
             }
             dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                // v49 ROOT FIX: submit se pehle check — kya ye sawal abhi
+                // bhi current hai? Purana dialog ho to jawab QUEUE me jayega
+                // (UserPrompt.answer kabhi drop nahi karta), lekin user ko
+                // batao taaki confusion na ho.
+                val stale = try {
+                    !com.formmitra.app.engine.UserPrompt.isCurrent(
+                        req.runId, req.id
+                    )
+                } catch (_: Exception) { false }
                 val map = mutableMapOf<String, Any?>("approved" to true)
                 edits.forEach { (k, et) -> map[k] = et.text.toString().trim() }
                 if (isOtpPrompt) SmsOtpConsent.stop()
@@ -627,6 +645,13 @@ object PromptDialog {
                     closeDetailGate("answered", GateAudit.BY_USER)
                 }
                 answer(activity, req, map)
+                if (stale) {
+                    toast(
+                        activity,
+                        "⚠️ Ye purana sawal tha — jawab surakshit hai, " +
+                            "naya sawal khul raha ho to wahan dobara na bharein"
+                    )
+                }
                 dlg.dismiss()
             }
             dlg.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {

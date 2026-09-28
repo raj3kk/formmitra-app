@@ -84,6 +84,33 @@ class FormEngine(private val appContext: Context) {
     }
 
     /**
+     * v58 NPE FIX (crash 2026-09-28 12:21 — FormEngine.navigate me
+     * `webView!!` par NullPointerException, app CRASH):
+     *
+     * ROOT CAUSE: stop() beech me `webView = null` / `handler = null` kar
+     * deta hai. navigate() ka runnable pehle se handler queue me tha —
+     * stop() ne field null kiya, phir onMain me `webView!!` → NPE → crash.
+     *
+     * RULE: handler/webView par kabhi `!!` mat lagao. Hamesha:
+     *   1. local me SNAPSHOT lo (val wv = webView) — snapshot ke baad
+     *      stop() field null kare to bhi hamara reference zinda hai.
+     *   2. null check → graceful skip (crash nahi).
+     *   3. postEngine() ka return check karo — false = handler dead.
+     *
+     * NOTE: HandlerThread.quitSafely() queued runnable ko chalne deta hai,
+     * isliye post()==true ka matlab runnable ZAROOR chalega (hang nahi).
+     * post()==false tabhi jab looper quit ho chuka — caller turant skip kare.
+     */
+    private fun postEngine(action: () -> Unit): Boolean {
+        val h = handler ?: return false
+        return try {
+            h.post(action)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
      * v33 FIX (root cause: WebView background thread par bana tha →
      * IllegalStateException). Android ka niyam: WebView ki CREATION aur
      * uske saare View-method calls (loadUrl, evaluateJavascript, measure,
@@ -1043,19 +1070,29 @@ class FormEngine(private val appContext: Context) {
 
     private fun evalJsSync(js: String, timeoutMs: Long = 30_000): String {        val latch = CountDownLatch(1)
         var out = "null"
-        handler!!.post {
-            try {
-                // v33: evaluateJavascript UI thread mangta hai. Callback
-                // (v -> ...) khud main thread par aata hai — sirf latch
-                // countDown karta hai, block nahi, isliye deadlock nahi.
-                val wv = onMain { webView!! }
-                onMain {
-                    wv.evaluateJavascript(js) { v ->
-                        out = v ?: "null"
-                        latch.countDown()
+        // v58 NPE FIX: webView ka snapshot — stop() race me field null kar
+        // sakta hai; !! lagane par app CRASH hota tha.
+        val wv = webView
+        var posted = false
+        if (wv != null) {
+            posted = postEngine {
+                try {
+                    // v33: evaluateJavascript UI thread mangta hai. Callback
+                    // (v -> ...) khud main thread par aata hai — sirf latch
+                    // countDown karta hai, block nahi, isliye deadlock nahi.
+                    onMain {
+                        wv.evaluateJavascript(js) { v ->
+                            out = v ?: "null"
+                            latch.countDown()
+                        }
                     }
-                }
-            } catch (_: Exception) { latch.countDown() }
+                } catch (_: Exception) { latch.countDown() }
+            }
+        }
+        if (!posted) {
+            // Engine stopped/dead — graceful "null" (caller handle karega).
+            latch.countDown()
+            return out
         }
         latch.await(timeoutMs, TimeUnit.MILLISECONDS)
         return out
@@ -1235,6 +1272,37 @@ class FormEngine(private val appContext: Context) {
     }
 
     /**
+     * v58 SMART-FIND: website ka layout badal jaye to automation NA toote.
+     *
+     * Primary selector (mode+value) pehle try hota hai. Na mile to
+     * automatically fallback: element ka text → label → placeholder.
+     * JS me `||` short-circuit se — pehla jo mile wahi return.
+     *
+     * Yehi "smartly handle" hai: selector purana ho gaya ho to bhi
+     * agent text/label se element dhoondh kar kaam jaari rakhta hai.
+     */
+    private fun smartFinderJs(s: StepSpec): String {
+        val parts = mutableListOf<String>()
+        if (s.selectorValue.isNotEmpty()) {
+            parts.add(finderJs(s.selectorMode, s.selectorValue))
+        }
+        // Fallback 1: element ka visible text
+        if (s.text.isNotEmpty() && parts.none { it.contains(JSONObject.quote(s.text)) }) {
+            parts.add(finderJs("text", s.text))
+        }
+        // Fallback 2: label
+        if (s.label.isNotEmpty() && s.label != s.text &&
+            parts.none { it.contains(JSONObject.quote(s.label)) }
+        ) {
+            parts.add(finderJs("text", s.label))
+        }
+        if (parts.isEmpty()) return finderJs(s.selectorMode, s.selectorValue)
+        if (parts.size == 1) return parts[0]
+        // Pehla jo mile — baaki try hi nahi honge (short-circuit)
+        return "(function(){ return (${parts.joinToString(") || (")}); })()"
+    }
+
+    /**
      * v24-refine (AI-training): AI ke diye selector ka target page par abhi
      * zinda hai ya nahi — execute se pehle LOCAL sanity (koi AI call nahi,
      * quota bachat). Wahi finderJs jo execute use karta hai (shadow DOM +
@@ -1254,31 +1322,66 @@ class FormEngine(private val appContext: Context) {
         }
     }
 
+    /**
+     * v58 SMART: StepSpec ke liye alive check — primary ya fallback
+     * (text/label) me se koi bhi mile to alive. Layout badalne par
+     * bhi pattern ko "mara hua" na samjho jab tak text/label se mil raha ho.
+     */
+    fun selectorAliveSmart(s: StepSpec): Boolean {
+        return try {
+            evalJsSync("!!(${smartFinderJs(s)})", 8_000).trim() == "true"
+        } catch (_: Exception) {
+            true
+        }
+    }
+
     // ---------------- navigation / primitives ----------------
 
     private fun navigate(url: String) {
         val latch = CountDownLatch(1)
-        handler!!.post {
-            // v33: webViewClient + loadUrl UI thread par.
-            onMain {
-                val wv = webView!!
-                // v38: host ka client extend karo — renderer-crash handling
-                // per-navigation replace par bhi na khoye.
-                wv.webViewClient = object : LiveWebViewHost.HostWebViewClient() {
-                    override fun onPageFinished(view: WebView?, u: String?) {
-                        latch.countDown()
-                    }
+        // v58 NPE FIX (crash 2026-09-28 12:21): webView ka SNAPSHOT lo.
+        // stop() beech me field ko null kar deta hai (race) — `webView!!`
+        // par app CRASH hota tha. Snapshot ke baad field null ho to bhi
+        // hamara local reference zinda rehta hai.
+        val wv = webView
+        var posted = false
+        if (wv != null) {
+            posted = postEngine {
+                try {
+                    // v33: webViewClient + loadUrl UI thread par.
+                    onMain {
+                        // v38: host ka client extend karo — renderer-crash handling
+                        // per-navigation replace par bhi na khoye.
+                        wv.webViewClient = object : LiveWebViewHost.HostWebViewClient() {
+                            override fun onPageFinished(view: WebView?, u: String?) {
+                                latch.countDown()
+                            }
 
-                    override fun onReceivedError(
-                        view: WebView?,
-                        request: android.webkit.WebResourceRequest?,
-                        error: android.webkit.WebResourceError?
-                    ) {
-                        if (request?.isForMainFrame == true) latch.countDown()
+                            override fun onReceivedError(
+                            view: WebView?,
+                            request: android.webkit.WebResourceRequest?,
+                            error: android.webkit.WebResourceError?
+                        ) {
+                            if (request?.isForMainFrame == true) latch.countDown()
+                        }
                     }
+                    }
+                    wv.loadUrl(url)
+                } catch (t: Throwable) {
+                    // v58: loadUrl/webViewClient me kuch bhi phate — latch khol
+                    // do taaki caller 45s tak na atke; step fail hoga, crash nahi.
+                    android.util.Log.w("FormEngine",
+                        "navigate failed: ${(t.message ?: "").take(80)}")
+                    latch.countDown()
                 }
-                wv.loadUrl(url)
             }
+        }
+        if (!posted) {
+            // Engine stopped/dead — graceful skip (caller step ko fail
+            // samjhega, app crash nahi hogi).
+            android.util.Log.w("FormEngine",
+                "navigate skip (engine stopped): ${url.take(80)}")
+            return
         }
         latch.await(45, TimeUnit.SECONDS)
         val deadline = SystemClock.elapsedRealtime() + 20_000
@@ -1303,7 +1406,7 @@ class FormEngine(private val appContext: Context) {
     private fun fillField(s: StepSpec): JSONObject {
         val q = JSONObject.quote(s.text)
         val js = """(function(){
-          var el=${finderJs(s.selectorMode, s.selectorValue)};
+          var el=${smartFinderJs(s)};
           if(!el) return JSON.stringify({status:'NOT_FOUND',value:''});
           try{ el.scrollIntoView({block:'center'}); }catch(e){}
           try{ el.focus(); }catch(e){}
@@ -1357,7 +1460,7 @@ class FormEngine(private val appContext: Context) {
     private fun selectOption(s: StepSpec): JSONObject {
         val q = JSONObject.quote(s.option)
         val js1 = """(function(){
-          var el=${finderJs(s.selectorMode, s.selectorValue)};
+          var el=${smartFinderJs(s)};
           if(!el) return JSON.stringify({status:'NOT_FOUND'});
           if((el.tagName||'').toLowerCase()==='select'){
             var nd=$q.toLowerCase(), pick=null, i;
@@ -1404,7 +1507,7 @@ class FormEngine(private val appContext: Context) {
     /** toggle — checkbox/radio: target state ke liye zaroorat ho tabhi click. */
     private fun toggleCheck(s: StepSpec): JSONObject {
         val js = """(function(){
-          var el=${finderJs(s.selectorMode, s.selectorValue)};
+          var el=${smartFinderJs(s)};
           if(!el) return JSON.stringify({status:'NOT_FOUND'});
           var before=!!el.checked;
           var want = '${s.state}'==='on' ? true : ('${s.state}'==='off' ? false : !before);
@@ -1443,7 +1546,7 @@ class FormEngine(private val appContext: Context) {
         val qk = JSONObject.quote(pair.first)
         val qc = JSONObject.quote(pair.second)
         val target = if (s.selectorValue.isNotEmpty())
-            "var el=${finderJs(s.selectorMode, s.selectorValue)};"
+            "var el=${smartFinderJs(s)};"
         else
             "var el=document.activeElement||document.body;"
         val js = """(function(){
@@ -1557,7 +1660,7 @@ class FormEngine(private val appContext: Context) {
             return JSONObject().put("clicked", true).put("via", "index-fresh")
         }
         val js = """(function(){
-          var el=${finderJs(s.selectorMode, s.selectorValue)};
+          var el=${smartFinderJs(s)};
           if(!el) return 'NOT_FOUND';
           try{ el.scrollIntoView({block:'center'}); }catch(e){}
           el.click();
@@ -1572,7 +1675,7 @@ class FormEngine(private val appContext: Context) {
 
     private fun waitForElement(s: StepSpec) {
         val js = """(function(){
-          var el=${finderJs(s.selectorMode, s.selectorValue)};
+          var el=${smartFinderJs(s)};
           if(!el) return 'false';
           try{
             var r=el.getBoundingClientRect();
@@ -1616,14 +1719,21 @@ class FormEngine(private val appContext: Context) {
     /** back — WebView history back + settle wait. */
     fun goBack() {
         val latch = CountDownLatch(1)
-        handler!!.post {
-            try {
-                // v33: canGoBack/goBack UI thread par.
-                onMain {
-                    val wv = webView!!
-                    if (wv.canGoBack()) wv.goBack()
-                }
-            } catch (_: Exception) { }
+        // v58 NPE FIX: snapshot (stop() race me field null kar sakta hai).
+        val wv = webView
+        var posted = false
+        if (wv != null) {
+            posted = postEngine {
+                try {
+                    // v33: canGoBack/goBack UI thread par.
+                    onMain {
+                        if (wv.canGoBack()) wv.goBack()
+                    }
+                } catch (_: Exception) { }
+                latch.countDown()
+            }
+        }
+        if (!posted) {
             latch.countDown()
         }
         latch.await(5, TimeUnit.SECONDS)
@@ -1658,14 +1768,21 @@ class FormEngine(private val appContext: Context) {
     /** forward — WebView history forward + settle wait. */
     private fun goForward() {
         val latch = CountDownLatch(1)
-        handler!!.post {
-            try {
-                // v33: canGoForward/goForward UI thread par.
-                onMain {
-                    val wv = webView!!
-                    if (wv.canGoForward()) wv.goForward()
-                }
-            } catch (_: Exception) { }
+        // v58 NPE FIX: snapshot (stop() race me field null kar sakta hai).
+        val wv = webView
+        var posted = false
+        if (wv != null) {
+            posted = postEngine {
+                try {
+                    // v33: canGoForward/goForward UI thread par.
+                    onMain {
+                        if (wv.canGoForward()) wv.goForward()
+                    }
+                } catch (_: Exception) { }
+                latch.countDown()
+            }
+        }
+        if (!posted) {
             latch.countDown()
         }
         latch.await(5, TimeUnit.SECONDS)
@@ -1707,22 +1824,29 @@ class FormEngine(private val appContext: Context) {
     private fun renderBitmap(w: Int): Bitmap? {
         val latch = CountDownLatch(1)
         var bmp: Bitmap? = null
-        handler!!.post {
-            try {
-                // v33: width/height/draw UI thread mangte hain.
-                bmp = onMain {
-                    val wv = webView!!
-                    val h = (960 * wv.height / wv.width.coerceAtLeast(1)).coerceAtMost(1200)
-                    val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                    val canvas = android.graphics.Canvas(b)
-                    canvas.scale(
-                        w.toFloat() / wv.width.coerceAtLeast(1),
-                        h.toFloat() / wv.height.coerceAtLeast(1)
-                    )
-                    wv.draw(canvas)
-                    b
-                }
-            } catch (_: Exception) { }
+        // v58 NPE FIX: snapshot (stop() race me field null kar sakta hai).
+        val wv = webView
+        var posted = false
+        if (wv != null) {
+            posted = postEngine {
+                try {
+                    // v33: width/height/draw UI thread mangte hain.
+                    bmp = onMain {
+                        val h = (960 * wv.height / wv.width.coerceAtLeast(1)).coerceAtMost(1200)
+                        val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                        val canvas = android.graphics.Canvas(b)
+                        canvas.scale(
+                            w.toFloat() / wv.width.coerceAtLeast(1),
+                            h.toFloat() / wv.height.coerceAtLeast(1)
+                        )
+                        wv.draw(canvas)
+                        b
+                    }
+                } catch (_: Exception) { }
+                latch.countDown()
+            }
+        }
+        if (!posted) {
             latch.countDown()
         }
         latch.await(15, TimeUnit.SECONDS)
@@ -1912,22 +2036,29 @@ class FormEngine(private val appContext: Context) {
     private fun renderBitmapUncapped(w: Int): Bitmap? {
         val latch = CountDownLatch(1)
         var bmp: Bitmap? = null
-        handler!!.post {
-            try {
-                // v33: width/height/draw UI thread par.
-                bmp = onMain {
-                    val wv = webView!!
-                    val h = 960 * wv.height / wv.width.coerceAtLeast(1)
-                    val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                    val canvas = android.graphics.Canvas(b)
-                    canvas.scale(
-                        w.toFloat() / wv.width.coerceAtLeast(1),
-                        h.toFloat() / wv.height.coerceAtLeast(1)
-                    )
-                    wv.draw(canvas)
-                    b
-                }
-            } catch (_: Exception) { }
+        // v58 NPE FIX: snapshot (stop() race me field null kar sakta hai).
+        val wv = webView
+        var posted = false
+        if (wv != null) {
+            posted = postEngine {
+                try {
+                    // v33: width/height/draw UI thread par.
+                    bmp = onMain {
+                        val h = 960 * wv.height / wv.width.coerceAtLeast(1)
+                        val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                        val canvas = android.graphics.Canvas(b)
+                        canvas.scale(
+                            w.toFloat() / wv.width.coerceAtLeast(1),
+                            h.toFloat() / wv.height.coerceAtLeast(1)
+                        )
+                        wv.draw(canvas)
+                        b
+                    }
+                } catch (_: Exception) { }
+                latch.countDown()
+            }
+        }
+        if (!posted) {
             latch.countDown()
         }
         latch.await(15, TimeUnit.SECONDS)

@@ -267,6 +267,18 @@ object LiveWebViewHost {
                 try {
                     wv.webViewClient = HostWebViewClient()
                 } catch (_: Exception) { }
+                // v59: JavaScript + DOM storage ZAROORI (AI Mode ke liye).
+                // Pehle sirf UA set tha — JS band hone se AI Mode nahi khulta tha.
+                try {
+                    with(wv.settings) {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        databaseEnabled = true
+                        mediaPlaybackRequiresUserGesture = false
+                        setSupportMultipleWindows(true)
+                        javaScriptCanOpenWindowsAutomatically = true
+                    }
+                } catch (_: Exception) { }
                 try {
                     wv.settings.userAgentString =
                         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
@@ -349,10 +361,29 @@ object LiveWebViewHost {
         try {
             if (view != null && view === helpWebView) {
                 helpLastUrl = u
+                // v58: Admin takeover me admin ki navigation capture karo
+                // (agent seekhega). Agent ki apni navigation log nahi hoti.
+                if (AdminTakeover.isDriving(false)) {
+                    try {
+                        AdminActionCapture.log(
+                            view.context.applicationContext,
+                            "help", "admin_navigate", u, null
+                        )
+                    } catch (_: Exception) { }
+                }
                 return
             }
         } catch (_: Exception) { }
         lastUrl = u
+        // v58: work browser par admin takeover capture
+        try {
+            if (view != null && AdminTakeover.isDriving(true)) {
+                AdminActionCapture.log(
+                    view.context.applicationContext,
+                    "work", "admin_navigate", u, null
+                )
+            }
+        } catch (_: Exception) { }
     }
 
     /** Purana signature (compat) — work browser me track. */
