@@ -65,17 +65,37 @@ class FormRunService : Service() {
         private val activeLock = Any()
 
         /**
+         * v61 ROOT FIX (race condition): stopService() pehle activeTaskId
+         * ko turant null kar deta tha (volatile write, lock ke bina), lekin
+         * purana runThread tab tak zinda rehta tha jab tak onDestroy() na
+         * chale. Is window me naya tryClaim SUCCEED ho jata tha → DO
+         * runThread ek saath, dono shared WebView chalate the.
+         *
+         * Ab: stopRequested flag lagta hai, tryClaim use bhi check karta hai.
+         * Flag tabhi clear hota hai jab purana thread actually mar jata hai
+         * (finally me releaseClaim).
+         */
+        @Volatile
+        private var stopRequested = false
+
+        /**
          * L5: atomic run claim — do startWithTask ek saath aaye to sirf
          * pehla claim jeetega, doosra handoff ignore hoga (overwrite nahi).
+         * v61: stopRequested ho to claim nahi — purana thread abhi mara nahi.
          */
         private fun tryClaim(taskId: String): Boolean = synchronized(activeLock) {
             if (activeTaskId != null) return false
+            if (stopRequested) return false
             activeTaskId = taskId
             true
         }
 
         private fun releaseClaim(taskId: String) = synchronized(activeLock) {
-            if (activeTaskId == taskId) activeTaskId = null
+            if (activeTaskId == taskId) {
+                activeTaskId = null
+                // Purana thread mar gaya — ab naya claim allowed.
+                stopRequested = false
+            }
         }
 
         // ---------- v36 (point 10): owner unlimited ----------
@@ -109,12 +129,16 @@ class FormRunService : Service() {
 
         /**
          * v50: Service poori tarah roko — delete / naya kaam par.
+         * v61 ROOT FIX: activeTaskId ko turant null MAT karo — purana
+         * runThread abhi zinda hai. Sirf stopRequested lagao; flag tabhi
+         * clear hoga jab thread actually marega (finally → releaseClaim).
+         * Isse duplicate-run race window band hoti hai.
          */
         fun stopService(ctx: Context) {
             try {
-                // Active task ka flag saaf — loop agle check par rukega.
-                try { activeTaskId = null } catch (_: Exception) { }
-                // Phir service stop (onDestroy me cleanup hoga).
+                // Pehle stop-request lagao (naye claims block).
+                synchronized(activeLock) { stopRequested = true }
+                // Phir service stop (onDestroy me thread interrupt + cleanup).
                 ctx.stopService(Intent(ctx, FormRunService::class.java))
             } catch (_: Exception) { }
         }
@@ -212,7 +236,9 @@ class FormRunService : Service() {
             try {
                 if (com.formmitra.app.engine.OperatorSession.isActive) return
                 synchronized(activeLock) {
-                    if (activeTaskId != null) return
+                    // v61: stopRequested ho to queue mat pump karo —
+                    // purana thread abhi mara nahi, duplicate run hoga.
+                    if (activeTaskId != null || stopRequested) return
                 }
                 pumpQueue(ctx)
             } catch (_: Exception) { }
@@ -643,7 +669,11 @@ class FormRunService : Service() {
             watchdogHandler.postDelayed(watchdog, 60_000L)
         } catch (_: Exception) { }
 
-        return START_NOT_STICKY
+        // v59 BACKGROUND FIX (user order): "app background me na chale to
+        // notification nahi ata". Task chal raha ho to service STICKY —
+        // system kill kare to restart ho, kaam na ruke. Task khatm hone
+        // par stopSelf() khud band kar dega.
+        return START_STICKY
     }
 
     private fun runTask(task: JSONObject, name: String) {
